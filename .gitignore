@@ -23,3 +23,5 @@ Thumbs.db
 # данные
 data/
 rec_system/help.md
+cuda-keyring_1.1-1_all.deb
+rec_system/result/baseline_submission.csv
