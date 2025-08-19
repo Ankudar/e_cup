@@ -1,1 +1,25 @@
+# виртуальные окружения
+.venv/
+venv/
+ENV/
+env/
+
+# кэш Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# логи
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# системное
+.DS_Store
+Thumbs.db
+
+# данные
+data/
 rec_system/help.md
