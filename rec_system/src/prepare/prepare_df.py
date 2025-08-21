@@ -60,11 +60,12 @@ sns.set_palette("husl")
 #     return orders_ddf, tracker_ddf, items_ddf, categories_ddf, test_users_df
 
 
-def load_train_data(max_parts=2, max_rows=10000):
+def load_train_data(max_parts=1, max_rows=500):
     """
     Загружает данные через Dask с опцией частичного прогона.
-    max_parts: сколько частей Dask загружать
-    max_rows: ограничение по числу строк для быстрого теста
+    max_parts: сколько частей Dask загружать (для orders, tracker, items)
+    max_rows: ограничение по числу строк (для orders, tracker, items)
+    categories и test_users всегда берутся полностью
     """
     print("=== Загрузка данных через Dask (пробный прогон) ===")
 
@@ -77,30 +78,42 @@ def load_train_data(max_parts=2, max_rows=10000):
     }
 
     def read_sample(path, max_parts=max_parts, max_rows=max_rows):
+        """Частичная загрузка (ограниченные данные)"""
         ddf = dd.read_parquet(path)
         n_parts = min(ddf.npartitions, max_parts)
         ddf = ddf.partitions[:n_parts]
         if max_rows is not None:
-            # Dask head возвращает Pandas DataFrame, поэтому оборачиваем обратно в Dask
             sample_df = ddf.head(max_rows, compute=True)
             ddf = dd.from_pandas(sample_df, npartitions=1)
         return ddf
 
+    def read_full(path):
+        """Полная загрузка (без ограничений)"""
+        return dd.read_parquet(path)
+
+    # Ограниченные данные
     orders_ddf = read_sample(paths["orders"])
-    print(f"Заказы: {orders_ddf.npartitions} частей")
+    print(
+        f"Заказы: {orders_ddf.shape[0].compute():,} строк ({orders_ddf.npartitions} частей)"
+    )
 
     tracker_ddf = read_sample(paths["tracker"])
-    print(f"Взаимодействия: {tracker_ddf.npartitions} частей")
+    print(
+        f"Взаимодействия: {tracker_ddf.shape[0].compute():,} строк ({tracker_ddf.npartitions} частей)"
+    )
 
     items_ddf = read_sample(paths["items"])
-    print(f"Товары: {items_ddf.npartitions} частей")
-
-    categories_ddf = read_sample(paths["categories"])
-    print(f"Категории: {categories_ddf.shape[0].compute():,} (частичный прогон)")
-
-    test_users_ddf = read_sample(paths["test_users"])
     print(
-        f"Тестовые пользователи: {test_users_ddf.shape[0].compute():,} (частичный прогон)"
+        f"Товары: {items_ddf.shape[0].compute():,} строк ({items_ddf.npartitions} частей)"
+    )
+
+    # Полные данные
+    categories_ddf = read_full(paths["categories"])
+    print(f"Категории: {categories_ddf.shape[0].compute():,} строк (полный прогон)")
+
+    test_users_ddf = read_full(paths["test_users"])
+    print(
+        f"Тестовые пользователи: {test_users_ddf.shape[0].compute():,} строк (полный прогон)"
     )
 
     return orders_ddf, tracker_ddf, items_ddf, categories_ddf, test_users_ddf
@@ -638,7 +651,6 @@ def train_ranker(train_df, val_df=None):
     train_df: DataFrame с колонками ['user_id', 'item_id', 'label', ...features]
     val_df: DataFrame для валидации, если None - обучение на всей выборке без early stopping
     """
-    # Выбираем фичи, исключая идентификаторы и label
     features = [c for c in train_df.columns if c not in ["user_id", "item_id", "label"]]
 
     X_train = train_df[features]
@@ -651,12 +663,14 @@ def train_ranker(train_df, val_df=None):
         ndcg_at=[100],
         learning_rate=0.05,
         num_leaves=64,
+        min_child_samples=20,  # минимальное число строк на лист
         feature_fraction=0.8,
         bagging_fraction=0.8,
         bagging_freq=5,
         n_estimators=500,
         random_state=42,
         n_jobs=-1,
+        verbose=-1,  # отключаем предупреждения
     )
 
     if val_df is not None and len(val_df) > 0:
@@ -684,31 +698,23 @@ def train_ranker(train_df, val_df=None):
 
 # --- 4) ANN по fclip_embed (PyTorch CPU/GPU) ---
 def build_ann_index(item_embeddings, emb_col="fclip_embed", device="cpu"):
-    """
-    item_embeddings: DataFrame ['item_id','fclip_embed'] где fclip_embed = np.array или list
-    emb_col: название колонки с эмбеддингами
-    device: 'cpu' или 'cuda'
-
-    Возвращает:
-        ids: np.array item_id
-        embs_tensor: torch.Tensor нормализованные эмбеддинги
-    """
     if item_embeddings.empty:
         raise ValueError("item_embeddings пустой")
 
-    # --- IDs ---
     ids = item_embeddings["item_id"].values
 
-    # --- Эмбеддинги ---
-    try:
-        embs_list = item_embeddings[emb_col].apply(
-            lambda x: np.array(x, dtype=np.float32)
-        )
-        embs = np.stack(embs_list.values)
-    except Exception as e:
-        raise ValueError(f"Ошибка при конвертации эмбеддингов: {e}")
+    def parse_embed(x):
+        if isinstance(x, str):
+            # убираем скобки и разбиваем по пробелу
+            return np.fromstring(x.strip("[]"), sep=" ", dtype=np.float32)
+        elif isinstance(x, (list, np.ndarray)):
+            return np.array(x, dtype=np.float32)
+        else:
+            raise ValueError(f"Неподдерживаемый тип эмбеддинга: {type(x)}")
 
-    # --- Тензор и нормализация ---
+    embs_list = item_embeddings[emb_col].apply(parse_embed)
+    embs = np.stack(embs_list.values)
+
     embs_tensor = torch.tensor(embs, dtype=torch.float32, device=device)
     embs_tensor = torch.nn.functional.normalize(embs_tensor, dim=1)
 
