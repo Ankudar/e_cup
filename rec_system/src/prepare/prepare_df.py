@@ -27,40 +27,7 @@ plt.style.use("seaborn-v0_8")
 sns.set_palette("husl")
 
 
-# def load_train_data():
-#     print("Загружаем тренировочные данные через Dask...")
-
-#     orders_path = "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_orders_data/*/*.parquet"
-#     tracker_path = "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_tracker_data/*/*.parquet"
-#     items_path = "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_items_data/*.parquet"
-#     categories_path = "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train_final_categories_tree/*.parquet"
-#     test_users_path = "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_test_for_participants/test_for_participants/*.parquet"
-
-#     # --- Загружаем заказы ---
-#     orders_ddf = dd.read_parquet(orders_path)
-#     print(f"Найдено файлов заказов: {orders_ddf.npartitions} частей")
-
-#     # --- Загружаем взаимодействия ---
-#     tracker_ddf = dd.read_parquet(tracker_path)
-#     print(f"Найдено файлов взаимодействий: {tracker_ddf.npartitions} частей")
-
-#     # --- Загружаем товары ---
-#     items_ddf = dd.read_parquet(items_path)
-#     print(f"Найдено файлов товаров: {items_ddf.npartitions} частей")
-
-#     # --- Загружаем категории ---
-#     categories_ddf = dd.read_parquet(categories_path)
-#     print(f"Категорий после фильтрации: {categories_ddf.shape[0].compute():,}")
-
-#     # --- Загружаем тестовых юзеров ---
-#     test_users_df = dd.read_parquet(test_users_path)
-#     print(f"Тестовых юзеров: {test_users_df.shape[0].compute():,}")
-
-#     # --- Возвращаем Dask DataFrame ---
-#     return orders_ddf, tracker_ddf, items_ddf, categories_ddf, test_users_df
-
-
-def load_train_data(max_parts=1, max_rows=500):
+def load_train_data(max_parts=0, max_rows=5000):
     """
     Загружает данные через Dask с опцией частичного прогона.
     max_parts: сколько частей Dask загружать (для orders, tracker, items)
@@ -80,11 +47,17 @@ def load_train_data(max_parts=1, max_rows=500):
     def read_sample(path, max_parts=max_parts, max_rows=max_rows):
         """Частичная загрузка (ограниченные данные)"""
         ddf = dd.read_parquet(path)
-        n_parts = min(ddf.npartitions, max_parts)
-        ddf = ddf.partitions[:n_parts]
-        if max_rows is not None:
+
+        # Ограничение по числу частей
+        if max_parts > 0:
+            n_parts = min(ddf.npartitions, max_parts)
+            ddf = ddf.partitions[:n_parts]
+
+        # Ограничение по числу строк
+        if max_rows > 0:
             sample_df = ddf.head(max_rows, compute=True)
             ddf = dd.from_pandas(sample_df, npartitions=1)
+
         return ddf
 
     def read_full(path):
@@ -651,6 +624,7 @@ def train_ranker(train_df, val_df=None):
     train_df: DataFrame с колонками ['user_id', 'item_id', 'label', ...features]
     val_df: DataFrame для валидации, если None - обучение на всей выборке без early stopping
     """
+    # Отбираем признаки, исключая идентификаторы и label
     features = [c for c in train_df.columns if c not in ["user_id", "item_id", "label"]]
 
     X_train = train_df[features]
@@ -663,15 +637,17 @@ def train_ranker(train_df, val_df=None):
         ndcg_at=[100],
         learning_rate=0.05,
         num_leaves=64,
-        min_child_samples=20,  # минимальное число строк на лист
+        min_child_samples=20,
         feature_fraction=0.8,
         bagging_fraction=0.8,
         bagging_freq=5,
         n_estimators=500,
         random_state=42,
         n_jobs=-1,
-        verbose=-1,  # отключаем предупреждения
+        verbose=-1,  # отключаем лишние предупреждения
     )
+
+    evals_result = {}  # сюда будут записываться метрики
 
     if val_df is not None and len(val_df) > 0:
         X_val = val_df[features]
@@ -684,13 +660,28 @@ def train_ranker(train_df, val_df=None):
             group=group_train,
             eval_set=[(X_val, y_val)],
             eval_group=[group_val],
-            eval_at=[100],
+            eval_at=[100],  # будет использоваться вместе с ndcg_at
             callbacks=[
                 lgb.early_stopping(stopping_rounds=50, verbose=True),
-                lgb.log_evaluation(50),
+                lgb.record_evaluation(evals_result),
+                lgb.log_evaluation(period=50),
             ],
         )
+
+        # Визуализация прогресса NDCG
+        if "valid_0" in evals_result:
+            plt.figure(figsize=(10, 5))
+            for metric_name, values in evals_result["valid_0"].items():
+                plt.plot(values, label=metric_name)
+            plt.xlabel("Итерация")
+            plt.ylabel("NDCG@100")
+            plt.title("Процесс обучения LGBMRanker")
+            plt.legend()
+            plt.grid(True)
+            plt.show()
+
     else:
+        # Обучение на всей выборке без валидации
         model.fit(X_train, y_train, group=group_train)
 
     return model, features
