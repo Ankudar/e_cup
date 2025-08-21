@@ -1,31 +1,15 @@
-import dask
+from collections import Counter
+
 import dask.dataframe as dd
-import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
-import seaborn as sns
-import torch
-from dask.diagnostics import ProgressBar  # type: ignore
-from tqdm import tqdm
 from tqdm.auto import tqdm
 
 tqdm.pandas()
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
-plt.style.use("seaborn-v0_8")
-sns.set_palette("husl")
-
-
+# -------------------- Загрузка данных --------------------
 def load_train_data(max_parts=0, max_rows=0):
-    """
-    Загружает данные через Dask с опцией частичного прогона.
-    max_parts: сколько частей Dask загружать (для orders, tracker, items)
-    max_rows: ограничение по числу строк (для orders, tracker, items)
-    categories и test_users всегда берутся полностью
-    """
-    print("=== Загрузка данных через Dask (пробный прогон) ===")
-
+    print("=== Загрузка данных через Dask ===")
     paths = {
         "orders": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_orders_data/*/*.parquet",
         "tracker": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_tracker_data/*/*.parquet",
@@ -34,65 +18,82 @@ def load_train_data(max_parts=0, max_rows=0):
         "test_users": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_test_for_participants/test_for_participants/*.parquet",
     }
 
-    def read_sample(path, max_parts=max_parts, max_rows=max_rows):
+    def read_sample(path):
         ddf = dd.read_parquet(path)
         if max_parts > 0:
-            n_parts = min(ddf.npartitions, max_parts)
-            ddf = ddf.partitions[:n_parts]
+            ddf = ddf.partitions[: min(ddf.npartitions, max_parts)]
         if max_rows > 0:
             sample_df = ddf.head(max_rows, compute=True)
             ddf = dd.from_pandas(sample_df, npartitions=1)
         return ddf
 
-    def read_full(path):
-        return dd.read_parquet(path)
-
     orders_ddf = read_sample(paths["orders"])
-    print(
-        f"Заказы: {orders_ddf.shape[0].compute():,} строк ({orders_ddf.npartitions} частей)"
-    )
-
     tracker_ddf = read_sample(paths["tracker"])
-    print(
-        f"Взаимодействия: {tracker_ddf.shape[0].compute():,} строк ({tracker_ddf.npartitions} частей)"
-    )
-
     items_ddf = read_sample(paths["items"])
+    categories_ddf = dd.read_parquet(paths["categories"])
+    test_users_ddf = dd.read_parquet(paths["test_users"])
+
     print(
-        f"Товары: {items_ddf.shape[0].compute():,} строк ({items_ddf.npartitions} частей)"
+        f"Orders: {orders_ddf.shape[0].compute():,}\n Tracker: {tracker_ddf.shape[0].compute():,}\n Items: {items_ddf.shape[0].compute():,}\n Categories: {categories_ddf.shape[0].compute():,}\n Test users: {test_users_ddf.shape[0].compute():,}"
     )
-
-    categories_ddf = read_full(paths["categories"])
-    print(f"Категории: {categories_ddf.shape[0].compute():,} строк (полный прогон)")
-
-    test_users_ddf = read_full(paths["test_users"])
-    print(
-        f"Тестовые пользователи: {test_users_ddf.shape[0].compute():,} строк (полный прогон)"
-    )
-
     return orders_ddf, tracker_ddf, items_ddf, categories_ddf, test_users_ddf
 
 
-# --- Baseline на популярных товарах ---
-def compute_popular_items(orders_ddf, top_k=100):
-    """Возвращает топ-K популярных товаров"""
-    orders_df = orders_ddf.compute()
-    item_counts = orders_df.groupby("item_id").size().sort_values(ascending=False)
-    top_items = item_counts.head(top_k).index.tolist()
-    return top_items
+# -------------------- Фильтрация данных --------------------
+def filter_data(orders_ddf, tracker_ddf, items_ddf):
+    orders_ddf = orders_ddf[orders_ddf["last_status"] == "delivered_orders"]
+    allowed_actions = ["page_view", "favorite", "to_cart"]
+    tracker_ddf = tracker_ddf[tracker_ddf["action_type"].isin(allowed_actions)]
+    items_ddf = items_ddf.drop(columns=["variant_id", "model_id"], errors="ignore")
+    print("Данные отфильтрованы")
+    return orders_ddf, tracker_ddf, items_ddf
 
 
-def recommend_popular_for_users(test_users_ddf, popular_items):
-    """Для каждого пользователя возвращаем один и тот же топ популярных товаров"""
+# -------------------- Рекомендации --------------------
+def recommend_recent_purchases(orders_ddf, test_users_ddf, top_k=100, recent_n=5):
+    """
+    Генерация рекомендаций:
+    - последние покупки пользователя с удвоенным весом для последних N
+    - дополнение глобальными популярными товарами
+    """
+    orders_df = orders_ddf.compute().sort_values(["user_id", "created_timestamp"])
     test_users_df = test_users_ddf.compute()
+
+    # --- Считаем последние покупки пользователей ---
+    user_items_weighted = {}
+    for user_id, group in tqdm(orders_df.groupby("user_id"), desc="User profiles"):
+        items = group["item_id"].tolist()
+        weights = [1] * len(items)
+        if len(items) > recent_n:
+            for i in range(-recent_n, 0):
+                weights[i] *= 2
+        counter = Counter()
+        for item, w in zip(items, weights):
+            counter[item] += w
+        user_items_weighted[user_id] = counter
+
+    # --- Глобальные популярные товары ---
+    popular_items = orders_df["item_id"].value_counts().index.tolist()
+
+    # --- Формируем рекомендации ---
     recommendations = {}
     for user_id in test_users_df["user_id"].unique():
-        recommendations[user_id] = popular_items
+        counter = user_items_weighted.get(user_id, Counter())
+        top_items = [item for item, _ in counter.most_common(top_k)]
+        # дополняем популярными
+        if len(top_items) < top_k:
+            for item in popular_items:
+                if item not in top_items:
+                    top_items.append(item)
+                if len(top_items) >= top_k:
+                    break
+        recommendations[user_id] = top_items
+
     return recommendations
 
 
+# -------------------- Сохранение --------------------
 def save_submission_csv(recommendations, top_k=100, filename="submission.csv"):
-    """Сохраняем рекомендации в CSV в нужном формате"""
     submission_data = []
     for user_id, items in recommendations.items():
         submission_data.append(
@@ -101,18 +102,27 @@ def save_submission_csv(recommendations, top_k=100, filename="submission.csv"):
                 f"item_id_1 item_id_2 ... item_id_{top_k}": " ".join(map(str, items)),
             }
         )
-    submission_df = pd.DataFrame(submission_data)
-    submission_df.to_csv(filename, index=False)
+    pd.DataFrame(submission_data).to_csv(filename, index=False)
     print(f"CSV сохранен как {filename}")
 
 
-# --- Пример использования ---
+# -------------------- Пример использования --------------------
 if __name__ == "__main__":
     K = 100
+    recent_n = 4
+
+    # 1. Загрузка
     orders_ddf, tracker_ddf, items_ddf, categories_ddf, test_users_ddf = (
         load_train_data()
     )
 
-    top_items = compute_popular_items(orders_ddf, top_k=K)
-    recommendations = recommend_popular_for_users(test_users_ddf, top_items)
+    # 2. Фильтрация
+    orders_ddf, tracker_ddf, items_ddf = filter_data(orders_ddf, tracker_ddf, items_ddf)
+
+    # 3. Генерация рекомендаций (последние покупки + популярные)
+    recommendations = recommend_recent_purchases(
+        orders_ddf, test_users_ddf, top_k=K, recent_n=recent_n
+    )
+
+    # 4. Сохранение
     save_submission_csv(recommendations, top_k=K)
