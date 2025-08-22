@@ -151,14 +151,9 @@ def prepare_interactions(
     cutoff_ts_per_user,
     batch_size=100_000_000,
     action_weights=None,
-    scale_days=30,
+    scale_days=60,
     output_dir="/home/root6/python/e_cup/rec_system/data/processed/prepare_interactions_batches",
 ):
-    import gc
-    import os
-
-    import numpy as np
-    import pandas as pd
 
     print("Формируем матрицу взаимодействий по батчам...")
 
@@ -170,6 +165,7 @@ def prepare_interactions(
     ref_time = train_orders_df["created_timestamp"].max()
 
     # ====== Orders ======
+    print("... для orders")
     n_rows = len(train_orders_df)
     for start in range(0, n_rows, batch_size):
         batch_orders = train_orders_df.iloc[start : start + batch_size].copy()
@@ -186,34 +182,38 @@ def prepare_interactions(
         batch_files.append(orders_file)
         del batch_orders
         gc.collect()
-        print(f"Сохранен orders-батч строк {start}-{start+batch_size}")
+        print(f"Сохранен orders-батч строк {start}-{min(start+batch_size, n_rows)}")
 
     # ====== Tracker ======
+    print("... для tracker")
     tracker_ddf = tracker_ddf[["user_id", "item_id", "timestamp", "action_type"]]
-    tracker_ddf = tracker_ddf.compute()
-    tracker_ddf["timestamp"] = pd.to_datetime(tracker_ddf["timestamp"])
-    tracker_ddf["aw"] = tracker_ddf["action_type"].map(action_weights).fillna(0)
-    tracker_ddf["cutoff"] = tracker_ddf["user_id"].map(cutoff_ts_per_user)
-    tracker_ddf = tracker_ddf[
-        (tracker_ddf["cutoff"].isna())
-        | (tracker_ddf["timestamp"] < tracker_ddf["cutoff"])
-    ]
-    tracker_ddf["days_ago"] = (ref_time - tracker_ddf["timestamp"]).dt.days.clip(
-        lower=1
-    )
-    tracker_ddf["time_factor"] = np.log1p(tracker_ddf["days_ago"] / scale_days)
-    tracker_ddf["weight"] = tracker_ddf["aw"] * tracker_ddf["time_factor"]
-    tracker_ddf = tracker_ddf[["user_id", "item_id", "weight", "timestamp"]]
+    n_rows = tracker_ddf.shape[0].compute()  # число строк
 
-    n_rows = len(tracker_ddf)
     for start in range(0, n_rows, batch_size):
-        batch_tracker = tracker_ddf.iloc[start : start + batch_size].copy()
+        batch_ddf = tracker_ddf.partitions[
+            start // batch_size : (start + batch_size) // batch_size
+        ]
+        batch_tracker = batch_ddf.compute()
+        batch_tracker["timestamp"] = pd.to_datetime(batch_tracker["timestamp"])
+        batch_tracker["aw"] = batch_tracker["action_type"].map(action_weights).fillna(0)
+        batch_tracker["cutoff"] = batch_tracker["user_id"].map(cutoff_ts_per_user)
+        batch_tracker = batch_tracker[
+            (batch_tracker["cutoff"].isna())
+            | (batch_tracker["timestamp"] < batch_tracker["cutoff"])
+        ]
+        batch_tracker["days_ago"] = (
+            ref_time - batch_tracker["timestamp"]
+        ).dt.days.clip(lower=1)
+        batch_tracker["time_factor"] = np.log1p(batch_tracker["days_ago"] / scale_days)
+        batch_tracker["weight"] = batch_tracker["aw"] * batch_tracker["time_factor"]
+        batch_tracker = batch_tracker[["user_id", "item_id", "weight", "timestamp"]]
+
         tracker_file = os.path.join(output_dir, f"tracker_batch_{start}.parquet")
         batch_tracker.to_parquet(tracker_file, index=False, engine="pyarrow")
         batch_files.append(tracker_file)
         del batch_tracker
         gc.collect()
-        print(f"Сохранен tracker-батч строк {start}-{start+batch_size}")
+        print(f"Сохранен tracker-батч строк {start}-{min(start+batch_size, n_rows)}")
 
     print("Все батчи сохранены на диск.")
     return batch_files
