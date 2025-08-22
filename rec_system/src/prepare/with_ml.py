@@ -1,13 +1,15 @@
+import gc
 import os
 import pickle
 from collections import defaultdict
+from pathlib import Path
 
 import dask.dataframe as dd
 import numpy as np
 import pandas as pd
 from dask.diagnostics import ProgressBar
 from implicit.als import AlternatingLeastSquares
-from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse import coo_matrix, csr_matrix, vstack
 from tqdm.auto import tqdm
 
 # tqdm интеграция с pandas
@@ -54,7 +56,8 @@ def load_train_data(max_parts=0, max_rows=0):
             used_parts = total_parts
 
         if max_rows > 0:
-            sample_df = ddf.head(max_rows, compute=True)
+            actual_rows = min(max_rows, len(ddf))
+            sample_df = ddf.head(actual_rows, compute=True)
             ddf = dd.from_pandas(sample_df, npartitions=1)
 
         count = ddf.shape[0].compute()
@@ -104,88 +107,116 @@ def filter_data(orders_ddf, tracker_ddf, items_ddf):
 # -------------------- Train/Test split по времени --------------------
 def train_test_split_by_time(orders_df, test_size=0.2):
     """
-    Делим покупки каждого пользователя на train/test по времени.
-    Возвращаем train_df, test_df и cutoff_ts_per_user (первая дата теста).
+    Быстрый temporal split на train/test для каждого пользователя без Python loop.
+    Возвращаем train_df, test_df и cutoff_ts_per_user.
     """
     print("Делаем train/test split...")
     orders_df = orders_df.copy()
     orders_df["created_timestamp"] = pd.to_datetime(orders_df["created_timestamp"])
 
-    train_parts, test_parts, cutoff_ts = [], [], {}
+    # сортируем
+    orders_df = orders_df.sort_values(["user_id", "created_timestamp"])
 
-    for user, grp in tqdm(orders_df.groupby("user_id"), desc="Split by user"):
-        grp = grp.sort_values("created_timestamp")
-        n_test = max(1, int(len(grp) * test_size))
-        test_g = grp.tail(n_test)
-        train_g = grp.iloc[:-n_test] if len(grp) > n_test else grp.iloc[:0]
+    # для каждого пользователя считаем размер теста
+    user_counts = orders_df.groupby("user_id").size()
+    test_counts = (user_counts * test_size).apply(lambda x: max(1, int(x)))
 
-        if not test_g.empty:
-            cutoff_ts[user] = test_g["created_timestamp"].min()
+    # индекс последнего train
+    orders_df["cumcount"] = orders_df.groupby("user_id").cumcount()
+    orders_df["test_count"] = orders_df["user_id"].map(test_counts)
 
-        train_parts.append(train_g)
-        test_parts.append(test_g)
+    mask_test = orders_df["cumcount"] >= (
+        orders_df.groupby("user_id")["cumcount"].transform("max")
+        + 1
+        - orders_df["test_count"]
+    )
+    train_df = orders_df[~mask_test].drop(columns=["cumcount", "test_count"])
+    test_df = orders_df[mask_test].drop(columns=["cumcount", "test_count"])
 
-    train_df = pd.concat(train_parts).reset_index(drop=True)
-    test_df = pd.concat(test_parts).reset_index(drop=True)
+    # cutoff timestamp для каждого пользователя
+    cutoff_ts_per_user = test_df.groupby("user_id")["created_timestamp"].min().to_dict()
+
     print("Split завершён")
-    return train_df, test_df, cutoff_ts
+    return (
+        train_df.reset_index(drop=True),
+        test_df.reset_index(drop=True),
+        cutoff_ts_per_user,
+    )
 
 
 # -------------------- Подготовка взаимодействий --------------------
 def prepare_interactions(
-    train_orders_df, tracker_ddf, cutoff_ts_per_user, action_weights=None, scale_days=30
+    train_orders_df,
+    tracker_ddf,
+    cutoff_ts_per_user,
+    batch_size=100_000_000,
+    action_weights=None,
+    scale_days=30,
+    output_dir="/home/root6/python/e_cup/rec_system/data/processed/prepare_interactions_batches",
 ):
-    """
-    Формируем веса user-item:
-    - Заказы (train) с временным весом.
-    - Tracker-ивенты до cutoff.
-    Сохраняем timestamp для recent_items.
-    """
-    print("Формируем матрицу взаимодействий...")
+    import gc
+    import os
+
+    import numpy as np
+    import pandas as pd
+
+    print("Формируем матрицу взаимодействий по батчам...")
+
     if action_weights is None:
-        action_weights = {"page_view": 1, "favorite": 2, "to_cart": 3}
+        action_weights = {"page_view": 2, "favorite": 4, "to_cart": 6}
 
-    orders_df = train_orders_df.copy()
-    orders_df["created_timestamp"] = pd.to_datetime(orders_df["created_timestamp"])
-    ref_time = (
-        orders_df["created_timestamp"].max()
-        if not orders_df.empty
-        else pd.Timestamp.now()
-    )
-    base_weight = 5.0
+    os.makedirs(output_dir, exist_ok=True)
+    batch_files = []
+    ref_time = train_orders_df["created_timestamp"].max()
 
-    orders_df["days_ago"] = (ref_time - orders_df["created_timestamp"]).dt.days.clip(
+    # ====== Orders ======
+    n_rows = len(train_orders_df)
+    for start in range(0, n_rows, batch_size):
+        batch_orders = train_orders_df.iloc[start : start + batch_size].copy()
+        batch_orders["days_ago"] = (
+            ref_time - batch_orders["created_timestamp"]
+        ).dt.days.clip(lower=1)
+        batch_orders["time_factor"] = np.log1p(batch_orders["days_ago"] / scale_days)
+        batch_orders["weight"] = 5.0 * batch_orders["time_factor"]
+        batch_orders = batch_orders.rename(columns={"created_timestamp": "timestamp"})
+        batch_orders = batch_orders[["user_id", "item_id", "weight", "timestamp"]]
+
+        orders_file = os.path.join(output_dir, f"orders_batch_{start}.parquet")
+        batch_orders.to_parquet(orders_file, index=False, engine="pyarrow")
+        batch_files.append(orders_file)
+        del batch_orders
+        gc.collect()
+        print(f"Сохранен orders-батч строк {start}-{start+batch_size}")
+
+    # ====== Tracker ======
+    tracker_ddf = tracker_ddf[["user_id", "item_id", "timestamp", "action_type"]]
+    tracker_ddf = tracker_ddf.compute()
+    tracker_ddf["timestamp"] = pd.to_datetime(tracker_ddf["timestamp"])
+    tracker_ddf["aw"] = tracker_ddf["action_type"].map(action_weights).fillna(0)
+    tracker_ddf["cutoff"] = tracker_ddf["user_id"].map(cutoff_ts_per_user)
+    tracker_ddf = tracker_ddf[
+        (tracker_ddf["cutoff"].isna())
+        | (tracker_ddf["timestamp"] < tracker_ddf["cutoff"])
+    ]
+    tracker_ddf["days_ago"] = (ref_time - tracker_ddf["timestamp"]).dt.days.clip(
         lower=1
     )
-    orders_df["time_factor"] = np.log1p(orders_df["days_ago"] / scale_days)
-    orders_df["weight"] = base_weight * orders_df["time_factor"]
-    orders_df = orders_df.rename(columns={"created_timestamp": "timestamp"})
+    tracker_ddf["time_factor"] = np.log1p(tracker_ddf["days_ago"] / scale_days)
+    tracker_ddf["weight"] = tracker_ddf["aw"] * tracker_ddf["time_factor"]
+    tracker_ddf = tracker_ddf[["user_id", "item_id", "weight", "timestamp"]]
 
-    tracker_df = tracker_ddf.compute()
-    tracker_df["timestamp"] = pd.to_datetime(tracker_df["timestamp"])
-    tracker_df["aw"] = tracker_df["action_type"].map(action_weights).fillna(0)
-    tracker_df["cutoff"] = tracker_df["user_id"].map(cutoff_ts_per_user)
-    tracker_df = tracker_df[
-        (tracker_df["cutoff"].isna()) | (tracker_df["timestamp"] < tracker_df["cutoff"])
-    ]
-    tracker_df["days_ago"] = (ref_time - tracker_df["timestamp"]).dt.days.clip(lower=1)
-    tracker_df["time_factor"] = np.log1p(tracker_df["days_ago"] / scale_days)
-    tracker_df["weight"] = tracker_df["aw"] * tracker_df["time_factor"]
+    n_rows = len(tracker_ddf)
+    for start in range(0, n_rows, batch_size):
+        batch_tracker = tracker_ddf.iloc[start : start + batch_size].copy()
+        tracker_file = os.path.join(output_dir, f"tracker_batch_{start}.parquet")
+        batch_tracker.to_parquet(tracker_file, index=False, engine="pyarrow")
+        batch_files.append(tracker_file)
+        del batch_tracker
+        gc.collect()
+        print(f"Сохранен tracker-батч строк {start}-{start+batch_size}")
 
-    interactions_df = pd.concat(
-        [
-            orders_df[["user_id", "item_id", "weight", "timestamp"]],
-            tracker_df[["user_id", "item_id", "weight", "timestamp"]],
-        ],
-        ignore_index=True,
-    )
-    interactions_df = interactions_df.groupby(
-        ["user_id", "item_id"], as_index=False
-    ).agg(
-        {"weight": "sum", "timestamp": "max"}  # сохраняем последнее взаимодействие
-    )
-    print(f"Матрица взаимодействий: {interactions_df.shape}")
-    return interactions_df
+    print("Все батчи сохранены на диск.")
+    return batch_files
 
 
 # -------------------- Глобальная популярность --------------------
@@ -202,140 +233,382 @@ def compute_global_popularity(train_orders_df):
 
 
 # -------------------- Обучение ALS --------------------
-def train_als(interactions_df, factors=64, iterations=100):
-    print("Обучаем ALS...")
-    user_ids = interactions_df["user_id"].unique()
-    item_ids = interactions_df["item_id"].unique()
+def train_als(
+    batch_files, factors=64, iterations=100, dtype=np.float32, random_state=42
+):
+    """
+    batch_files: список parquet файлов с взаимодействиями (user_id, item_id, weight)
+    Возвращает: model, user_map, item_map
+    """
+    print("Подсчитываем уникальные user_id и item_id по всем батчам...")
+    user_set, item_set = set(), set()
+    for f in batch_files:
+        df = pd.read_parquet(f)
+        user_set.update(df["user_id"].unique())
+        item_set.update(df["item_id"].unique())
+
+    user_ids = sorted(user_set)
+    item_ids = sorted(item_set)
+
     user_map = {u: i for i, u in enumerate(user_ids)}
     item_map = {i: j for j, i in enumerate(item_ids)}
 
-    df = interactions_df.copy()
-    df["user_idx"] = df["user_id"].map(user_map)
-    df["item_idx"] = df["item_id"].map(item_map)
+    print(f"Всего пользователей: {len(user_ids)}, товаров: {len(item_ids)}")
 
-    sparse_interactions = coo_matrix(
-        (
-            df["weight"].astype(float),
-            (df["user_idx"].astype(int), df["item_idx"].astype(int)),
-        ),
-        shape=(len(user_ids), len(item_ids)),
-    )
+    coo_batches = []
+
+    print("Формируем sparse матрицу по батчам...")
+    for f in batch_files:
+        df = pd.read_parquet(f)
+        df["user_idx"] = df["user_id"].map(user_map).astype(np.int32)
+        df["item_idx"] = df["item_id"].map(item_map).astype(np.int32)
+        coo = coo_matrix(
+            (df["weight"].astype(dtype), (df["user_idx"], df["item_idx"])),
+            shape=(len(user_ids), len(item_ids)),
+        )
+        coo_batches.append(coo)
+
+    sparse_interactions = vstack(coo_batches)
+    print(f"Общая COO матрица: {sparse_interactions.shape}")
 
     model = AlternatingLeastSquares(
-        factors=factors, iterations=iterations, random_state=42
+        factors=factors, iterations=iterations, random_state=random_state
     )
 
     model.fit(sparse_interactions.T, show_progress=True)
-
     print("ALS обучение завершено")
     return model, user_map, item_map
 
 
 # -------------------- User-Items CSR для recommend --------------------
-def build_user_items_csr(interactions_df, user_map, item_map):
-    print("Строим CSR матрицу user-items...")
-    df = interactions_df.copy()
-    df["user_idx"] = df["user_id"].map(user_map)
-    df["item_idx"] = df["item_id"].map(item_map)
-    df = df.dropna(subset=["user_idx", "item_idx"])
-    df["user_idx"] = df["user_idx"].astype(int)
-    df["item_idx"] = df["item_idx"].astype(int)
-    n_users = len(user_map)
-    n_items = len(item_map)
-    coo = coo_matrix(
-        (df["weight"].astype(float), (df["user_idx"], df["item_idx"])),
-        shape=(n_users, n_items),
-    )
-    print("CSR матрица построена")
-    return coo.tocsr()
+def build_user_items_csr(batch_files, user_map, item_map, dtype=np.float32):
+    """
+    batch_files: список parquet файлов с взаимодействиями
+    Возвращает CSR матрицу user-items
+    """
+    from scipy.sparse import coo_matrix, vstack
+
+    print("Строим CSR матрицу по батчам...")
+    coo_batches = []
+
+    for f in batch_files:
+        df = pd.read_parquet(f)
+        df["user_idx"] = df["user_id"].map(user_map).astype(np.int32)
+        df["item_idx"] = df["item_id"].map(item_map).astype(np.int32)
+        coo = coo_matrix(
+            (df["weight"].astype(dtype), (df["user_idx"], df["item_idx"])),
+            shape=(len(user_map), len(item_map)),
+        )
+        coo_batches.append(coo)
+        print(f"Батч {f} добавлен")
+
+    user_items_csr = vstack(coo_batches).tocsr()
+    print(f"CSR матрица построена: {user_items_csr.shape}")
+    return user_items_csr
 
 
 # -------------------- Recommendations (ALS + recent + similar + popular) --------------------
-def generate_recommendations_hybrid(
+def generate_and_save_recommendations_iter(
     model,
     user_map,
     item_map,
     user_items_csr,
     interactions_df,
-    items_df,
-    categories_df,
-    users_df,
     popularity_s,
+    users_df,
+    recent_items_map=None,
     top_k=100,
     recent_n=5,
     similar_top_n_seed=20,
     blend_sim_beta=0.3,
+    blend_cat_beta=0.3,  # новый параметр для категорий
+    batch_size=10_000,
+    filename="/home/root6/python/e_cup/rec_system/result/submission.csv",
+    item_to_cat=None,
+    cat_to_items=None,
 ):
-    inv_user_map = {v: k for k, v in user_map.items()}
-    inv_item_map = {v: k for k, v in item_map.items()}
-    recommendations = {}
-    sim_model = model  # пока используем тот же ALS для похожих
+    recent_items_map = recent_items_map or {}
+    inv_item_map = {int(v): int(k) for k, v in item_map.items()}
+    popular_items = popularity_s.index.tolist()
 
-    # сортируем interactions для быстрого recent_items
-    interactions_df_sorted = interactions_df.sort_values(
-        ["user_id", "timestamp"], ascending=[True, False]
-    )
+    first_run = True
+    if os.path.exists(filename):
+        os.remove(filename)
 
-    for user_id, user_idx in tqdm(user_map.items(), desc="Hybrid recommendations"):
+    batch_rows = []
+
+    for user_id in tqdm(users_df["user_id"], desc="Hybrid recommendations iter"):
         try:
-            # ALS рекомендации
-            rec = model.recommend(
-                userid=user_idx,
-                user_items=user_items_csr[user_idx],
-                N=top_k * 2,
-                filter_already_liked_items=True,
-                recalculate_user=True,
-            )
-            als_items = [(inv_item_map[i], float(score)) for i, score in rec]
+            user_idx_int = user_map.get(user_id)
 
-            # последние товары по timestamp
-            recent_items = (
-                interactions_df_sorted[interactions_df_sorted["user_id"] == user_id][
-                    "item_id"
-                ]
-                .head(recent_n)
-                .tolist()
+            # ======== Купленные / tracker-взаимодействия ========
+            user_tracker = interactions_df[interactions_df["user_id"] == user_id]
+            user_bought_items = set(user_tracker[user_tracker["weight"] > 0]["item_id"])
+            tracker_scored = (
+                user_tracker[["item_id", "weight"]].drop_duplicates().values.tolist()
             )
 
-            # похожие к последним
+            # ======== ALS рекомендации ========
+            als_scored = []
+            if user_idx_int is not None and user_idx_int < user_items_csr.shape[0]:
+                try:
+                    rec = model.recommend(
+                        userid=user_idx_int,
+                        user_items=user_items_csr[user_idx_int],
+                        N=top_k * 2,
+                        filter_already_liked_items=True,
+                        recalculate_user=True,
+                    )
+                    als_items = [
+                        (inv_item_map[int(r[0])], float(r[1]))
+                        for r in rec
+                        if len(r) == 2 and int(r[0]) in inv_item_map
+                    ]
+                    als_scored = [
+                        (it, score * 0.5)
+                        for it, score in als_items
+                        if it not in user_bought_items
+                    ]
+                except Exception as e:
+                    print(f"Ошибка ALS для пользователя {user_id}: {e}")
+
+            # ======== Последние товары ========
+            recent_items = recent_items_map.get(user_id, [])
+            recent_scored = [
+                (it, 1.0)
+                for it in recent_items[:recent_n]
+                if it not in user_bought_items
+            ]
+
+            # ======== Похожие товары ========
             sim_items = []
             for rit in recent_items:
                 if rit in item_map:
-                    sims = sim_model.similar_items(item_map[rit], N=similar_top_n_seed)
-                    sim_items.extend([inv_item_map[i] for i, _ in sims])
-            sim_items = list(
-                dict.fromkeys(sim_items)
-            )  # уникальные, порядок сохраняется
-
-            # blend похожих
+                    try:
+                        sims = model.similar_items(
+                            int(item_map[rit]), N=similar_top_n_seed
+                        )
+                        sim_items.extend(
+                            [
+                                inv_item_map[int(si[0])]
+                                for si in sims
+                                if len(si) == 2 and int(si[0]) in inv_item_map
+                            ]
+                        )
+                    except Exception:
+                        continue
+            sim_items = list(dict.fromkeys(sim_items))
             sim_quota = int(top_k * blend_sim_beta)
-            min_als_score = min((s for _, s in als_items), default=1.0)
-            sim_scored = [(it, min_als_score * 0.5) for it in sim_items[:sim_quota]]
+            sim_scored = [
+                (it, 0.5) for it in sim_items[:sim_quota] if it not in user_bought_items
+            ]
 
-            # популярные
-            popular_items_full = popularity_s.index.tolist()
-            pop_scored = [(it, min_als_score * 0.1) for it in popular_items_full]
+            # ======== Товары из категорий последних покупок ========
+            category_scored = []
+            if item_to_cat and cat_to_items:
+                for rit in recent_items:
+                    cat = item_to_cat.get(rit)
+                    if cat:
+                        cat_items = [
+                            i
+                            for i in cat_to_items[cat]
+                            if i != rit and i not in user_bought_items
+                        ]
+                        quota = int(top_k * blend_cat_beta)
+                        category_scored.extend([(i, 0.8) for i in cat_items[:quota]])
 
-            # объединяем и сортируем
-            all_candidates = als_items + sim_scored + pop_scored
+            # ======== Популярные товары ========
+            min_score = min((s for _, s in als_scored), default=0.1)
+            pop_scored = [
+                (it, min_score * 0.1)
+                for it in popular_items
+                if it not in user_bought_items
+            ]
+
+            # ======== Объединяем все кандидаты ========
+            all_candidates = (
+                tracker_scored
+                + als_scored
+                + recent_scored
+                + sim_scored
+                + category_scored
+                + pop_scored
+            )
             all_candidates = sorted(all_candidates, key=lambda x: x[1], reverse=True)
 
-            # уникализация top_k
+            # уникализируем top_k
             seen, final = set(), []
-            for it, score in all_candidates:
+            for it, _ in all_candidates:
                 if it not in seen:
                     final.append(it)
                     seen.add(it)
                 if len(final) >= top_k:
                     break
 
-            recommendations[user_id] = final
+            # если не хватает, добавляем популярные
+            if len(final) < top_k:
+                for it in popular_items:
+                    if it not in seen:
+                        final.append(it)
+                        seen.add(it)
+                    if len(final) >= top_k:
+                        break
+
+            top_items = final[:top_k]
+
+            batch_rows.append(
+                {
+                    "user_id": user_id,
+                    "item_id_1 item_id_2 ... item_id_100": " ".join(
+                        map(str, top_items)
+                    ),
+                }
+            )
+
+            # записываем батч
+            if len(batch_rows) >= batch_size:
+                pd.DataFrame(batch_rows).to_csv(
+                    filename,
+                    index=False,
+                    mode="w" if first_run else "a",
+                    header=first_run,
+                )
+                first_run = False
+                batch_rows = []
 
         except Exception as e:
             print(f"Ошибка для пользователя {user_id}: {e}")
-            recommendations[user_id] = popularity_s.index[:top_k].tolist()
+            continue
 
-    return recommendations
+    if batch_rows:
+        pd.DataFrame(batch_rows).to_csv(
+            filename, index=False, mode="w" if first_run else "a", header=first_run
+        )
+
+
+def evaluate_ndcg_iter(
+    model,
+    user_map,
+    item_map,
+    user_items_csr,
+    test_df,
+    popularity_s,
+    users_df,
+    recent_items_map=None,
+    top_k=100,
+    recent_n=5,
+    similar_top_n_seed=20,
+    blend_sim_beta=0.3,
+):
+    recent_items_map = recent_items_map or {}
+    inv_item_map = {int(v): int(k) for k, v in item_map.items()}
+    popular_items = popularity_s.index.tolist()
+
+    # создаем ground truth
+    gt = test_df.groupby("user_id")["item_id"].apply(set).to_dict()
+
+    ndcg_sum = 0.0
+    n_users = 0
+
+    for user_id in tqdm(users_df["user_id"], desc="Evaluate NDCG iter"):
+        try:
+            user_idx_int = user_map.get(user_id)
+
+            # ======== Tracker / купленные ========
+            user_tracker = interactions_df[interactions_df["user_id"] == user_id]
+            user_bought_items = set(user_tracker[user_tracker["weight"] > 0]["item_id"])
+            tracker_scored = (
+                user_tracker[["item_id", "weight"]].drop_duplicates().values.tolist()
+            )
+
+            # ======== ALS рекомендации ========
+            if user_idx_int is not None and user_idx_int < user_items_csr.shape[0]:
+                rec = model.recommend(
+                    userid=user_idx_int,
+                    user_items=user_items_csr[user_idx_int],
+                    N=top_k * 2,
+                    filter_already_liked_items=True,
+                    recalculate_user=True,
+                )
+                als_items = [
+                    (inv_item_map[int(r[0])], float(r[1]))
+                    for r in rec
+                    if len(r) == 2 and int(r[0]) in inv_item_map
+                ]
+                als_scored = [
+                    (it, score * 0.5)
+                    for it, score in als_items
+                    if it not in user_bought_items
+                ]
+            else:
+                als_scored = []
+
+            # ======== Последние товары ========
+            recent_items = recent_items_map.get(user_id, [])
+            recent_scored = [
+                (it, 1.0)
+                for it in recent_items[:recent_n]
+                if it not in user_bought_items
+            ]
+
+            # ======== Похожие товары ========
+            sim_items = []
+            for rit in recent_items:
+                if rit in item_map:
+                    try:
+                        sims = model.similar_items(
+                            int(item_map[rit]), N=similar_top_n_seed
+                        )
+                        sim_items.extend(
+                            [
+                                inv_item_map[int(si[0])]
+                                for si in sims
+                                if len(si) == 2 and int(si[0]) in inv_item_map
+                            ]
+                        )
+                    except Exception:
+                        continue
+            sim_items = list(dict.fromkeys(sim_items))
+            sim_quota = int(top_k * blend_sim_beta)
+            sim_scored = [
+                (it, 0.5) for it in sim_items[:sim_quota] if it not in user_bought_items
+            ]
+
+            # ======== Популярные товары ========
+            min_score = min((s for _, s in als_scored), default=0.1)
+            pop_scored = [
+                (it, min_score * 0.1)
+                for it in popular_items
+                if it not in user_bought_items
+            ]
+
+            # ======== Объединяем и сортируем по весу ========
+            all_candidates = (
+                tracker_scored + als_scored + recent_scored + sim_scored + pop_scored
+            )
+            all_candidates = sorted(all_candidates, key=lambda x: x[1], reverse=True)
+
+            # уникализируем top_k
+            seen, final = set(), []
+            for it, _ in all_candidates:
+                if it not in seen:
+                    final.append(it)
+                    seen.add(it)
+                if len(final) >= top_k:
+                    break
+
+            recommended = final if final else popular_items[:top_k]
+
+            # NDCG
+            user_gt = gt.get(user_id, set())
+            ndcg_sum += ndcg_at_k(recommended, user_gt, k=top_k)
+            n_users += 1
+
+        except Exception as e:
+            print(f"Ошибка для пользователя {user_id}: {e}")
+            continue
+
+    return ndcg_sum / n_users if n_users > 0 else 0.0
 
 
 # -------------------- Строим словарь "какие товары похожи на какой" --------------------
@@ -381,6 +654,36 @@ def evaluate_ndcg(recommendations, test_df, k=100):
     return float(np.mean(scores)) if scores else 0.0
 
 
+def build_recent_items_map_from_batches(batch_dir, recent_n=5):
+    """
+    batch_dir: путь к папке с батчами interactions (orders + tracker)
+    recent_n: сколько последних товаров хранить для каждого пользователя
+    Возвращает словарь user_id -> list последних item_id
+    """
+    recent_items_map = {}
+    batch_files = sorted(Path(batch_dir).glob("*.parquet"))
+
+    for f in batch_files:
+        print(f"Обрабатываем батч: {f}")
+        df = pd.read_parquet(f, columns=["user_id", "item_id", "timestamp"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df.sort_values(["user_id", "timestamp"], ascending=[True, False])
+
+        for uid, g in df.groupby("user_id"):
+            items = g["item_id"].head(recent_n).tolist()
+            if uid not in recent_items_map:
+                recent_items_map[uid] = items
+            else:
+                # объединяем предыдущие и новые, сортируем по времени и оставляем последние recent_n
+                combined = pd.Series(recent_items_map[uid] + items)
+                recent_items_map[uid] = combined.head(recent_n).tolist()
+
+        del df
+        gc.collect()
+
+    return recent_items_map
+
+
 # -------------------- Сохранение --------------------
 def save_model(
     model,
@@ -402,22 +705,14 @@ def save_submission_csv(
 ):
     print("Сохраняем submission CSV...")
     os.makedirs(os.path.dirname(filename), exist_ok=True)
-
     popular_items = popularity_s.index.tolist() if popularity_s is not None else []
-    submission_data = []
 
+    submission_data = []
     for user_id, items in tqdm(recommendations.items(), desc="Save CSV"):
         items = list(items[:top_k])
-
-        if len(items) < top_k and popular_items:
-            for pop_item in popular_items:
-                if pop_item not in items:
-                    items.append(pop_item)
-                if len(items) >= top_k:
-                    break
-
-        if len(items) < top_k:
-            items.extend([items[0]] * (top_k - len(items)))
+        missing = top_k - len(items)
+        if missing > 0 and popular_items:
+            items.extend([x for x in popular_items if x not in items][:missing])
 
         submission_data.append(
             {
@@ -435,30 +730,34 @@ def save_submission_csv(
 # -------------------- Основной запуск --------------------
 if __name__ == "__main__":
     K = 100
-    RECENT_N = 5
+    RECENT_N = 20
     TEST_SIZE = 0.2
     SIMILAR_SEED = 20
-    BLEND_SIM_BETA = 0.3  # доля похожих в топ@K
+    BLEND_SIM_BETA = 0.3
 
-    # 1) Load & filter
+    # -------------------- Load & filter --------------------
     orders_ddf, tracker_ddf, items_ddf, categories_ddf, test_users_ddf = (
         load_train_data()
     )
     orders_ddf, tracker_ddf, items_ddf = filter_data(orders_ddf, tracker_ddf, items_ddf)
 
-    # 2) Split by time on PURCHASES
+    # -------------------- Split --------------------
     orders_df_full = orders_ddf.compute()
     train_orders_df, test_orders_df, cutoff_ts_per_user = train_test_split_by_time(
-        orders_df_full, test_size=TEST_SIZE
+        orders_df_full, TEST_SIZE
     )
 
-    # 3) Build interactions (train orders + tracker before cutoff)
-    interactions_df_train = prepare_interactions(
+    # -------------------- Prepare interactions batches --------------------
+    interactions_files = prepare_interactions(
         train_orders_df, tracker_ddf, cutoff_ts_per_user, scale_days=30
     )
 
-    # 4) Train ALS
-    model, user_map, item_map = train_als(interactions_df_train)
+    # -------------------- Recent items map --------------------
+    batch_dir = "/home/root6/python/e_cup/rec_system/data/processed/prepare_interactions_batches"
+    recent_items_map = build_recent_items_map_from_batches(batch_dir, recent_n=RECENT_N)
+
+    # -------------------- Train ALS --------------------
+    model, user_map, item_map = train_als(interactions_files)
     save_model(
         model,
         user_map,
@@ -466,60 +765,50 @@ if __name__ == "__main__":
         path="/home/root6/python/e_cup/rec_system/src/models/model_als.pkl",
     )
 
-    # 5) Popularity from TRAIN purchases
+    # -------------------- Popularity --------------------
     popularity_s = compute_global_popularity(train_orders_df)
 
-    # 6) Матрица user-items CSR для recommend
-    user_items_csr = build_user_items_csr(interactions_df_train, user_map, item_map)
+    # -------------------- User-items CSR --------------------
+    user_items_csr = build_user_items_csr(interactions_files, user_map, item_map)
 
-    # 7) Recommendations for test users file (submission)
+    # -------------------- Items & test users --------------------
     with ProgressBar():
         items_df_pd = items_ddf.compute()
-
     with ProgressBar():
         test_users_df = test_users_ddf.compute()
 
-    print("Генерируем рекомендации для SUBMISSION...")
-    recs_for_submission = generate_recommendations_hybrid(
+    # -------------------- Generate submission --------------------
+    interactions_df = pd.concat(
+        [pd.read_parquet(f) for f in interactions_files], ignore_index=True
+    )
+    generate_and_save_recommendations_iter(
         model=model,
         user_map=user_map,
         item_map=item_map,
         user_items_csr=user_items_csr,
-        interactions_df=interactions_df_train,
-        items_df=items_df_pd,
-        categories_df=categories_ddf,
-        users_df=test_users_df[["user_id"]],
+        interactions_df=interactions_df,  # <- сюда добавлено
         popularity_s=popularity_s,
+        users_df=test_users_df[["user_id"]],
+        recent_items_map=recent_items_map,
         top_k=K,
-        recent_n=RECENT_N,
         similar_top_n_seed=SIMILAR_SEED,
         blend_sim_beta=BLEND_SIM_BETA,
-    )
-    save_submission_csv(
-        recs_for_submission,
-        top_k=K,
+        batch_size=10000,
         filename="/home/root6/python/e_cup/rec_system/result/submission.csv",
     )
 
-    # 8) Evaluation NDCG@100 on temporal test split (users who have test purchases)
-    print("Генерируем рекомендации для EVAL...")
-    users_with_test_df = test_orders_df[["user_id"]].drop_duplicates()
-    recs_for_eval = generate_recommendations_hybrid(
+    # -------------------- Evaluate NDCG --------------------
+    ndcg100 = evaluate_ndcg_iter(
         model=model,
         user_map=user_map,
         item_map=item_map,
         user_items_csr=user_items_csr,
-        interactions_df=interactions_df_train,
-        items_df=items_df_pd,
-        categories_df=categories_ddf,
-        users_df=test_users_df[["user_id"]],
+        test_df=test_orders_df[["user_id", "item_id"]],
         popularity_s=popularity_s,
+        users_df=test_orders_df[["user_id"]].drop_duplicates(),
+        recent_items_map=recent_items_map,
         top_k=K,
-        recent_n=RECENT_N,
         similar_top_n_seed=SIMILAR_SEED,
         blend_sim_beta=BLEND_SIM_BETA,
-    )
-    ndcg100 = evaluate_ndcg(
-        recs_for_eval, test_orders_df[["user_id", "item_id"]], k=100
     )
     print(f"NDCG@100 (temporal split): {ndcg100:.6f}")
