@@ -1,3 +1,5 @@
+import os
+import shutil
 from collections import Counter
 
 import dask
@@ -14,7 +16,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=0):
+def load_train_data(max_parts=0, max_rows=100_000):  # 0 = использовать все что есть
     print("=== Загрузка данных через Dask ===")
 
     paths = {
@@ -85,10 +87,14 @@ def filter_data(orders_ddf, tracker_ddf, items_ddf):
 
 
 # -------------------- Считаем взаимодействия пользователя --------------------
-def compute_user_interactions(tracker_ddf, action_weights=None):
+def compute_user_interactions(tracker_ddf, action_weights=None, out_file=None):
     """
-    Быстрый батчевый подсчет интереса пользователя к товарам на CPU с Dask.
-    Возвращает словарь: user_id -> Counter({item_id: суммарный вес})
+    Инкрементальная обработка Dask DataFrame с подсчетом веса действий.
+    Экономит память за счет оптимизации типов (int32/int16) и промежуточного сохранения.
+
+    Возвращает путь к итоговому Parquet.
+
+    out_file: путь к итоговому Parquet (если None, используется стандартный путь)
     """
     if action_weights is None:
         action_weights = {"page_view": 1, "favorite": 2, "to_cart": 3}
@@ -98,23 +104,52 @@ def compute_user_interactions(tracker_ddf, action_weights=None):
         weight=tracker_ddf["action_type"].map(action_weights).fillna(0)
     )
 
-    print("-> Группируем по user_id и item_id и суммируем веса...")
-    with ProgressBar():
-        grouped = (
-            tracker_ddf.groupby(["user_id", "item_id"])["weight"]
-            .sum()
-            .compute()  # Dask агрегирует партициями и выводит pandas Series
-        )
+    if out_file is None:
+        out_file = "/home/root6/python/e_cup/rec_system/data/processed/user_item_weights.parquet"
+    os.makedirs(os.path.dirname(out_file), exist_ok=True)
 
-    # Сохраняем промежуточный результат на диск
-    print("-> Сохраняем результат в Parquet...")
-    grouped.reset_index().to_parquet(
-        "/home/root6/python/e_cup/rec_system/data/processed/user_item_weights.parquet"
-    )
+    print("-> Обрабатываем партиции и обновляем итоговый Parquet...")
+    for i in range(tracker_ddf.npartitions):
+        part = tracker_ddf.get_partition(i).compute()
 
+        # Оптимизация типов для экономии памяти
+        part["user_id"] = part["user_id"].astype("int32")
+        part["item_id"] = part["item_id"].astype("int32")
+        part["weight"] = part["weight"].astype(
+            "int16"
+        )  # предполагается, что вес не превышает 32767
+
+        # Группировка по user_id и item_id
+        df_grouped = part.groupby(["user_id", "item_id"])["weight"].sum().reset_index()
+
+        if os.path.exists(out_file):
+            # Загружаем текущие результаты и суммируем
+            current = pd.read_parquet(out_file)
+            current["user_id"] = current["user_id"].astype("int32")
+            current["item_id"] = current["item_id"].astype("int32")
+            current["weight"] = current["weight"].astype("int16")
+
+            df_grouped = pd.concat([current, df_grouped], ignore_index=True)
+            df_grouped = (
+                df_grouped.groupby(["user_id", "item_id"])["weight"].sum().reset_index()
+            )
+
+        # Сохраняем обратно
+        df_grouped.to_parquet(out_file, index=False)
+        print(f"-> Партиция {i} обработана и обновлена в Parquet")
+
+    print("-> Обработка завершена. Итоговый Parquet готов.")
+
+    # Преобразование в словарь user_id -> Counter({item_id: weight})
     print("-> Преобразуем в словарь user_id -> Counter({item_id: weight})...")
     result = {}
-    for (user, item), w in grouped.items():
+    grouped_df = pd.read_parquet(out_file)
+    grouped_df["user_id"] = grouped_df["user_id"].astype("int32")
+    grouped_df["item_id"] = grouped_df["item_id"].astype("int32")
+    grouped_df["weight"] = grouped_df["weight"].astype("int16")
+
+    for _, row in grouped_df.iterrows():
+        user, item, w = row["user_id"], row["item_id"], row["weight"]
         if user not in result:
             result[user] = Counter()
         result[user][item] = w
@@ -125,28 +160,23 @@ def compute_user_interactions(tracker_ddf, action_weights=None):
 
 # -------------------- Генерация рекомендаций --------------------
 def recommend_user_based(
-    orders_ddf, tracker_ddf, test_users_ddf, top_k=100, recent_n=5
+    orders_ddf, tracker_ddf, items_df, test_users_ddf, top_k=100, recent_n=5
 ):
-    """
-    Рекомендации с учетом:
-    - последних покупок пользователя
-    - частоты взаимодействий с товарами (tracker)
-    - дополнение глобальными популярными товарами
-    """
-
     print("=== Начинаем вычисление рекомендаций ===")
 
     # --- 1. Последние покупки ---
     print("-> Обрабатываем последние покупки пользователей...")
     orders_df = orders_ddf.compute().sort_values(["user_id", "created_timestamp"])
     test_users_df = test_users_ddf.compute()
+
     user_items_weighted = {}
     for user_id, group in tqdm(orders_df.groupby("user_id"), desc="Последние покупки"):
         items = group["item_id"].tolist()
         weights = [1] * len(items)
+        # уменьшаем вес последних recent_n покупок
         if len(items) > recent_n:
             for i in range(-recent_n, 0):
-                weights[i] *= 2
+                weights[i] *= 0.5
         counter = Counter()
         for item, w in zip(items, weights):
             counter[item] += w
@@ -155,9 +185,7 @@ def recommend_user_based(
 
     # --- 2. Интерес пользователя через tracker ---
     print("-> Считаем взаимодействия пользователя с товарами (tracker)...")
-    user_interactions = compute_user_interactions(
-        tracker_ddf
-    )  # предполагается, что функция уже есть
+    user_interactions = compute_user_interactions(tracker_ddf)
     for user_id, counter in tqdm(
         user_interactions.items(), desc="Интерес пользователя"
     ):
@@ -172,7 +200,7 @@ def recommend_user_based(
     popular_items = orders_df["item_id"].value_counts().index.tolist()
     print("-> Глобальные популярные товары сформированы")
 
-    # --- 4. Формируем рекомендации ---
+    # --- 4. Генерация рекомендаций ---
     print("-> Генерируем рекомендации для пользователей...")
     recommendations = {}
     for user_id in tqdm(
@@ -180,22 +208,59 @@ def recommend_user_based(
     ):
         counter = user_items_weighted.get(user_id, Counter())
         top_items = [item for item, _ in counter.most_common(top_k)]
-        # дополняем популярными
+
+        # --- 4a. Добавляем связанные товары ---
+        augmented = []
+        for item in top_items:
+            related = get_related_items(item, items_df, top_n=3)
+            augmented.extend(related)
+        for item in augmented:
+            if item not in top_items:
+                top_items.append(item)
+            if len(top_items) >= top_k:
+                break
+
+        # --- 4b. Дополняем популярными, если не хватает ---
         if len(top_items) < top_k:
             for item in popular_items:
                 if item not in top_items:
                     top_items.append(item)
                 if len(top_items) >= top_k:
                     break
-        recommendations[user_id] = top_items
-    print("-> Рекомендации сформированы")
 
+        recommendations[user_id] = top_items[:top_k]
+
+    print("-> Рекомендации сформированы")
     print("=== Завершено ===")
     return recommendations
 
 
+def get_related_items(item_id, items_df, top_n=5):
+    """
+    Получаем товары из той же категории (catalogid), исключая сам товар.
+    catalogid всегда int.
+    """
+    row = items_df.loc[items_df["item_id"] == item_id]
+    if row.empty:
+        return []
+
+    catalog_id = row["catalogid"].values[0]
+
+    # Фильтруем товары той же категории
+    related = items_df[items_df["catalogid"] == catalog_id]["item_id"].tolist()
+
+    # Исключаем исходный товар
+    related = [i for i in related if i != item_id]
+
+    return related[:top_n]
+
+
 # -------------------- Сохранение --------------------
-def save_submission_csv(recommendations, top_k=100, filename="submission.csv"):
+def save_submission_csv(
+    recommendations,
+    top_k=100,
+    filename="/home/root6/python/e_cup/rec_system/result/submission.csv",
+):
     submission_data = []
     for user_id, items in recommendations.items():
         submission_data.append(
@@ -225,8 +290,9 @@ if __name__ == "__main__":
 
     # 3. Рекомендации с учетом последних покупок и взаимодействий
     print("Подбор рекомендаций")
+    items_df = items_ddf.compute()  # <- преобразуем Dask в pandas
     recommendations = recommend_user_based(
-        orders_ddf, tracker_ddf, test_users_ddf, top_k=K, recent_n=recent_n
+        orders_ddf, tracker_ddf, items_df, test_users_ddf, top_k=K, recent_n=recent_n
     )
 
     # 4. Сохранение
