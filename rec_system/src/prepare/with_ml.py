@@ -15,15 +15,16 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=100000000):
+def load_train_data(max_parts=0, max_rows=0):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
+    Если колонка отсутствует в файле, пропускаем её.
     """
     paths = {
         "orders": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_orders_data/*/*.parquet",
         "tracker": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_tracker_data/*/*.parquet",
         "items": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_items_data/*.parquet",
-        "categories": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_categories_tree/*.parquet",
+        "categories": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train_final_categories_tree/*.parquet",
         "test_users": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_test_for_participants/test_for_participants/*.parquet",
     }
 
@@ -36,14 +37,36 @@ def load_train_data(max_parts=0, max_rows=100000000):
     }
 
     def read_sample(path, columns=None, name=""):
-        ddf = dd.read_parquet(path, columns=columns)
+        ddf = dd.read_parquet(path)
+        # оставляем только колонки, которые реально есть
+        if columns is not None:
+            available_cols = [c for c in columns if c in ddf.columns]
+            if not available_cols:
+                print(f"{name}: ни одна из колонок {columns} не найдена, пропускаем")
+                return dd.from_pandas(pd.DataFrame(), npartitions=1)
+            ddf = ddf[available_cols]
+
+        total_parts = ddf.npartitions
         if max_parts > 0:
-            ddf = ddf.partitions[: min(ddf.npartitions, max_parts)]
+            used_parts = min(total_parts, max_parts)
+            ddf = ddf.partitions[:used_parts]
+        else:
+            used_parts = total_parts
+
         if max_rows > 0:
             sample_df = ddf.head(max_rows, compute=True)
             ddf = dd.from_pandas(sample_df, npartitions=1)
+
         count = ddf.shape[0].compute()
-        print(f"{name}: {count:,} строк")
+        mem_bytes = (
+            ddf.map_partitions(lambda df: df.memory_usage(deep=True).sum())
+            .compute()
+            .sum()
+        )
+        mem_mb = mem_bytes / (1024**2)
+        print(
+            f"{name}: {count:,} строк (использовано {used_parts} из {total_parts} партиций), ~{mem_mb:.1f} MB"
+        )
         return ddf
 
     print("Загружаем данные...")
@@ -116,12 +139,14 @@ def prepare_interactions(
     Формируем веса user-item:
     - Заказы (train) с временным весом.
     - Tracker-ивенты до cutoff.
+    Сохраняем timestamp для recent_items.
     """
     print("Формируем матрицу взаимодействий...")
     if action_weights is None:
         action_weights = {"page_view": 1, "favorite": 2, "to_cart": 3}
 
     orders_df = train_orders_df.copy()
+    orders_df["created_timestamp"] = pd.to_datetime(orders_df["created_timestamp"])
     ref_time = (
         orders_df["created_timestamp"].max()
         if not orders_df.empty
@@ -129,35 +154,35 @@ def prepare_interactions(
     )
     base_weight = 5.0
 
-    orders_df["days_ago"] = (
-        ref_time - pd.to_datetime(orders_df["created_timestamp"])
-    ).dt.days.clip(lower=1)
+    orders_df["days_ago"] = (ref_time - orders_df["created_timestamp"]).dt.days.clip(
+        lower=1
+    )
     orders_df["time_factor"] = np.log1p(orders_df["days_ago"] / scale_days)
     orders_df["weight"] = base_weight * orders_df["time_factor"]
+    orders_df = orders_df.rename(columns={"created_timestamp": "timestamp"})
 
     tracker_df = tracker_ddf.compute()
     tracker_df["timestamp"] = pd.to_datetime(tracker_df["timestamp"])
     tracker_df["aw"] = tracker_df["action_type"].map(action_weights).fillna(0)
-
     tracker_df["cutoff"] = tracker_df["user_id"].map(cutoff_ts_per_user)
     tracker_df = tracker_df[
         (tracker_df["cutoff"].isna()) | (tracker_df["timestamp"] < tracker_df["cutoff"])
     ]
-
     tracker_df["days_ago"] = (ref_time - tracker_df["timestamp"]).dt.days.clip(lower=1)
     tracker_df["time_factor"] = np.log1p(tracker_df["days_ago"] / scale_days)
     tracker_df["weight"] = tracker_df["aw"] * tracker_df["time_factor"]
 
     interactions_df = pd.concat(
         [
-            orders_df[["user_id", "item_id", "weight"]],
-            tracker_df[["user_id", "item_id", "weight"]],
+            orders_df[["user_id", "item_id", "weight", "timestamp"]],
+            tracker_df[["user_id", "item_id", "weight", "timestamp"]],
         ],
         ignore_index=True,
     )
-
-    interactions_df = (
-        interactions_df.groupby(["user_id", "item_id"])["weight"].sum().reset_index()
+    interactions_df = interactions_df.groupby(
+        ["user_id", "item_id"], as_index=False
+    ).agg(
+        {"weight": "sum", "timestamp": "max"}  # сохраняем последнее взаимодействие
     )
     print(f"Матрица взаимодействий: {interactions_df.shape}")
     return interactions_df
@@ -225,7 +250,7 @@ def build_user_items_csr(interactions_df, user_map, item_map):
     return coo.tocsr()
 
 
-# -------------------- Рекомендации (ALS + похожие + popular) --------------------
+# -------------------- Recommendations (ALS + recent + similar + popular) --------------------
 def generate_recommendations_hybrid(
     model,
     user_map,
@@ -243,13 +268,17 @@ def generate_recommendations_hybrid(
 ):
     inv_user_map = {v: k for k, v in user_map.items()}
     inv_item_map = {v: k for k, v in item_map.items()}
-
     recommendations = {}
-    sim_model = model  # пока берём тот же ALS для похожести
+    sim_model = model  # пока используем тот же ALS для похожих
+
+    # сортируем interactions для быстрого recent_items
+    interactions_df_sorted = interactions_df.sort_values(
+        ["user_id", "timestamp"], ascending=[True, False]
+    )
 
     for user_id, user_idx in tqdm(user_map.items(), desc="Hybrid recommendations"):
         try:
-            # --- ALS рекомендации ---
+            # ALS рекомендации
             rec = model.recommend(
                 userid=user_idx,
                 user_items=user_items_csr[user_idx],
@@ -259,38 +288,39 @@ def generate_recommendations_hybrid(
             )
             als_items = [(inv_item_map[i], float(score)) for i, score in rec]
 
-            # --- последние товары ---
+            # последние товары по timestamp
             recent_items = (
-                interactions_df[interactions_df["user_id"] == user_id]
-                .sort_values("timestamp", ascending=False)["item_id"]
+                interactions_df_sorted[interactions_df_sorted["user_id"] == user_id][
+                    "item_id"
+                ]
                 .head(recent_n)
                 .tolist()
             )
 
-            # --- похожие к последним ---
+            # похожие к последним
             sim_items = []
             for rit in recent_items:
                 if rit in item_map:
                     sims = sim_model.similar_items(item_map[rit], N=similar_top_n_seed)
                     sim_items.extend([inv_item_map[i] for i, _ in sims])
-            sim_items = list(dict.fromkeys(sim_items))  # уникальные, сохраняем порядок
+            sim_items = list(
+                dict.fromkeys(sim_items)
+            )  # уникальные, порядок сохраняется
 
-            # --- скоринг для blend ---
+            # blend похожих
             sim_quota = int(top_k * blend_sim_beta)
             min_als_score = min((s for _, s in als_items), default=1.0)
             sim_scored = [(it, min_als_score * 0.5) for it in sim_items[:sim_quota]]
 
-            # --- популярные (ещё слабее) ---
+            # популярные
             popular_items_full = popularity_s.index.tolist()
             pop_scored = [(it, min_als_score * 0.1) for it in popular_items_full]
 
-            # --- объединяем ---
+            # объединяем и сортируем
             all_candidates = als_items + sim_scored + pop_scored
-
-            # сортируем по score
             all_candidates = sorted(all_candidates, key=lambda x: x[1], reverse=True)
 
-            # убираем дубли, ограничиваем top_k
+            # уникализация top_k
             seen, final = set(), []
             for it, score in all_candidates:
                 if it not in seen:
