@@ -22,7 +22,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=0):
+def load_train_data(max_parts=0, max_rows=1000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Если колонка отсутствует в файле, пропускаем её.
@@ -1218,7 +1218,7 @@ if __name__ == "__main__":
     TEST_SIZE = 0.2
 
     # Параметры масштабирования
-    SCALING_STAGE = "full"  # small, medium, large, full
+    SCALING_STAGE = "small"  # small, medium, large, full
 
     scaling_config = {
         "small": {"sample_users": 500, "sample_fraction": 0.1},
