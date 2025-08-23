@@ -17,7 +17,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=0):
+def load_train_data(max_parts=0, max_rows=10000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Если колонка отсутствует в файле, пропускаем её.
@@ -313,7 +313,7 @@ def generate_and_save_recommendations_iter(
     user_map,
     item_map,
     user_items_csr,
-    interactions_df,
+    interactions_files,
     popularity_s,
     users_df,
     recent_items_map=None,
@@ -321,12 +321,17 @@ def generate_and_save_recommendations_iter(
     recent_n=5,
     similar_top_n_seed=20,
     blend_sim_beta=0.3,
-    blend_cat_beta=0.3,  # новый параметр для категорий
+    blend_cat_beta=0.3,
     batch_size=10_000,
     filename="/home/root6/python/e_cup/rec_system/result/submission.csv",
     item_to_cat=None,
     cat_to_items=None,
 ):
+    import os
+
+    import pandas as pd
+    from tqdm import tqdm
+
     recent_items_map = recent_items_map or {}
     inv_item_map = {int(v): int(k) for k, v in item_map.items()}
     popular_items = popularity_s.index.tolist()
@@ -339,10 +344,20 @@ def generate_and_save_recommendations_iter(
 
     for user_id in tqdm(users_df["user_id"], desc="Hybrid recommendations iter"):
         try:
-            user_idx_int = user_map.get(user_id)
+            # ======== Загружаем только нужные строки из батчей ========
+            user_tracker_list = []
+            for f in interactions_files:
+                df = pd.read_parquet(f)
+                user_rows = df[df["user_id"] == user_id]
+                if not user_rows.empty:
+                    user_tracker_list.append(user_rows)
+            if user_tracker_list:
+                user_tracker = pd.concat(user_tracker_list, ignore_index=True)
+            else:
+                user_tracker = pd.DataFrame(
+                    columns=["user_id", "item_id", "weight", "timestamp"]
+                )
 
-            # ======== Купленные / tracker-взаимодействия ========
-            user_tracker = interactions_df[interactions_df["user_id"] == user_id]
             user_bought_items = set(user_tracker[user_tracker["weight"] > 0]["item_id"])
             tracker_scored = (
                 user_tracker[["item_id", "weight"]].drop_duplicates().values.tolist()
@@ -350,6 +365,7 @@ def generate_and_save_recommendations_iter(
 
             # ======== ALS рекомендации ========
             als_scored = []
+            user_idx_int = user_map.get(user_id)
             if user_idx_int is not None and user_idx_int < user_items_csr.shape[0]:
                 try:
                     rec = model.recommend(
@@ -436,7 +452,6 @@ def generate_and_save_recommendations_iter(
             )
             all_candidates = sorted(all_candidates, key=lambda x: x[1], reverse=True)
 
-            # уникализируем top_k
             seen, final = set(), []
             for it, _ in all_candidates:
                 if it not in seen:
@@ -494,12 +509,16 @@ def evaluate_ndcg_iter(
     test_df,
     popularity_s,
     users_df,
+    interactions_files,
     recent_items_map=None,
     top_k=100,
     recent_n=5,
     similar_top_n_seed=20,
     blend_sim_beta=0.3,
 ):
+    import pandas as pd
+    from tqdm import tqdm
+
     recent_items_map = recent_items_map or {}
     inv_item_map = {int(v): int(k) for k, v in item_map.items()}
     popular_items = popularity_s.index.tolist()
@@ -514,34 +533,48 @@ def evaluate_ndcg_iter(
         try:
             user_idx_int = user_map.get(user_id)
 
-            # ======== Tracker / купленные ========
-            user_tracker = interactions_df[interactions_df["user_id"] == user_id]
+            # ======== Загружаем интеракции пользователя из батчей ========
+            user_tracker_list = []
+            for f in interactions_files:
+                df = pd.read_parquet(f)
+                user_rows = df[df["user_id"] == user_id]
+                if not user_rows.empty:
+                    user_tracker_list.append(user_rows)
+            if user_tracker_list:
+                user_tracker = pd.concat(user_tracker_list, ignore_index=True)
+            else:
+                user_tracker = pd.DataFrame(
+                    columns=["user_id", "item_id", "weight", "timestamp"]
+                )
+
             user_bought_items = set(user_tracker[user_tracker["weight"] > 0]["item_id"])
             tracker_scored = (
                 user_tracker[["item_id", "weight"]].drop_duplicates().values.tolist()
             )
 
             # ======== ALS рекомендации ========
+            als_scored = []
             if user_idx_int is not None and user_idx_int < user_items_csr.shape[0]:
-                rec = model.recommend(
-                    userid=user_idx_int,
-                    user_items=user_items_csr[user_idx_int],
-                    N=top_k * 2,
-                    filter_already_liked_items=True,
-                    recalculate_user=True,
-                )
-                als_items = [
-                    (inv_item_map[int(r[0])], float(r[1]))
-                    for r in rec
-                    if len(r) == 2 and int(r[0]) in inv_item_map
-                ]
-                als_scored = [
-                    (it, score * 0.5)
-                    for it, score in als_items
-                    if it not in user_bought_items
-                ]
-            else:
-                als_scored = []
+                try:
+                    rec = model.recommend(
+                        userid=user_idx_int,
+                        user_items=user_items_csr[user_idx_int],
+                        N=top_k * 2,
+                        filter_already_liked_items=True,
+                        recalculate_user=True,
+                    )
+                    als_items = [
+                        (inv_item_map[int(r[0])], float(r[1]))
+                        for r in rec
+                        if len(r) == 2 and int(r[0]) in inv_item_map
+                    ]
+                    als_scored = [
+                        (it, score * 0.5)
+                        for it, score in als_items
+                        if it not in user_bought_items
+                    ]
+                except Exception as e:
+                    print(f"Ошибка ALS для пользователя {user_id}: {e}")
 
             # ======== Последние товары ========
             recent_items = recent_items_map.get(user_id, [])
@@ -582,13 +615,12 @@ def evaluate_ndcg_iter(
                 if it not in user_bought_items
             ]
 
-            # ======== Объединяем и сортируем по весу ========
+            # ======== Объединяем и сортируем ========
             all_candidates = (
                 tracker_scored + als_scored + recent_scored + sim_scored + pop_scored
             )
             all_candidates = sorted(all_candidates, key=lambda x: x[1], reverse=True)
 
-            # уникализируем top_k
             seen, final = set(), []
             for it, _ in all_candidates:
                 if it not in seen:
@@ -599,7 +631,7 @@ def evaluate_ndcg_iter(
 
             recommended = final if final else popular_items[:top_k]
 
-            # NDCG
+            # ======== NDCG ========
             user_gt = gt.get(user_id, set())
             ndcg_sum += ndcg_at_k(recommended, user_gt, k=top_k)
             n_users += 1
@@ -778,15 +810,12 @@ if __name__ == "__main__":
         test_users_df = test_users_ddf.compute()
 
     # -------------------- Generate submission --------------------
-    interactions_df = pd.concat(
-        [pd.read_parquet(f) for f in interactions_files], ignore_index=True
-    )
     generate_and_save_recommendations_iter(
         model=model,
         user_map=user_map,
         item_map=item_map,
         user_items_csr=user_items_csr,
-        interactions_df=interactions_df,  # <- сюда добавлено
+        interactions_files=interactions_files,
         popularity_s=popularity_s,
         users_df=test_users_df[["user_id"]],
         recent_items_map=recent_items_map,
@@ -806,6 +835,7 @@ if __name__ == "__main__":
         test_df=test_orders_df[["user_id", "item_id"]],
         popularity_s=popularity_s,
         users_df=test_orders_df[["user_id"]].drop_duplicates(),
+        interactions_files=interactions_files,  # <- список батчей
         recent_items_map=recent_items_map,
         top_k=K,
         similar_top_n_seed=SIMILAR_SEED,
