@@ -332,35 +332,67 @@ def build_user_items_csr(
 
 def build_copurchase_map(train_orders_df, min_co_items=2, top_n=10):
     """
-    train_orders_df: колонка user_id, item_id, created_timestamp
-    min_co_items: учитывать только корзины с >= min_co_items товаров
-    top_n: сколько соседних товаров хранить для каждого item
+    Улучшенная версия: строим словарь совместных покупок с весами
     """
-    print("Строим словарь co-purchase...")
-    copurchase_dict = defaultdict(lambda: defaultdict(int))
+    print("Строим улучшенный словарь co-purchase...")
+    copurchase_dict = defaultdict(lambda: defaultdict(float))
 
-    # корзины с более чем 1 товаром
-    grouped = (
-        train_orders_df.groupby(["user_id", "created_timestamp"])["item_id"]
-        .apply(list)
-        .reset_index()
-    )
-    grouped = grouped[grouped["item_id"].map(len) >= min_co_items]
+    # Группируем покупки по пользователям и времени
+    grouped = train_orders_df.groupby(["user_id", "created_timestamp"])[
+        "item_id"
+    ].apply(list)
 
-    for items in grouped["item_id"]:
-        for i, item in enumerate(items):
-            for j, co_item in enumerate(items):
-                if i != j:
-                    copurchase_dict[item][co_item] += 1
+    for items in grouped:
+        if len(items) >= min_co_items:
+            # Взвешиваем по количеству товаров в корзине (чем больше корзина, тем слабее связи)
+            weight = 1.0 / len(items)
+            for i, item1 in enumerate(items):
+                for j, item2 in enumerate(items):
+                    if i != j:
+                        copurchase_dict[item1][item2] += weight
 
-    # оставляем топ-N наиболее частых
+    # Нормализуем и оставляем топ-N
     final_copurchase = {}
     for item, co_items in copurchase_dict.items():
-        sorted_items = sorted(co_items.items(), key=lambda x: x[1], reverse=True)
-        final_copurchase[item] = [it for it, _ in sorted_items[:top_n]]
+        total = sum(co_items.values())
+        # Нормализуем и сортируем
+        sorted_items = sorted(
+            co_items.items(), key=lambda x: x[1] / total, reverse=True
+        )
+        final_copurchase[item] = [
+            (it, weight / total) for it, weight in sorted_items[:top_n]
+        ]
 
     print(f"Co-purchase словарь построен для {len(final_copurchase)} товаров")
     return final_copurchase
+
+
+def build_category_maps(items_df, categories_df):
+    """
+    Строим маппинги товаров к категориям и категорий к товарам
+    """
+    print("Построение категорийных маппингов...")
+
+    # Товар -> категория
+    item_to_cat = items_df.set_index("item_id")["catalogid"].to_dict()
+
+    # Категория -> список товаров
+    cat_to_items = items_df.groupby("catalogid")["item_id"].apply(list).to_dict()
+
+    # Иерархия категорий
+    cat_tree = categories_df.set_index("catalogid")["ids"].to_dict()
+
+    # Расширяем cat_to_items с учетом иерархии
+    extended_cat_to_items = {}
+    for cat_id, items_list in cat_to_items.items():
+        all_items = set(items_list)
+        if cat_id in cat_tree:
+            for parent_cat in cat_tree[cat_id]:
+                if parent_cat in cat_to_items:
+                    all_items.update(cat_to_items[parent_cat])
+        extended_cat_to_items[cat_id] = list(all_items)
+
+    return item_to_cat, extended_cat_to_items
 
 
 # -------------------- Recommendations (ALS + recent + similar + popular) --------------------
@@ -965,6 +997,11 @@ class LightGBMRecommender:
         self.user_embeddings = None
         self.item_embeddings = None
         self.external_embeddings_dict = None
+        self.copurchase_map = None
+        self.item_to_cat = None
+        self.cat_to_items = None
+        self.user_map = None
+        self.item_map = None
 
     def set_als_embeddings(self, als_model):
         """Сохраняем ALS эмбеддинги для использования в признаках"""
@@ -974,6 +1011,16 @@ class LightGBMRecommender:
     def set_external_embeddings(self, embeddings_dict):
         """Устанавливаем внешние эмбеддинги товаров"""
         self.external_embeddings_dict = embeddings_dict
+
+    def set_additional_data(
+        self, copurchase_map, item_to_cat, cat_to_items, user_map, item_map
+    ):
+        """Устанавливаем дополнительные данные"""
+        self.copurchase_map = copurchase_map
+        self.item_to_cat = item_to_cat
+        self.cat_to_items = cat_to_items
+        self.user_map = user_map
+        self.item_map = item_map
 
     def prepare_training_data(
         self,
@@ -986,22 +1033,25 @@ class LightGBMRecommender:
         sample_fraction=0.1,
     ):
         """
-        Подготовка данных для обучения LightGBM
+        Улучшенная подготовка данных для обучения LightGBM
         """
         print("Подготовка данных для LightGBM...")
 
-        # Ограничиваем количество данных для демо
+        # Ограничиваем количество данных
         test_orders_df = test_orders_df.sample(frac=sample_fraction, random_state=42)
 
-        # Собираем все взаимодействия
+        # Собираем ВСЕ взаимодействия для богатых признаков
+        print("Загрузка всех взаимодействий для признаков...")
         all_interactions = []
-        for f in tqdm(
-            interactions_files[:3], desc="Чтение взаимодействий"
-        ):  # Ограничиваем файлы
+        for f in tqdm(interactions_files, desc="Загрузка взаимодействий"):
             df = pd.read_parquet(f)
             all_interactions.append(df)
 
         interactions_df = pd.concat(all_interactions, ignore_index=True)
+
+        # Добавляем временные метки
+        interactions_df["timestamp"] = pd.to_datetime(interactions_df["timestamp"])
+        max_timestamp = interactions_df["timestamp"].max()
 
         # Создаем позитивные пары
         positive_samples = []
@@ -1012,13 +1062,33 @@ class LightGBMRecommender:
 
         positive_df = pd.DataFrame(positive_samples)
 
-        # Создаем негативные сэмплы
-        print("Создание негативных сэмплов...")
+        # Улучшенное негативное сэмплирование
+        print("Улучшенное негативное сэмплирование...")
         negative_samples = []
 
-        # Группируем по пользователям для эффективности
+        # Богатые пользовательские профили
+        user_interaction_stats = (
+            interactions_df.groupby("user_id")
+            .agg(
+                {"weight": ["count", "mean", "sum", "std"], "timestamp": ["max", "min"]}
+            )
+            .reset_index()
+        )
+        user_interaction_stats.columns = [
+            "user_id",
+            "user_int_count",
+            "user_int_mean",
+            "user_int_sum",
+            "user_int_std",
+            "user_last_int",
+            "user_first_int",
+        ]
+
         user_items = interactions_df.groupby("user_id")["item_id"].apply(set).to_dict()
         all_items_set = set(item_map.keys())
+
+        # Создаем копию popularity_s для безопасного доступа
+        popularity_series = popularity_s.copy()
 
         for user_id in tqdm(positive_df["user_id"].unique(), desc="Негативные сэмплы"):
             user_positives = set(
@@ -1030,10 +1100,44 @@ class LightGBMRecommender:
             available_negatives = list(all_items_set - user_interacted - user_positives)
 
             if available_negatives:
-                n_negatives = min(4, len(available_negatives))
-                negative_items = np.random.choice(
-                    available_negatives, n_negatives, replace=False
+                # Увеличиваем количество негативных примеров
+                n_negatives = min(20, len(available_negatives))
+
+                # Стратегическое сэмплирование: популярные + случайные
+                # Фильтруем только те товары, которые есть в popularity_series
+                available_in_popularity = [
+                    item
+                    for item in available_negatives
+                    if item in popularity_series.index
+                ]
+
+                if available_in_popularity:
+                    # Берем топ популярных из доступных
+                    popular_negatives = (
+                        popularity_series[available_in_popularity]
+                        .nlargest(min(10, len(available_in_popularity)))
+                        .index.tolist()
+                    )
+                else:
+                    popular_negatives = []
+
+                # Случайные из оставшихся
+                remaining_negatives = list(
+                    set(available_negatives) - set(popular_negatives)
                 )
+                if remaining_negatives:
+                    random_negatives = np.random.choice(
+                        remaining_negatives,
+                        min(
+                            n_negatives - len(popular_negatives),
+                            len(remaining_negatives),
+                        ),
+                        replace=False,
+                    ).tolist()
+                else:
+                    random_negatives = []
+
+                negative_items = popular_negatives + random_negatives
 
                 for item_id in negative_items:
                     negative_samples.append(
@@ -1045,33 +1149,48 @@ class LightGBMRecommender:
         # Объединяем данные
         train_data = pd.concat([positive_df, negative_df], ignore_index=True)
 
-        # Добавляем признаки
-        train_data = self._add_features(
+        # Добавляем БОГАТЫЕ признаки
+        train_data = self._add_rich_features(
             train_data,
             interactions_df,
             popularity_s,
             recent_items_map,
             user_map,
             item_map,
+            max_timestamp,
         )
 
         return train_data
 
-    def _add_features(
-        self, data, interactions_df, popularity_s, recent_items_map, user_map, item_map
+    def _add_rich_features(
+        self,
+        data,
+        interactions_df,
+        popularity_s,
+        recent_items_map,
+        user_map,
+        item_map,
+        max_timestamp,
     ):
         """
-        Добавление признаков к данным
+        Добавление богатых признаков к данным
         """
+        print("Добавление богатых признаков...")
+
         # Базовые признаки
         data["item_popularity"] = (
             data["item_id"].map(lambda x: popularity_s.get(x, 0.0)).fillna(0.0)
         )
 
-        # Признаки пользователя
+        # === ПРИЗНАКИ ПОЛЬЗОВАТЕЛЯ ===
         user_stats = (
             interactions_df.groupby("user_id")
-            .agg({"weight": ["count", "mean", "sum", "std"]})
+            .agg(
+                {
+                    "weight": ["count", "mean", "sum", "std", "max", "min"],
+                    "timestamp": ["max", "min"],
+                }
+            )
             .reset_index()
         )
         user_stats.columns = [
@@ -1080,14 +1199,31 @@ class LightGBMRecommender:
             "user_mean",
             "user_sum",
             "user_std",
+            "user_max",
+            "user_min",
+            "user_last_ts",
+            "user_first_ts",
         ]
+
+        # Время с последнего взаимодействия
+        user_stats["user_days_since_last"] = (
+            max_timestamp - user_stats["user_last_ts"]
+        ).dt.days
+        user_stats["user_days_since_first"] = (
+            max_timestamp - user_stats["user_first_ts"]
+        ).dt.days
 
         data = data.merge(user_stats, on="user_id", how="left")
 
-        # Признаки товара
+        # === ПРИЗНАКИ ТОВАРА ===
         item_stats = (
             interactions_df.groupby("item_id")
-            .agg({"weight": ["count", "mean", "sum", "std"]})
+            .agg(
+                {
+                    "weight": ["count", "mean", "sum", "std", "max", "min"],
+                    "timestamp": ["max", "min"],
+                }
+            )
             .reset_index()
         )
         item_stats.columns = [
@@ -1096,81 +1232,95 @@ class LightGBMRecommender:
             "item_mean",
             "item_sum",
             "item_std",
+            "item_max",
+            "item_min",
+            "item_last_ts",
+            "item_first_ts",
         ]
+
+        # Время с последнего взаимодействия с товаром
+        item_stats["item_days_since_last"] = (
+            max_timestamp - item_stats["item_last_ts"]
+        ).dt.days
+        item_stats["item_days_since_first"] = (
+            max_timestamp - item_stats["item_first_ts"]
+        ).dt.days
 
         data = data.merge(item_stats, on="item_id", how="left")
 
-        # Время since last interaction
-        last_interaction = (
-            interactions_df.groupby(["user_id", "item_id"])["timestamp"]
-            .max()
+        # === ПРИЗНАКИ ВЗАИМОДЕЙСТВИЯ ПОЛЬЗОВАТЕЛЬ-ТОВАР ===
+        user_item_stats = (
+            interactions_df.groupby(["user_id", "item_id"])
+            .agg(
+                {
+                    "weight": ["count", "mean", "sum", "std", "max", "min"],
+                    "timestamp": ["max", "min"],
+                }
+            )
             .reset_index()
         )
-        last_interaction["days_since_interaction"] = (
-            pd.Timestamp.now() - last_interaction["timestamp"]
+        user_item_stats.columns = [
+            "user_id",
+            "item_id",
+            "ui_count",
+            "ui_mean",
+            "ui_sum",
+            "ui_std",
+            "ui_max",
+            "ui_min",
+            "ui_last_ts",
+            "ui_first_ts",
+        ]
+
+        user_item_stats["ui_days_since_last"] = (
+            max_timestamp - user_item_stats["ui_last_ts"]
+        ).dt.days
+        user_item_stats["ui_days_since_first"] = (
+            max_timestamp - user_item_stats["ui_first_ts"]
         ).dt.days
 
-        data = data.merge(
-            last_interaction[["user_id", "item_id", "days_since_interaction"]],
-            on=["user_id", "item_id"],
-            how="left",
+        data = data.merge(user_item_stats, on=["user_id", "item_id"], how="left")
+
+        # === КАТЕГОРИАЛЬНЫЕ ПРИЗНАКИ ===
+        if self.item_to_cat:
+            data["item_category"] = data["item_id"].map(self.item_to_cat)
+            # One-hot encoding для топ-20 категорий
+            top_categories = data["item_category"].value_counts().head(20).index
+            for cat in top_categories:
+                data[f"cat_{cat}"] = (data["item_category"] == cat).astype(int)
+
+        # === CO-PURCHASE ПРИЗНАКИ ===
+        if self.copurchase_map:
+            data["copurchase_strength"] = data.apply(
+                lambda row: self._get_copurchase_strength(row["item_id"]), axis=1
+            )
+
+            # Признаки на основе истории пользователя
+            data["user_copurchase_affinity"] = data.apply(
+                lambda row: self._get_user_copurchase_affinity(
+                    row["user_id"], row["item_id"]
+                ),
+                axis=1,
+            )
+
+        # === ВРЕМЕННЫЕ ПРИЗНАКИ ===
+        data["is_weekend"] = data.apply(
+            lambda row: (
+                1
+                if pd.notna(row.get("ui_last_ts")) and row["ui_last_ts"].dayofweek >= 5
+                else 0
+            ),
+            axis=1,
         )
 
-        # ALS эмбеддинги
-        if self.user_embeddings is not None and self.item_embeddings is not None:
-            print("Добавление ALS эмбеддингов...")
-            embedding_size = min(10, self.user_embeddings.shape[1])
+        data["hour_of_day"] = data.apply(
+            lambda row: (
+                row["ui_last_ts"].hour if pd.notna(row.get("ui_last_ts")) else 12
+            ),
+            axis=1,
+        )
 
-            # Создаем массивы для эмбеддингов
-            user_embeddings_data = np.zeros(
-                (len(data), embedding_size), dtype=np.float32
-            )
-            item_embeddings_data = np.zeros(
-                (len(data), embedding_size), dtype=np.float32
-            )
-
-            for i in range(embedding_size):
-                # User embeddings
-                user_embeds = np.zeros(len(data), dtype=np.float32)
-                for idx, row in data.iterrows():
-                    user_id = row["user_id"]
-                    if (
-                        user_id in user_map
-                        and user_map[user_id] < self.user_embeddings.shape[0]
-                    ):
-                        user_embeds[idx] = self.user_embeddings[user_map[user_id], i]
-                user_embeddings_data[:, i] = user_embeds
-                data[f"user_als_{i}"] = user_embeds
-
-                # Item embeddings
-                item_embeds = np.zeros(len(data), dtype=np.float32)
-                for idx, row in data.iterrows():
-                    item_id = row["item_id"]
-                    if (
-                        item_id in item_map
-                        and item_map[item_id] < self.item_embeddings.shape[0]
-                    ):
-                        item_embeds[idx] = self.item_embeddings[item_map[item_id], i]
-                item_embeddings_data[:, i] = item_embeds
-                data[f"item_als_{i}"] = item_embeds
-
-        # Внешние эмбеддинги (fclip) - ТЕПЕРЬ numpy arrays
-        if self.external_embeddings_dict:
-            print("Добавление внешних эмбеддингов...")
-            sample_embedding = next(iter(self.external_embeddings_dict.values()))
-
-            # Создаем колонки для эмбеддингов
-            for i in range(min(10, len(sample_embedding))):
-                embed_col = np.zeros(len(data), dtype=np.float32)
-                for idx, row in data.iterrows():
-                    item_id = row["item_id"]
-                    if item_id in self.external_embeddings_dict:
-                        embedding = self.external_embeddings_dict[item_id]
-                        if i < len(embedding):
-                            embed_col[idx] = embedding[i]
-                data[f"fclip_embed_{i}"] = embed_col
-
-        # Признаки из recent items
+        # === RECENT ITEMS ПРИЗНАКИ ===
         data["in_recent_items"] = data.apply(
             lambda row: (
                 1 if row["item_id"] in recent_items_map.get(row["user_id"], []) else 0
@@ -1178,17 +1328,86 @@ class LightGBMRecommender:
             axis=1,
         )
 
+        data["recent_items_count"] = data["user_id"].map(
+            lambda x: len(recent_items_map.get(x, []))
+        )
+
+        # === ALS ЭМБЕДДИНГИ ===
+        if self.user_embeddings is not None and self.item_embeddings is not None:
+            print("Добавление ALS эмбеддингов...")
+            embedding_size = min(10, self.user_embeddings.shape[1])
+
+            for i in range(embedding_size):
+                # User embeddings
+                data[f"user_als_{i}"] = data["user_id"].map(
+                    lambda x: (
+                        self.user_embeddings[user_map[x], i]
+                        if x in user_map and user_map[x] < self.user_embeddings.shape[0]
+                        else 0.0
+                    )
+                )
+
+                # Item embeddings
+                data[f"item_als_{i}"] = data["item_id"].map(
+                    lambda x: (
+                        self.item_embeddings[item_map[x], i]
+                        if x in item_map and item_map[x] < self.item_embeddings.shape[0]
+                        else 0.0
+                    )
+                )
+
+        # === FCLIP ЭМБЕДДИНГИ ===
+        if self.external_embeddings_dict:
+            print("Добавление внешних эмбеддингов...")
+            sample_embedding = next(iter(self.external_embeddings_dict.values()))
+            for i in range(min(10, len(sample_embedding))):
+                data[f"fclip_embed_{i}"] = data["item_id"].map(
+                    lambda x: (
+                        self.external_embeddings_dict.get(x, np.zeros(1))[i]
+                        if x in self.external_embeddings_dict
+                        else 0.0
+                    )
+                )
+
+        # === ИНТЕРАКЦИОННЫЕ ПРИЗНАКИ ===
+        data["user_item_affinity"] = data["ui_mean"] * data["user_mean"]
+        data["popularity_affinity"] = data["item_popularity"] * data["user_count"]
+
+        # Взаимодействия пользователя с категорией
+        if self.item_to_cat:
+            user_category_stats = (
+                interactions_df.merge(
+                    pd.DataFrame(
+                        {
+                            "item_id": list(self.item_to_cat.keys()),
+                            "category": list(self.item_to_cat.values()),
+                        }
+                    ),
+                    on="item_id",
+                )
+                .groupby(["user_id", "category"])["weight"]
+                .sum()
+                .reset_index()
+            )
+
+            user_category_pivot = user_category_stats.pivot_table(
+                index="user_id", columns="category", values="weight", fill_value=0
+            )
+            user_category_pivot.columns = [
+                f"user_cat_{col}" for col in user_category_pivot.columns
+            ]
+
+            data = data.merge(user_category_pivot, on="user_id", how="left")
+
         # Заполняем пропуски
         numeric_cols = data.select_dtypes(include=[np.number]).columns
         data[numeric_cols] = data[numeric_cols].fillna(0)
 
-        # Убедимся, что все колонки имеют числовые типы
-        for col in data.columns:
-            if data[col].dtype == "object":
-                try:
-                    data[col] = pd.to_numeric(data[col], errors="coerce").fillna(0)
-                except:
-                    data[col] = data[col].astype("category")
+        # Удаляем временные колонки
+        data = data.drop(
+            columns=[col for col in data.columns if "_ts" in col], errors="ignore"
+        )
+        data = data.drop(columns=["item_category"], errors="ignore")
 
         self.feature_columns = [
             col
@@ -1197,8 +1416,26 @@ class LightGBMRecommender:
             and data[col].dtype in [np.int64, np.int32, np.float64, np.float32]
         ]
 
-        print(f"Создано {len(self.feature_columns)} признаков")
+        print(f"Создано {len(self.feature_columns)} богатых признаков")
         return data
+
+    def _get_copurchase_strength(self, item_id):
+        """Получаем силу co-purchase связи"""
+        if not self.copurchase_map or item_id not in self.copurchase_map:
+            return 0.0
+
+        # Максимальная сила связи с этим товаром
+        strengths = [strength for _, strength in self.copurchase_map[item_id]]
+        return max(strengths) if strengths else 0.0
+
+    def _get_user_copurchase_affinity(self, user_id, item_id):
+        """Affinity пользователя к co-purchase связям"""
+        if not self.copurchase_map or not hasattr(self, "user_items_history"):
+            return 0.0
+
+        # Здесь нужно добавить логику расчета на основе истории пользователя
+        # Временная реализация - возвращаем общую силу
+        return self._get_copurchase_strength(item_id)
 
     def train(self, train_data, val_data=None, params=None):
         """
@@ -1211,9 +1448,9 @@ class LightGBMRecommender:
                 "ndcg_at": [100],
                 "boosting_type": "gbdt",
                 "learning_rate": 0.05,
-                "num_leaves": 31,
-                "max_depth": 6,
-                "min_child_samples": 20,
+                "num_leaves": 127,  # Увеличили для сложных признаков
+                "max_depth": 8,  # Увеличили глубину
+                "min_child_samples": 30,
                 "subsample": 0.8,
                 "colsample_bytree": 0.8,
                 "verbosity": 1,
@@ -1257,8 +1494,8 @@ class LightGBMRecommender:
             valid_sets=valid_sets,
             valid_names=valid_names,
             callbacks=[
-                lgb.log_evaluation(50),  # каждые 50 итераций выводить лог
-                lgb.early_stopping(50),  # early stopping
+                lgb.log_evaluation(50),
+                lgb.early_stopping(50),
             ],
         )
 
@@ -1282,11 +1519,7 @@ class LightGBMRecommender:
     def predict_rank(self, data):
         """Предсказание рангов"""
         X = data[self.feature_columns]
-
-        # Убедимся, что все данные числовые
-        X_numeric = X.select_dtypes(include=[np.number])
-
-        return self.model.predict(X_numeric)
+        return self.model.predict(X)
 
     def recommend(self, user_items_data):
         """Генерация рекомендаций"""
@@ -1409,9 +1642,21 @@ if __name__ == "__main__":
     model, user_map, item_map = train_als(interactions_files)
     popularity_s = compute_global_popularity(train_orders_df)
 
+    print("=== ПОСТРОЕНИЕ ДОПОЛНИТЕЛЬНЫХ ДАННЫХ ===")
+    # Строим co-purchase map
+    copurchase_map = build_copurchase_map(train_orders_df)
+
+    # Строим категорийные маппинги
+    items_df = items_ddf.compute()
+    categories_df = categories_ddf.compute()
+    item_to_cat, cat_to_items = build_category_maps(items_df, categories_df)
+
     print("=== ПОДГОТОВКА ДАННЫХ ДЛЯ LightGBM ===")
     recommender = LightGBMRecommender()
     recommender.set_als_embeddings(model)
+    recommender.set_additional_data(
+        copurchase_map, item_to_cat, cat_to_items, user_map, item_map
+    )
 
     if embeddings_dict:
         recommender.set_external_embeddings(embeddings_dict)
