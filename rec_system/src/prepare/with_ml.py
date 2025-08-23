@@ -25,7 +25,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=1000):
+def load_train_data(max_parts=0, max_rows=0):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Если колонка отсутствует в файле, пропускаем её.
@@ -383,11 +383,39 @@ def generate_and_save_recommendations_iter(
     filename="/home/root6/python/e_cup/rec_system/result/submission.csv",
     item_to_cat=None,
     cat_to_items=None,
+    device="cuda",
 ):
     recent_items_map = recent_items_map or {}
     copurchase_map = copurchase_map or {}
     inv_item_map = {int(v): int(k) for k, v in item_map.items()}
     popular_items = popularity_s.index.tolist()
+
+    # Переносим модель и данные на GPU
+    user_factors = torch.tensor(model.user_factors, device=device, dtype=torch.float32)
+    item_factors = torch.tensor(model.item_factors, device=device, dtype=torch.float32)
+
+    # Конвертируем CSR в torch sparse tensor на GPU
+    user_items_sparse = torch.sparse_csr_tensor(
+        user_items_csr.indptr,
+        user_items_csr.indices,
+        user_items_csr.data,
+        size=user_items_csr.shape,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    # Предзагрузка всех интеракций в память для быстрого доступа
+    print("Предзагрузка интеракций пользователей...")
+    user_interactions_dict = {}
+    for f in tqdm(interactions_files, desc="Загрузка файлов интеракций"):
+        df = pd.read_parquet(f)
+        for uid, group in df.groupby("user_id"):
+            if uid not in user_interactions_dict:
+                user_interactions_dict[uid] = group
+            else:
+                user_interactions_dict[uid] = pd.concat(
+                    [user_interactions_dict[uid], group]
+                )
 
     first_run = True
     if os.path.exists(filename):
@@ -395,156 +423,217 @@ def generate_and_save_recommendations_iter(
 
     batch_rows = []
 
-    for user_id in tqdm(users_df["user_id"], desc="Hybrid recommendations iter"):
+    # Векторизованная обработка пользователей
+    user_ids_list = users_df["user_id"].tolist()
+
+    for i in tqdm(
+        range(0, len(user_ids_list), batch_size), desc="Обработка пользователей батчами"
+    ):
+        user_batch = user_ids_list[i : i + batch_size]
+
         try:
-            # ======== Загружаем интеракции пользователя ========
-            user_tracker_list = []
-            for f in interactions_files:
-                df = pd.read_parquet(f)
-                user_rows = df[df["user_id"] == user_id]
-                if not user_rows.empty:
-                    user_tracker_list.append(user_rows)
-            if user_tracker_list:
-                user_tracker = pd.concat(user_tracker_list, ignore_index=True)
-            else:
-                user_tracker = pd.DataFrame(
-                    columns=["user_id", "item_id", "weight", "timestamp"]
-                )
+            # ======== Пакетная обработка ALS рекомендаций на GPU ========
+            user_indices = [user_map.get(uid, -1) for uid in user_batch]
+            valid_user_mask = [
+                idx != -1 and idx < user_items_sparse.shape[0] for idx in user_indices
+            ]
+            valid_user_indices = [
+                idx for idx, valid in zip(user_indices, valid_user_mask) if valid
+            ]
 
-            user_bought_items = set(user_tracker[user_tracker["weight"] > 0]["item_id"])
-            tracker_scored = (
-                user_tracker[["item_id", "weight"]].drop_duplicates().values.tolist()
-            )
+            als_recommendations = {}
+            if valid_user_indices:
+                # Получаем эмбеддинги пользователей
+                user_embeddings = user_factors[valid_user_indices]
 
-            # ======== ALS рекомендации ========
-            als_scored = []
-            user_idx_int = user_map.get(user_id)
-            if user_idx_int is not None and user_idx_int < user_items_csr.shape[0]:
-                try:
-                    rec = model.recommend(
-                        userid=user_idx_int,
-                        user_items=user_items_csr[user_idx_int],
-                        N=top_k * 2,
-                        filter_already_liked_items=True,
-                        recalculate_user=True,
+                # Вычисляем scores на GPU
+                with torch.no_grad():
+                    scores = torch.matmul(item_factors, user_embeddings.T).T
+
+                    # Создаем маску для уже просмотренных товаров
+                    user_interactions_mask = torch.zeros(
+                        (len(valid_user_indices), item_factors.shape[0]),
+                        device=device,
+                        dtype=torch.bool,
                     )
-                    als_items = [
-                        (inv_item_map[int(r[0])], float(r[1]))
-                        for r in rec
-                        if len(r) == 2 and int(r[0]) in inv_item_map
-                    ]
+
+                    for j, user_idx in enumerate(valid_user_indices):
+                        user_interactions = user_items_sparse[user_idx].to_dense()
+                        user_interactions_mask[j] = user_interactions > 0
+
+                    # Маскируем уже просмотренные
+                    scores[user_interactions_mask] = -float("inf")
+
+                    # Берем топ-K для каждого пользователя
+                    top_scores, top_indices = torch.topk(scores, top_k * 2, dim=1)
+
+                    for j, user_idx in enumerate(valid_user_indices):
+                        user_id = [
+                            uid
+                            for uid, idx in zip(user_batch, user_indices)
+                            if idx == user_idx
+                        ][0]
+                        als_items = [
+                            (inv_item_map[int(idx)], float(score * 0.5))
+                            for idx, score in zip(
+                                top_indices[j].cpu(), top_scores[j].cpu()
+                            )
+                            if score > -float("inf") and int(idx) in inv_item_map
+                        ]
+                        als_recommendations[user_id] = als_items
+
+            # Обрабатываем каждого пользователя в батче
+            for user_id in user_batch:
+                try:
+                    # ======== Загружаем интеракции пользователя из предзагруженного словаря ========
+                    user_tracker = user_interactions_dict.get(
+                        user_id,
+                        pd.DataFrame(
+                            columns=["user_id", "item_id", "weight", "timestamp"]
+                        ),
+                    )
+
+                    user_bought_items = set(
+                        user_tracker[user_tracker["weight"] > 0]["item_id"]
+                    )
+                    tracker_scored = (
+                        user_tracker[["item_id", "weight"]]
+                        .drop_duplicates()
+                        .values.tolist()
+                    )
+
+                    # ======== ALS рекомендации из пакетного результата ========
+                    als_scored = als_recommendations.get(user_id, [])
                     als_scored = [
-                        (it, score * 0.5)
-                        for it, score in als_items
+                        (it, score)
+                        for it, score in als_scored
                         if it not in user_bought_items
                     ]
+
+                    # ======== Последние товары ========
+                    recent_items = recent_items_map.get(user_id, [])
+                    recent_scored = [
+                        (it, 1.0)
+                        for it in recent_items[:recent_n]
+                        if it not in user_bought_items
+                    ]
+
+                    # ======== Похожие товары ========
+                    sim_items = []
+                    for rit in recent_items:
+                        if rit in item_map:
+                            try:
+                                # Векторизованный поиск похожих товаров на GPU
+                                rit_idx = item_map[rit]
+                                rit_embedding = item_factors[rit_idx].unsqueeze(0)
+
+                                with torch.no_grad():
+                                    similarities = torch.matmul(
+                                        item_factors, rit_embedding.T
+                                    ).squeeze()
+                                    top_similar = torch.topk(
+                                        similarities, similar_top_n_seed + 1
+                                    )
+
+                                    similar_ids = [
+                                        inv_item_map[int(idx)]
+                                        for idx in top_similar.indices[
+                                            1:
+                                        ].cpu()  # пропускаем сам товар
+                                        if int(idx) in inv_item_map
+                                    ]
+                                    sim_items.extend(similar_ids)
+
+                            except Exception:
+                                continue
+
+                    sim_items = list(dict.fromkeys(sim_items))
+                    sim_quota = int(top_k * blend_sim_beta)
+                    sim_scored = [
+                        (it, 0.5)
+                        for it in sim_items[:sim_quota]
+                        if it not in user_bought_items
+                    ]
+
+                    # ======== Товары из категорий последних покупок ========
+                    category_scored = []
+                    if item_to_cat and cat_to_items:
+                        for rit in recent_items:
+                            cat = item_to_cat.get(rit)
+                            if cat:
+                                cat_items = [
+                                    i
+                                    for i in cat_to_items[cat]
+                                    if i != rit and i not in user_bought_items
+                                ]
+                                quota = int(top_k * blend_cat_beta)
+                                category_scored.extend(
+                                    [(i, 0.8) for i in cat_items[:quota]]
+                                )
+
+                    # ======== Co-purchase рекомендации ========
+                    copurchase_scored = []
+                    for rit in recent_items:
+                        for co_item in copurchase_map.get(rit, []):
+                            if co_item not in user_bought_items:
+                                copurchase_scored.append((co_item, 0.8))
+
+                    # ======== Популярные товары ========
+                    min_score = min((s for _, s in als_scored), default=0.1)
+                    pop_scored = [
+                        (it, min_score * 0.1)
+                        for it in popular_items
+                        if it not in user_bought_items
+                    ]
+
+                    # ======== Объединяем все кандидаты ========
+                    all_candidates = (
+                        tracker_scored
+                        + als_scored
+                        + recent_scored
+                        + sim_scored
+                        + category_scored
+                        + copurchase_scored
+                        + pop_scored
+                    )
+                    all_candidates = sorted(
+                        all_candidates, key=lambda x: x[1], reverse=True
+                    )
+
+                    seen, final = set(), []
+                    for it, _ in all_candidates:
+                        if it not in seen:
+                            final.append(it)
+                            seen.add(it)
+                        if len(final) >= top_k:
+                            break
+
+                    # если не хватает, добавляем популярные
+                    if len(final) < top_k:
+                        for it in popular_items:
+                            if it not in seen:
+                                final.append(it)
+                                seen.add(it)
+                            if len(final) >= top_k:
+                                break
+
+                    top_items = final[:top_k]
+
+                    batch_rows.append(
+                        {
+                            "user_id": user_id,
+                            "item_id_1 item_id_2 ... item_id_100": " ".join(
+                                map(str, top_items)
+                            ),
+                        }
+                    )
+
                 except Exception as e:
-                    print(f"Ошибка ALS для пользователя {user_id}: {e}")
+                    print(f"Ошибка для пользователя {user_id}: {e}")
+                    continue
 
-            # ======== Последние товары ========
-            recent_items = recent_items_map.get(user_id, [])
-            recent_scored = [
-                (it, 1.0)
-                for it in recent_items[:recent_n]
-                if it not in user_bought_items
-            ]
-
-            # ======== Похожие товары ========
-            sim_items = []
-            for rit in recent_items:
-                if rit in item_map:
-                    try:
-                        sims = model.similar_items(
-                            int(item_map[rit]), N=similar_top_n_seed
-                        )
-                        sim_items.extend(
-                            [
-                                inv_item_map[int(si[0])]
-                                for si in sims
-                                if len(si) == 2 and int(si[0]) in inv_item_map
-                            ]
-                        )
-                    except Exception:
-                        continue
-            sim_items = list(dict.fromkeys(sim_items))
-            sim_quota = int(top_k * blend_sim_beta)
-            sim_scored = [
-                (it, 0.5) for it in sim_items[:sim_quota] if it not in user_bought_items
-            ]
-
-            # ======== Товары из категорий последних покупок ========
-            category_scored = []
-            if item_to_cat and cat_to_items:
-                for rit in recent_items:
-                    cat = item_to_cat.get(rit)
-                    if cat:
-                        cat_items = [
-                            i
-                            for i in cat_to_items[cat]
-                            if i != rit and i not in user_bought_items
-                        ]
-                        quota = int(top_k * blend_cat_beta)
-                        category_scored.extend([(i, 0.8) for i in cat_items[:quota]])
-
-            # ======== Co-purchase рекомендации ========
-            copurchase_scored = []
-            for rit in recent_items:
-                for co_item in copurchase_map.get(rit, []):
-                    if co_item not in user_bought_items:
-                        copurchase_scored.append(
-                            (co_item, 0.8)
-                        )  # вес можно регулировать
-
-            # ======== Популярные товары ========
-            min_score = min((s for _, s in als_scored), default=0.1)
-            pop_scored = [
-                (it, min_score * 0.1)
-                for it in popular_items
-                if it not in user_bought_items
-            ]
-
-            # ======== Объединяем все кандидаты ========
-            all_candidates = (
-                tracker_scored
-                + als_scored
-                + recent_scored
-                + sim_scored
-                + category_scored
-                + copurchase_scored
-                + pop_scored
-            )
-            all_candidates = sorted(all_candidates, key=lambda x: x[1], reverse=True)
-
-            seen, final = set(), []
-            for it, _ in all_candidates:
-                if it not in seen:
-                    final.append(it)
-                    seen.add(it)
-                if len(final) >= top_k:
-                    break
-
-            # если не хватает, добавляем популярные
-            if len(final) < top_k:
-                for it in popular_items:
-                    if it not in seen:
-                        final.append(it)
-                        seen.add(it)
-                    if len(final) >= top_k:
-                        break
-
-            top_items = final[:top_k]
-
-            batch_rows.append(
-                {
-                    "user_id": user_id,
-                    "item_id_1 item_id_2 ... item_id_100": " ".join(
-                        map(str, top_items)
-                    ),
-                }
-            )
-
-            # записываем батч
-            if len(batch_rows) >= batch_size:
+            # Записываем батч
+            if batch_rows:
                 pd.DataFrame(batch_rows).to_csv(
                     filename,
                     index=False,
@@ -554,8 +643,11 @@ def generate_and_save_recommendations_iter(
                 first_run = False
                 batch_rows = []
 
+            # Очищаем память GPU
+            torch.cuda.empty_cache()
+
         except Exception as e:
-            print(f"Ошибка для пользователя {user_id}: {e}")
+            print(f"Ошибка в батче пользователей: {e}")
             continue
 
     if batch_rows:
@@ -1024,44 +1116,59 @@ class LightGBMRecommender:
             how="left",
         )
 
-        # ALS эмбеддинги если доступны - ИСПРАВЛЕННАЯ ВЕРСИЯ
+        # ALS эмбеддинги
         if self.user_embeddings is not None and self.item_embeddings is not None:
             print("Добавление ALS эмбеддингов...")
             embedding_size = min(10, self.user_embeddings.shape[1])
 
-            for i in range(embedding_size):
-                data[f"user_als_{i}"] = data["user_id"].map(
-                    lambda x: (
-                        self.user_embeddings[user_map[x], i]
-                        if x in user_map and user_map[x] < self.user_embeddings.shape[0]
-                        else 0.0
-                    )
-                )
+            # Создаем массивы для эмбеддингов
+            user_embeddings_data = np.zeros(
+                (len(data), embedding_size), dtype=np.float32
+            )
+            item_embeddings_data = np.zeros(
+                (len(data), embedding_size), dtype=np.float32
+            )
 
             for i in range(embedding_size):
-                data[f"item_als_{i}"] = data["item_id"].map(
-                    lambda x: (
-                        self.item_embeddings[item_map[x], i]
-                        if x in item_map and item_map[x] < self.item_embeddings.shape[0]
-                        else 0.0
-                    )
-                )
+                # User embeddings
+                user_embeds = np.zeros(len(data), dtype=np.float32)
+                for idx, row in data.iterrows():
+                    user_id = row["user_id"]
+                    if (
+                        user_id in user_map
+                        and user_map[user_id] < self.user_embeddings.shape[0]
+                    ):
+                        user_embeds[idx] = self.user_embeddings[user_map[user_id], i]
+                user_embeddings_data[:, i] = user_embeds
+                data[f"user_als_{i}"] = user_embeds
 
-        # Внешние эмбеддинги (fclip)
+                # Item embeddings
+                item_embeds = np.zeros(len(data), dtype=np.float32)
+                for idx, row in data.iterrows():
+                    item_id = row["item_id"]
+                    if (
+                        item_id in item_map
+                        and item_map[item_id] < self.item_embeddings.shape[0]
+                    ):
+                        item_embeds[idx] = self.item_embeddings[item_map[item_id], i]
+                item_embeddings_data[:, i] = item_embeds
+                data[f"item_als_{i}"] = item_embeds
+
+        # Внешние эмбеддинги (fclip) - ТЕПЕРЬ numpy arrays
         if self.external_embeddings_dict:
             print("Добавление внешних эмбеддингов...")
-            # Добавляем основные компоненты
             sample_embedding = next(iter(self.external_embeddings_dict.values()))
-            for i in range(
-                min(10, len(sample_embedding))
-            ):  # Уменьшил до 10 для скорости
-                data[f"fclip_embed_{i}"] = data["item_id"].map(
-                    lambda x: (
-                        self.external_embeddings_dict.get(x, np.zeros(1))[i]
-                        if x in self.external_embeddings_dict
-                        else 0.0
-                    )
-                )
+
+            # Создаем колонки для эмбеддингов
+            for i in range(min(10, len(sample_embedding))):
+                embed_col = np.zeros(len(data), dtype=np.float32)
+                for idx, row in data.iterrows():
+                    item_id = row["item_id"]
+                    if item_id in self.external_embeddings_dict:
+                        embedding = self.external_embeddings_dict[item_id]
+                        if i < len(embedding):
+                            embed_col[idx] = embedding[i]
+                data[f"fclip_embed_{i}"] = embed_col
 
         # Признаки из recent items
         data["in_recent_items"] = data.apply(
@@ -1075,10 +1182,19 @@ class LightGBMRecommender:
         numeric_cols = data.select_dtypes(include=[np.number]).columns
         data[numeric_cols] = data[numeric_cols].fillna(0)
 
+        # Убедимся, что все колонки имеют числовые типы
+        for col in data.columns:
+            if data[col].dtype == "object":
+                try:
+                    data[col] = pd.to_numeric(data[col], errors="coerce").fillna(0)
+                except:
+                    data[col] = data[col].astype("category")
+
         self.feature_columns = [
             col
             for col in data.columns
             if col not in ["user_id", "item_id", "target", "timestamp"]
+            and data[col].dtype in [np.int64, np.int32, np.float64, np.float32]
         ]
 
         print(f"Создано {len(self.feature_columns)} признаков")
@@ -1166,7 +1282,11 @@ class LightGBMRecommender:
     def predict_rank(self, data):
         """Предсказание рангов"""
         X = data[self.feature_columns]
-        return self.model.predict(X)
+
+        # Убедимся, что все данные числовые
+        X_numeric = X.select_dtypes(include=[np.number])
+
+        return self.model.predict(X_numeric)
 
     def recommend(self, user_items_data):
         """Генерация рекомендаций"""
@@ -1181,13 +1301,14 @@ class LightGBMRecommender:
         return recommendations
 
 
-def load_and_process_embeddings(items_ddf, embedding_column="fclip_embed"):
+def load_and_process_embeddings(
+    items_ddf, embedding_column="fclip_embed", device="cuda"
+):
     """
     Загрузка и обработка эмбеддингов товаров
     """
     print("Загрузка эмбеддингов товаров...")
 
-    # Вычисляем items_df с ProgressBar
     with ProgressBar():
         items_df = items_ddf.compute()
 
@@ -1204,27 +1325,35 @@ def load_and_process_embeddings(items_ddf, embedding_column="fclip_embed"):
         item_id = row["item_id"]
         embedding_str = row[embedding_column]
 
-        # случай: строка
         if isinstance(embedding_str, str) and pd.notna(embedding_str):
             try:
-                embedding = np.fromstring(embedding_str.strip("[]"), sep=" ")
+                embedding = np.fromstring(
+                    embedding_str.strip("[]"), sep=" ", dtype=np.float32
+                )
                 if embedding.size > 0:
+                    # Сохраняем как numpy array для совместимости с LightGBM
                     embeddings_dict[item_id] = embedding
                     valid_items.append(item_id)
-            except Exception:
+            except Exception as e:
+                print(f"Ошибка обработки эмбеддинга для товара {item_id}: {e}")
                 continue
-
-        # случай: список или массив
         elif isinstance(embedding_str, (list, np.ndarray)):
-            arr = np.array(embedding_str, dtype=float)
+            arr = np.array(embedding_str, dtype=np.float32)
             if arr.size > 0:
                 embeddings_dict[item_id] = arr
                 valid_items.append(item_id)
-
-        # иначе игнорируем
+        elif hasattr(embedding_str, "__array__"):
+            # Для случаев, когда это уже тензор или array-like объект
+            try:
+                arr = np.array(embedding_str, dtype=np.float32)
+                if arr.size > 0:
+                    embeddings_dict[item_id] = arr
+                    valid_items.append(item_id)
+            except Exception as e:
+                print(f"Ошибка конвертации эмбеддинга для товара {item_id}: {e}")
+                continue
 
     print(f"Загружено эмбеддингов для {len(embeddings_dict)} товаров")
-
     return embeddings_dict
 
 
@@ -1232,11 +1361,11 @@ def load_and_process_embeddings(items_ddf, embedding_column="fclip_embed"):
 if __name__ == "__main__":
     start_time = time.time()
     K = 100
-    RECENT_N = 20
+    RECENT_N = 5
     TEST_SIZE = 0.2
 
     # Параметры масштабирования
-    SCALING_STAGE = "small"  # small, medium, large, full
+    SCALING_STAGE = "full"  # small, medium, large, full
 
     scaling_config = {
         "small": {"sample_users": 500, "sample_fraction": 0.1},
