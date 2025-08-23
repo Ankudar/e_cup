@@ -10,11 +10,14 @@ import dask.dataframe as dd
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import torch
+import torch.sparse
 from dask.diagnostics import ProgressBar
 from implicit.als import AlternatingLeastSquares
 from scipy.sparse import coo_matrix, csr_matrix, vstack
 from sklearn.metrics import ndcg_score
 from sklearn.model_selection import train_test_split
+from torch import nn
 from tqdm.auto import tqdm
 
 # tqdm интеграция с pandas
@@ -286,30 +289,45 @@ def train_als(
 
 
 # -------------------- User-Items CSR для recommend --------------------
-def build_user_items_csr(batch_files, user_map, item_map, dtype=np.float32):
+def build_user_items_csr(
+    batch_files, user_map, item_map, dtype=torch.float32, device="cuda"
+):
     """
     batch_files: список parquet файлов с взаимодействиями
-    Возвращает CSR матрицу user-items
+    Возвращает CSR матрицу user-items на GPU
     """
-    from scipy.sparse import coo_matrix, vstack
+    print("Строим CSR матрицу по батчам на GPU...")
 
-    print("Строим CSR матрицу по батчам...")
-    coo_batches = []
+    # Создаем пустые тензоры для COO формата
+    rows = []
+    cols = []
+    values = []
 
     for f in batch_files:
         df = pd.read_parquet(f)
         df["user_idx"] = df["user_id"].map(user_map).astype(np.int32)
         df["item_idx"] = df["item_id"].map(item_map).astype(np.int32)
-        coo = coo_matrix(
-            (df["weight"].astype(dtype), (df["user_idx"], df["item_idx"])),
-            shape=(len(user_map), len(item_map)),
-        )
-        coo_batches.append(coo)
-        print(f"Батч {f} добавлен")
 
-    user_items_csr = vstack(coo_batches).tocsr()
-    print(f"CSR матрица построена: {user_items_csr.shape}")
-    return user_items_csr
+        # Добавляем данные в COO формате
+        rows.extend(df["user_idx"].values)
+        cols.extend(df["item_idx"].values)
+        values.extend(df["weight"].values.astype(np.float32))
+
+    # Конвертируем в тензоры и переносим на GPU
+    rows_tensor = torch.tensor(rows, dtype=torch.long, device=device)
+    cols_tensor = torch.tensor(cols, dtype=torch.long, device=device)
+    values_tensor = torch.tensor(values, dtype=dtype, device=device)
+
+    # Создаем sparse матрицу на GPU
+    sparse_tensor = torch.sparse_coo_tensor(
+        torch.stack([rows_tensor, cols_tensor]),
+        values_tensor,
+        size=(len(user_map), len(item_map)),
+        device=device,
+    )
+
+    print(f"CSR матрица построена на GPU: {sparse_tensor.shape}")
+    return sparse_tensor
 
 
 def build_copurchase_map(train_orders_df, min_co_items=2, top_n=10):
