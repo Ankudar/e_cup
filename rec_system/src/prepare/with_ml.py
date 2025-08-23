@@ -1,15 +1,20 @@
 import gc
 import os
 import pickle
+import time
 from collections import defaultdict
+from datetime import timedelta
 from pathlib import Path
 
 import dask.dataframe as dd
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from dask.diagnostics import ProgressBar
 from implicit.als import AlternatingLeastSquares
 from scipy.sparse import coo_matrix, csr_matrix, vstack
+from sklearn.metrics import ndcg_score
+from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
 
 # tqdm интеграция с pandas
@@ -17,7 +22,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=10000):
+def load_train_data(max_parts=0, max_rows=0):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Если колонка отсутствует в файле, пропускаем её.
@@ -307,6 +312,39 @@ def build_user_items_csr(batch_files, user_map, item_map, dtype=np.float32):
     return user_items_csr
 
 
+def build_copurchase_map(train_orders_df, min_co_items=2, top_n=10):
+    """
+    train_orders_df: колонка user_id, item_id, created_timestamp
+    min_co_items: учитывать только корзины с >= min_co_items товаров
+    top_n: сколько соседних товаров хранить для каждого item
+    """
+    print("Строим словарь co-purchase...")
+    copurchase_dict = defaultdict(lambda: defaultdict(int))
+
+    # корзины с более чем 1 товаром
+    grouped = (
+        train_orders_df.groupby(["user_id", "created_timestamp"])["item_id"]
+        .apply(list)
+        .reset_index()
+    )
+    grouped = grouped[grouped["item_id"].map(len) >= min_co_items]
+
+    for items in grouped["item_id"]:
+        for i, item in enumerate(items):
+            for j, co_item in enumerate(items):
+                if i != j:
+                    copurchase_dict[item][co_item] += 1
+
+    # оставляем топ-N наиболее частых
+    final_copurchase = {}
+    for item, co_items in copurchase_dict.items():
+        sorted_items = sorted(co_items.items(), key=lambda x: x[1], reverse=True)
+        final_copurchase[item] = [it for it, _ in sorted_items[:top_n]]
+
+    print(f"Co-purchase словарь построен для {len(final_copurchase)} товаров")
+    return final_copurchase
+
+
 # -------------------- Recommendations (ALS + recent + similar + popular) --------------------
 def generate_and_save_recommendations_iter(
     model,
@@ -317,6 +355,7 @@ def generate_and_save_recommendations_iter(
     popularity_s,
     users_df,
     recent_items_map=None,
+    copurchase_map=None,
     top_k=100,
     recent_n=5,
     similar_top_n_seed=20,
@@ -327,12 +366,8 @@ def generate_and_save_recommendations_iter(
     item_to_cat=None,
     cat_to_items=None,
 ):
-    import os
-
-    import pandas as pd
-    from tqdm import tqdm
-
     recent_items_map = recent_items_map or {}
+    copurchase_map = copurchase_map or {}
     inv_item_map = {int(v): int(k) for k, v in item_map.items()}
     popular_items = popularity_s.index.tolist()
 
@@ -344,7 +379,7 @@ def generate_and_save_recommendations_iter(
 
     for user_id in tqdm(users_df["user_id"], desc="Hybrid recommendations iter"):
         try:
-            # ======== Загружаем только нужные строки из батчей ========
+            # ======== Загружаем интеракции пользователя ========
             user_tracker_list = []
             for f in interactions_files:
                 df = pd.read_parquet(f)
@@ -433,6 +468,15 @@ def generate_and_save_recommendations_iter(
                         quota = int(top_k * blend_cat_beta)
                         category_scored.extend([(i, 0.8) for i in cat_items[:quota]])
 
+            # ======== Co-purchase рекомендации ========
+            copurchase_scored = []
+            for rit in recent_items:
+                for co_item in copurchase_map.get(rit, []):
+                    if co_item not in user_bought_items:
+                        copurchase_scored.append(
+                            (co_item, 0.8)
+                        )  # вес можно регулировать
+
             # ======== Популярные товары ========
             min_score = min((s for _, s in als_scored), default=0.1)
             pop_scored = [
@@ -448,6 +492,7 @@ def generate_and_save_recommendations_iter(
                 + recent_scored
                 + sim_scored
                 + category_scored
+                + copurchase_scored
                 + pop_scored
             )
             all_candidates = sorted(all_candidates, key=lambda x: x[1], reverse=True)
@@ -501,7 +546,7 @@ def generate_and_save_recommendations_iter(
         )
 
 
-def evaluate_ndcg_iter(
+def evaluate_ndcg_iter_optimized(
     model,
     user_map,
     item_map,
@@ -522,9 +567,22 @@ def evaluate_ndcg_iter(
     recent_items_map = recent_items_map or {}
     inv_item_map = {int(v): int(k) for k, v in item_map.items()}
     popular_items = popularity_s.index.tolist()
+    popular_set = set(popular_items)
 
-    # создаем ground truth
+    # ======== Предварительно создаем ground truth ========
     gt = test_df.groupby("user_id")["item_id"].apply(set).to_dict()
+
+    # ======== Предзагрузка всех интеракций ========
+    user_interactions_dict = {}
+    for f in interactions_files:
+        df = pd.read_parquet(f)
+        for uid, df_user in df.groupby("user_id"):
+            if uid in user_interactions_dict:
+                user_interactions_dict[uid] = pd.concat(
+                    [user_interactions_dict[uid], df_user], ignore_index=True
+                )
+            else:
+                user_interactions_dict[uid] = df_user
 
     ndcg_sum = 0.0
     n_users = 0
@@ -532,21 +590,10 @@ def evaluate_ndcg_iter(
     for user_id in tqdm(users_df["user_id"], desc="Evaluate NDCG iter"):
         try:
             user_idx_int = user_map.get(user_id)
-
-            # ======== Загружаем интеракции пользователя из батчей ========
-            user_tracker_list = []
-            for f in interactions_files:
-                df = pd.read_parquet(f)
-                user_rows = df[df["user_id"] == user_id]
-                if not user_rows.empty:
-                    user_tracker_list.append(user_rows)
-            if user_tracker_list:
-                user_tracker = pd.concat(user_tracker_list, ignore_index=True)
-            else:
-                user_tracker = pd.DataFrame(
-                    columns=["user_id", "item_id", "weight", "timestamp"]
-                )
-
+            user_tracker = user_interactions_dict.get(
+                user_id,
+                pd.DataFrame(columns=["user_id", "item_id", "weight", "timestamp"]),
+            )
             user_bought_items = set(user_tracker[user_tracker["weight"] > 0]["item_id"])
             tracker_scored = (
                 user_tracker[["item_id", "weight"]].drop_duplicates().values.tolist()
@@ -615,7 +662,7 @@ def evaluate_ndcg_iter(
                 if it not in user_bought_items
             ]
 
-            # ======== Объединяем и сортируем ========
+            # ======== Объединяем кандидатов ========
             all_candidates = (
                 tracker_scored + als_scored + recent_scored + sim_scored + pop_scored
             )
@@ -628,7 +675,6 @@ def evaluate_ndcg_iter(
                     seen.add(it)
                 if len(final) >= top_k:
                     break
-
             recommended = final if final else popular_items[:top_k]
 
             # ======== NDCG ========
@@ -759,86 +805,536 @@ def save_submission_csv(
     print(f"CSV сохранён: {filename}")
 
 
+# -------------------- Метрики --------------------
+def ndcg_at_k_grouped(predictions, targets, groups, k=100):
+    """
+    Вычисление NDCG@k для сгруппированных данных (пользователей)
+    """
+    ndcg_scores = []
+    start_idx = 0
+
+    for group_size in groups:
+        if group_size == 0:
+            continue
+
+        end_idx = start_idx + group_size
+        group_preds = predictions[start_idx:end_idx]
+        group_targets = targets[start_idx:end_idx]
+
+        # Сортируем предсказания и цели по убыванию score
+        sorted_indices = np.argsort(group_preds)[::-1]
+        sorted_targets = group_targets[sorted_indices]
+
+        # Вычисляем DCG
+        dcg = 0.0
+        for i in range(min(k, len(sorted_targets))):
+            if sorted_targets[i] > 0:
+                dcg += 1.0 / np.log2(i + 2)  # i+2 потому что индекс с 1
+
+        # Вычисляем IDCG
+        ideal_sorted = np.sort(group_targets)[::-1]
+        idcg = 0.0
+        for i in range(min(k, len(ideal_sorted))):
+            if ideal_sorted[i] > 0:
+                idcg += 1.0 / np.log2(i + 2)
+
+        if idcg > 0:
+            ndcg_scores.append(dcg / idcg)
+        else:
+            ndcg_scores.append(0.0)
+
+        start_idx = end_idx
+
+    return np.mean(ndcg_scores) if ndcg_scores else 0.0
+
+
+class LightGBMRecommender:
+    def __init__(self):
+        self.model = None
+        self.feature_columns = []
+        self.user_embeddings = None
+        self.item_embeddings = None
+        self.external_embeddings_dict = None
+
+    def set_als_embeddings(self, als_model):
+        """Сохраняем ALS эмбеддинги для использования в признаках"""
+        self.user_embeddings = als_model.user_factors
+        self.item_embeddings = als_model.item_factors
+
+    def set_external_embeddings(self, embeddings_dict):
+        """Устанавливаем внешние эмбеддинги товаров"""
+        self.external_embeddings_dict = embeddings_dict
+
+    def prepare_training_data(
+        self,
+        interactions_files,
+        user_map,
+        item_map,
+        popularity_s,
+        recent_items_map,
+        test_orders_df,
+        sample_fraction=0.1,
+    ):
+        """
+        Подготовка данных для обучения LightGBM
+        """
+        print("Подготовка данных для LightGBM...")
+
+        # Ограничиваем количество данных для демо
+        test_orders_df = test_orders_df.sample(frac=sample_fraction, random_state=42)
+
+        # Собираем все взаимодействия
+        all_interactions = []
+        for f in tqdm(
+            interactions_files[:3], desc="Чтение взаимодействий"
+        ):  # Ограничиваем файлы
+            df = pd.read_parquet(f)
+            all_interactions.append(df)
+
+        interactions_df = pd.concat(all_interactions, ignore_index=True)
+
+        # Создаем позитивные пары
+        positive_samples = []
+        for _, row in tqdm(test_orders_df.iterrows(), desc="Позитивные примеры"):
+            positive_samples.append(
+                {"user_id": row["user_id"], "item_id": row["item_id"], "target": 1}
+            )
+
+        positive_df = pd.DataFrame(positive_samples)
+
+        # Создаем негативные сэмплы
+        print("Создание негативных сэмплов...")
+        negative_samples = []
+
+        # Группируем по пользователям для эффективности
+        user_items = interactions_df.groupby("user_id")["item_id"].apply(set).to_dict()
+        all_items_set = set(item_map.keys())
+
+        for user_id in tqdm(positive_df["user_id"].unique(), desc="Негативные сэмплы"):
+            user_positives = set(
+                positive_df[positive_df["user_id"] == user_id]["item_id"]
+            )
+            user_interacted = user_items.get(user_id, set())
+
+            # Доступные негативные товары
+            available_negatives = list(all_items_set - user_interacted - user_positives)
+
+            if available_negatives:
+                n_negatives = min(4, len(available_negatives))
+                negative_items = np.random.choice(
+                    available_negatives, n_negatives, replace=False
+                )
+
+                for item_id in negative_items:
+                    negative_samples.append(
+                        {"user_id": user_id, "item_id": item_id, "target": 0}
+                    )
+
+        negative_df = pd.DataFrame(negative_samples)
+
+        # Объединяем данные
+        train_data = pd.concat([positive_df, negative_df], ignore_index=True)
+
+        # Добавляем признаки
+        train_data = self._add_features(
+            train_data,
+            interactions_df,
+            popularity_s,
+            recent_items_map,
+            user_map,
+            item_map,
+        )
+
+        return train_data
+
+    def _add_features(
+        self, data, interactions_df, popularity_s, recent_items_map, user_map, item_map
+    ):
+        """
+        Добавление признаков к данным
+        """
+        # Базовые признаки
+        data["item_popularity"] = (
+            data["item_id"].map(lambda x: popularity_s.get(x, 0.0)).fillna(0.0)
+        )
+
+        # Признаки пользователя
+        user_stats = (
+            interactions_df.groupby("user_id")
+            .agg({"weight": ["count", "mean", "sum", "std"]})
+            .reset_index()
+        )
+        user_stats.columns = [
+            "user_id",
+            "user_count",
+            "user_mean",
+            "user_sum",
+            "user_std",
+        ]
+
+        data = data.merge(user_stats, on="user_id", how="left")
+
+        # Признаки товара
+        item_stats = (
+            interactions_df.groupby("item_id")
+            .agg({"weight": ["count", "mean", "sum", "std"]})
+            .reset_index()
+        )
+        item_stats.columns = [
+            "item_id",
+            "item_count",
+            "item_mean",
+            "item_sum",
+            "item_std",
+        ]
+
+        data = data.merge(item_stats, on="item_id", how="left")
+
+        # Время since last interaction
+        last_interaction = (
+            interactions_df.groupby(["user_id", "item_id"])["timestamp"]
+            .max()
+            .reset_index()
+        )
+        last_interaction["days_since_interaction"] = (
+            pd.Timestamp.now() - last_interaction["timestamp"]
+        ).dt.days
+
+        data = data.merge(
+            last_interaction[["user_id", "item_id", "days_since_interaction"]],
+            on=["user_id", "item_id"],
+            how="left",
+        )
+
+        # ALS эмбеддинги если доступны - ИСПРАВЛЕННАЯ ВЕРСИЯ
+        if self.user_embeddings is not None and self.item_embeddings is not None:
+            print("Добавление ALS эмбеддингов...")
+            embedding_size = min(10, self.user_embeddings.shape[1])
+
+            for i in range(embedding_size):
+                data[f"user_als_{i}"] = data["user_id"].map(
+                    lambda x: (
+                        self.user_embeddings[user_map[x], i]
+                        if x in user_map and user_map[x] < self.user_embeddings.shape[0]
+                        else 0.0
+                    )
+                )
+
+            for i in range(embedding_size):
+                data[f"item_als_{i}"] = data["item_id"].map(
+                    lambda x: (
+                        self.item_embeddings[item_map[x], i]
+                        if x in item_map and item_map[x] < self.item_embeddings.shape[0]
+                        else 0.0
+                    )
+                )
+
+        # Внешние эмбеддинги (fclip)
+        if self.external_embeddings_dict:
+            print("Добавление внешних эмбеддингов...")
+            # Добавляем основные компоненты
+            sample_embedding = next(iter(self.external_embeddings_dict.values()))
+            for i in range(
+                min(10, len(sample_embedding))
+            ):  # Уменьшил до 10 для скорости
+                data[f"fclip_embed_{i}"] = data["item_id"].map(
+                    lambda x: (
+                        self.external_embeddings_dict.get(x, np.zeros(1))[i]
+                        if x in self.external_embeddings_dict
+                        else 0.0
+                    )
+                )
+
+        # Признаки из recent items
+        data["in_recent_items"] = data.apply(
+            lambda row: (
+                1 if row["item_id"] in recent_items_map.get(row["user_id"], []) else 0
+            ),
+            axis=1,
+        )
+
+        # Заполняем пропуски
+        numeric_cols = data.select_dtypes(include=[np.number]).columns
+        data[numeric_cols] = data[numeric_cols].fillna(0)
+
+        self.feature_columns = [
+            col
+            for col in data.columns
+            if col not in ["user_id", "item_id", "target", "timestamp"]
+        ]
+
+        print(f"Создано {len(self.feature_columns)} признаков")
+        return data
+
+    def train(self, train_data, val_data=None, params=None):
+        """
+        Обучение LightGBM с NDCG optimization
+        """
+        if params is None:
+            params = {
+                "objective": "lambdarank",
+                "metric": "ndcg",
+                "ndcg_at": [100],
+                "boosting_type": "gbdt",
+                "learning_rate": 0.05,
+                "num_leaves": 31,
+                "max_depth": 6,
+                "min_child_samples": 20,
+                "subsample": 0.8,
+                "colsample_bytree": 0.8,
+                "verbosity": 1,
+                "random_state": 42,
+            }
+
+        # Группы для lambdarank (количество товаров на пользователя)
+        train_groups = train_data.groupby("user_id").size().values
+        X_train = train_data[self.feature_columns]
+        y_train = train_data["target"]
+
+        print(f"Размер тренировочных данных: {len(X_train)}")
+        print(f"Количество групп: {len(train_groups)}")
+
+        train_dataset = lgb.Dataset(
+            X_train,
+            label=y_train,
+            group=train_groups,
+            feature_name=list(X_train.columns),
+        )
+
+        if val_data is not None:
+            val_groups = val_data.groupby("user_id").size().values
+            X_val = val_data[self.feature_columns]
+            y_val = val_data["target"]
+
+            val_dataset = lgb.Dataset(
+                X_val, label=y_val, group=val_groups, reference=train_dataset
+            )
+            valid_sets = [train_dataset, val_dataset]
+            valid_names = ["train", "valid"]
+        else:
+            valid_sets = [train_dataset]
+            valid_names = ["train"]
+
+        print("Начинаем обучение LightGBM...")
+        self.model = lgb.train(
+            params,
+            train_dataset,
+            num_boost_round=1000,
+            valid_sets=valid_sets,
+            valid_names=valid_names,
+            callbacks=[
+                lgb.log_evaluation(50),  # каждые 50 итераций выводить лог
+                lgb.early_stopping(50),  # early stopping
+            ],
+        )
+
+        return self.model
+
+    def evaluate(self, data):
+        """Оценка модели"""
+        if self.model is None:
+            print("Модель не обучена")
+            return 0.0
+
+        if len(data) == 0:
+            print("Нет данных для оценки")
+            return 0.0
+
+        predictions = self.predict_rank(data)
+        groups = data.groupby("user_id").size().values
+        ndcg = ndcg_at_k_grouped(predictions, data["target"].values, groups, k=100)
+        return ndcg
+
+    def predict_rank(self, data):
+        """Предсказание рангов"""
+        X = data[self.feature_columns]
+        return self.model.predict(X)
+
+    def recommend(self, user_items_data):
+        """Генерация рекомендаций"""
+        predictions = self.predict_rank(user_items_data)
+        user_items_data["score"] = predictions
+
+        recommendations = {}
+        for user_id, group in user_items_data.groupby("user_id"):
+            top_items = group.nlargest(100, "score")["item_id"].tolist()
+            recommendations[user_id] = top_items
+
+        return recommendations
+
+
+def load_and_process_embeddings(items_ddf, embedding_column="fclip_embed"):
+    """
+    Загрузка и обработка эмбеддингов товаров
+    """
+    print("Загрузка эмбеддингов товаров...")
+
+    # Вычисляем items_df с ProgressBar
+    with ProgressBar():
+        items_df = items_ddf.compute()
+
+    if embedding_column not in items_df.columns:
+        print(f"Колонка {embedding_column} не найдена в items данных")
+        return None
+
+    embeddings_dict = {}
+    valid_items = []
+
+    for idx, row in tqdm(
+        items_df.iterrows(), desc="Обработка эмбеддингов", total=len(items_df)
+    ):
+        item_id = row["item_id"]
+        embedding_str = row[embedding_column]
+
+        # случай: строка
+        if isinstance(embedding_str, str) and pd.notna(embedding_str):
+            try:
+                embedding = np.fromstring(embedding_str.strip("[]"), sep=" ")
+                if embedding.size > 0:
+                    embeddings_dict[item_id] = embedding
+                    valid_items.append(item_id)
+            except Exception:
+                continue
+
+        # случай: список или массив
+        elif isinstance(embedding_str, (list, np.ndarray)):
+            arr = np.array(embedding_str, dtype=float)
+            if arr.size > 0:
+                embeddings_dict[item_id] = arr
+                valid_items.append(item_id)
+
+        # иначе игнорируем
+
+    print(f"Загружено эмбеддингов для {len(embeddings_dict)} товаров")
+
+    return embeddings_dict
+
+
 # -------------------- Основной запуск --------------------
 if __name__ == "__main__":
+    start_time = time.time()
     K = 100
     RECENT_N = 20
     TEST_SIZE = 0.2
-    SIMILAR_SEED = 20
-    BLEND_SIM_BETA = 0.3
 
-    # -------------------- Load & filter --------------------
+    # Параметры масштабирования
+    SCALING_STAGE = "full"  # small, medium, large, full
+
+    scaling_config = {
+        "small": {"sample_users": 500, "sample_fraction": 0.1},
+        "medium": {"sample_users": 5000, "sample_fraction": 0.3},
+        "large": {"sample_users": 20000, "sample_fraction": 0.7},
+        "full": {"sample_users": None, "sample_fraction": 1.0},
+    }
+
+    config = scaling_config[SCALING_STAGE]
+
+    print(f"=== РЕЖИМ МАСШТАБИРОВАНИЯ: {SCALING_STAGE.upper()} ===")
+    print(f"Пользователей: {config['sample_users'] or 'все'}")
+    print(f"Данных: {config['sample_fraction']*100}%")
+
+    print("=== ЗАГРУЗКА ДАННЫХ ===")
     orders_ddf, tracker_ddf, items_ddf, categories_ddf, test_users_ddf = (
         load_train_data()
     )
     orders_ddf, tracker_ddf, items_ddf = filter_data(orders_ddf, tracker_ddf, items_ddf)
 
-    # -------------------- Split --------------------
+    print("=== ЗАГРУЗКА ЭМБЕДДИНГОВ ===")
+    # Загружаем эмбеддинги товаров - теперь возвращается только словарь
+    embeddings_dict = load_and_process_embeddings(items_ddf)
+
+    print("=== SPLIT ДАННЫХ ===")
     orders_df_full = orders_ddf.compute()
     train_orders_df, test_orders_df, cutoff_ts_per_user = train_test_split_by_time(
         orders_df_full, TEST_SIZE
     )
 
-    # -------------------- Prepare interactions batches --------------------
+    print("=== ПОДГОТОВКА ВЗАИМОДЕЙСТВИЙ ===")
     interactions_files = prepare_interactions(
         train_orders_df, tracker_ddf, cutoff_ts_per_user, scale_days=30
     )
 
-    # -------------------- Recent items map --------------------
+    print("=== ПОСЛЕДНИЕ ТОВАРЫ ===")
     batch_dir = "/home/root6/python/e_cup/rec_system/data/processed/prepare_interactions_batches"
     recent_items_map = build_recent_items_map_from_batches(batch_dir, recent_n=RECENT_N)
 
-    # -------------------- Train ALS --------------------
+    print("=== ОБУЧЕНИЕ ALS ДЛЯ ПРИЗНАКОВ ===")
     model, user_map, item_map = train_als(interactions_files)
-    save_model(
-        model,
-        user_map,
-        item_map,
-        path="/home/root6/python/e_cup/rec_system/src/models/model_als.pkl",
-    )
-
-    # -------------------- Popularity --------------------
     popularity_s = compute_global_popularity(train_orders_df)
 
-    # -------------------- User-items CSR --------------------
-    user_items_csr = build_user_items_csr(interactions_files, user_map, item_map)
+    print("=== ПОДГОТОВКА ДАННЫХ ДЛЯ LightGBM ===")
+    recommender = LightGBMRecommender()
+    recommender.set_als_embeddings(model)
 
-    # -------------------- Items & test users --------------------
-    with ProgressBar():
-        items_df_pd = items_ddf.compute()
-    with ProgressBar():
-        test_users_df = test_users_ddf.compute()
+    if embeddings_dict:
+        recommender.set_external_embeddings(embeddings_dict)
 
-    # -------------------- Generate submission --------------------
-    generate_and_save_recommendations_iter(
-        model=model,
-        user_map=user_map,
-        item_map=item_map,
-        user_items_csr=user_items_csr,
-        interactions_files=interactions_files,
-        popularity_s=popularity_s,
-        users_df=test_users_df[["user_id"]],
-        recent_items_map=recent_items_map,
-        top_k=K,
-        similar_top_n_seed=SIMILAR_SEED,
-        blend_sim_beta=BLEND_SIM_BETA,
-        batch_size=10000,
-        filename="/home/root6/python/e_cup/rec_system/result/submission.csv",
+    # МАСШТАБИРУЕМ данные
+    if config["sample_users"]:
+        sample_test_orders = test_orders_df.sample(
+            min(config["sample_users"], len(test_orders_df)), random_state=42
+        )
+    else:
+        sample_test_orders = test_orders_df  # все данные
+
+    train_data = recommender.prepare_training_data(
+        interactions_files,
+        user_map,
+        item_map,
+        popularity_s,
+        recent_items_map,
+        sample_test_orders,
+        sample_fraction=config["sample_fraction"],
     )
 
-    # -------------------- Evaluate NDCG --------------------
-    ndcg100 = evaluate_ndcg_iter(
-        model=model,
-        user_map=user_map,
-        item_map=item_map,
-        user_items_csr=user_items_csr,
-        test_df=test_orders_df[["user_id", "item_id"]],
-        popularity_s=popularity_s,
-        users_df=test_orders_df[["user_id"]].drop_duplicates(),
-        interactions_files=interactions_files,  # <- список батчей
-        recent_items_map=recent_items_map,
-        top_k=K,
-        similar_top_n_seed=SIMILAR_SEED,
-        blend_sim_beta=BLEND_SIM_BETA,
+    # Разделяем на train/validation
+    users = train_data["user_id"].unique()
+    train_users, val_users = train_test_split(users, test_size=0.2, random_state=42)
+
+    train_df = train_data[train_data["user_id"].isin(train_users)]
+    val_df = train_data[train_data["user_id"].isin(val_users)]
+
+    print(f"Размер train: {len(train_df)}, validation: {len(val_df)}")
+    print(f"Признаки: {recommender.feature_columns[:20]}...")
+
+    print("=== ОБУЧЕНИЕ LightGBM ===")
+    model = recommender.train(train_df, val_df)
+
+    print("=== ОЦЕНКА МОДЕЛИ ===")
+    train_ndcg = recommender.evaluate(train_df)
+    val_ndcg = recommender.evaluate(val_df)
+
+    print(f"NDCG@100 train: {train_ndcg:.4f}")
+    print(f"NDCG@100 val: {val_ndcg:.4f}")
+
+    # Анализ важности признаков
+    print("=== ВАЖНОСТЬ ПРИЗНАКОВ ===")
+    feature_importance = pd.DataFrame(
+        {
+            "feature": recommender.feature_columns,
+            "importance": recommender.model.feature_importance(),
+        }
     )
-    print(f"NDCG@100 (temporal split): {ndcg100:.6f}")
+    feature_importance = feature_importance.sort_values("importance", ascending=False)
+    print(feature_importance.head(20))
+
+    print("=== СОХРАНЕНИЕ МОДЕЛИ ===")
+    os.makedirs("/home/root6/python/e_cup/rec_system/src/models", exist_ok=True)
+    with open(
+        "/home/root6/python/e_cup/rec_system/src/models/lgbm_model.pkl", "wb"
+    ) as f:
+        pickle.dump(
+            {
+                "model": recommender.model,
+                "feature_columns": recommender.feature_columns,
+                "user_map": user_map,
+                "item_map": item_map,
+                "popularity_s": popularity_s,
+                "embeddings_dict": embeddings_dict,
+            },
+            f,
+        )
+
+    print("Обучение завершено! Модель сохранена.")
+    elapsed_time = timedelta(seconds=time.time() - start_time)
+    print(f"Время подготовки модели: {elapsed_time}")
