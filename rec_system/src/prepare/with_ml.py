@@ -1033,61 +1033,38 @@ class LightGBMRecommender:
         sample_fraction=0.1,
     ):
         """
-        Улучшенная подготовка данных для обучения LightGBM
+        Подготовка данных для LightGBM с ограничением негативных примеров (≤3 на пользователя)
         """
         print("Подготовка данных для LightGBM...")
 
-        # Ограничиваем количество данных
+        # Ограничиваем данные
         test_orders_df = test_orders_df.sample(frac=sample_fraction, random_state=42)
 
-        # Собираем ВСЕ взаимодействия для богатых признаков
+        # Загружаем все взаимодействия
         print("Загрузка всех взаимодействий для признаков...")
         all_interactions = []
         for f in tqdm(interactions_files, desc="Загрузка взаимодействий"):
             df = pd.read_parquet(f)
             all_interactions.append(df)
-
         interactions_df = pd.concat(all_interactions, ignore_index=True)
 
-        # Добавляем временные метки
+        # Временные метки
         interactions_df["timestamp"] = pd.to_datetime(interactions_df["timestamp"])
         max_timestamp = interactions_df["timestamp"].max()
 
-        # Создаем позитивные пары
-        positive_samples = []
-        for _, row in tqdm(test_orders_df.iterrows(), desc="Позитивные примеры"):
-            positive_samples.append(
-                {"user_id": row["user_id"], "item_id": row["item_id"], "target": 1}
-            )
-
+        # Позитивные пары
+        positive_samples = [
+            {"user_id": row["user_id"], "item_id": row["item_id"], "target": 1}
+            for _, row in tqdm(test_orders_df.iterrows(), desc="Позитивные примеры")
+        ]
         positive_df = pd.DataFrame(positive_samples)
 
-        # Улучшенное негативное сэмплирование
+        # Негативные примеры
         print("Улучшенное негативное сэмплирование...")
         negative_samples = []
 
-        # Богатые пользовательские профили
-        user_interaction_stats = (
-            interactions_df.groupby("user_id")
-            .agg(
-                {"weight": ["count", "mean", "sum", "std"], "timestamp": ["max", "min"]}
-            )
-            .reset_index()
-        )
-        user_interaction_stats.columns = [
-            "user_id",
-            "user_int_count",
-            "user_int_mean",
-            "user_int_sum",
-            "user_int_std",
-            "user_last_int",
-            "user_first_int",
-        ]
-
         user_items = interactions_df.groupby("user_id")["item_id"].apply(set).to_dict()
         all_items_set = set(item_map.keys())
-
-        # Создаем копию popularity_s для безопасного доступа
         popularity_series = popularity_s.copy()
 
         for user_id in tqdm(positive_df["user_id"].unique(), desc="Негативные сэмплы"):
@@ -1096,15 +1073,12 @@ class LightGBMRecommender:
             )
             user_interacted = user_items.get(user_id, set())
 
-            # Доступные негативные товары
+            # Доступные негативы
             available_negatives = list(all_items_set - user_interacted - user_positives)
 
             if available_negatives:
-                # Увеличиваем количество негативных примеров
-                n_negatives = min(20, len(available_negatives))
+                n_negatives = min(3, len(available_negatives))
 
-                # Стратегическое сэмплирование: популярные + случайные
-                # Фильтруем только те товары, которые есть в popularity_series
                 available_in_popularity = [
                     item
                     for item in available_negatives
@@ -1112,16 +1086,14 @@ class LightGBMRecommender:
                 ]
 
                 if available_in_popularity:
-                    # Берем топ популярных из доступных
                     popular_negatives = (
                         popularity_series[available_in_popularity]
-                        .nlargest(min(10, len(available_in_popularity)))
+                        .nlargest(min(n_negatives, len(available_in_popularity)))
                         .index.tolist()
                     )
                 else:
                     popular_negatives = []
 
-                # Случайные из оставшихся
                 remaining_negatives = list(
                     set(available_negatives) - set(popular_negatives)
                 )
@@ -1146,10 +1118,10 @@ class LightGBMRecommender:
 
         negative_df = pd.DataFrame(negative_samples)
 
-        # Объединяем данные
+        # Объединение
         train_data = pd.concat([positive_df, negative_df], ignore_index=True)
 
-        # Добавляем БОГАТЫЕ признаки
+        # Богатые признаки
         train_data = self._add_rich_features(
             train_data,
             interactions_df,
