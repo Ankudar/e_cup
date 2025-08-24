@@ -1,6 +1,7 @@
 import gc
 import os
 import pickle
+import random
 import time
 from collections import defaultdict
 from datetime import timedelta
@@ -199,35 +200,37 @@ def prepare_interactions(
         gc.collect()
         print(f"Сохранен orders-батч {start}-{min(start+batch_size, n_rows)}")
 
-    # ====== Tracker ======
+    # ====== Tracker ====== # ИСПРАВЛЕНИЕ ЗДЕСЬ
     print("... для tracker")
     tracker_ddf = tracker_ddf[["user_id", "item_id", "timestamp", "action_type"]]
-    n_rows = tracker_ddf.size.compute() // 4  # 4 колонки
 
-    for start in range(0, n_rows, batch_size):
-        part = tracker_ddf.partitions[
-            start // batch_size : (start + batch_size) // batch_size
-        ]
-        batch = part.compute()
-        batch["timestamp"] = pd.to_datetime(batch["timestamp"])
-        batch["cutoff"] = batch["user_id"].map(cutoff_ts_per_user)
+    # ИСПРАВЛЕННЫЙ БЛОК: Итерируемся по партициям Dask DataFrame, а не по строкам.
+    n_partitions = tracker_ddf.npartitions
+    for partition_id in range(n_partitions):
+        # Вычисляем одну партицию
+        part = tracker_ddf.get_partition(partition_id).compute()
+        part["timestamp"] = pd.to_datetime(part["timestamp"])
+        part["cutoff"] = part["user_id"].map(cutoff_ts_per_user)
 
-        mask = batch["cutoff"].isna() | (batch["timestamp"] < batch["cutoff"])
-        batch = batch.loc[mask]
+        mask = part["cutoff"].isna() | (part["timestamp"] < part["cutoff"])
+        part = part.loc[mask]
 
-        aw = batch["action_type"].map(action_weights).fillna(0)
-        days_ago = (ref_time - batch["timestamp"]).dt.days.clip(lower=1)
+        if part.empty:
+            continue
+
+        aw = part["action_type"].map(action_weights).fillna(0)
+        days_ago = (ref_time - part["timestamp"]).dt.days.clip(lower=1)
         time_factor = np.log1p(days_ago / scale_days)
-        batch = batch.assign(weight=aw * time_factor)[
+        part = part.assign(weight=aw * time_factor)[
             ["user_id", "item_id", "weight", "timestamp"]
         ]
 
-        path = os.path.join(output_dir, f"tracker_batch_{start}.parquet")
-        batch.to_parquet(path, index=False, engine="pyarrow")
+        path = os.path.join(output_dir, f"tracker_part_{partition_id}.parquet")
+        part.to_parquet(path, index=False, engine="pyarrow")
         batch_files.append(path)
-        del batch
+        del part
         gc.collect()
-        print(f"Сохранен tracker-батч {start}-{min(start+batch_size, n_rows)}")
+        print(f"Сохранен tracker-партиция {partition_id}")
 
     print("Все батчи сохранены на диск.")
     return batch_files
@@ -247,82 +250,58 @@ def compute_global_popularity(train_orders_df):
 
 
 # -------------------- Обучение ALS --------------------
-def train_als(
-    interactions_files, n_factors=64, lr=0.01, reg=0.1, iterations=100, device="cuda"
-):
+def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
     """
-    Тренируем TorchALS с семплированием на GPU.
+    Обучение ALS с итеративной загрузкой данных для построения маппингов.
+    Фактическое обучение происходит на сжатом sparse тензоре.
     """
-    # Чтение всех взаимодействий в один DataFrame
-    chunks = [
-        pd.read_parquet(f, columns=["user_id", "item_id", "weight"])
-        for f in interactions_files
-    ]
-    interactions_df = pd.concat(chunks, ignore_index=True)
+    # 1. ПРОХОД: Собираем все user_id и item_id для построения маппингов
+    user_set = set()
+    item_set = set()
+    print("Первый проход: построение маппингов...")
+    for f in tqdm(interactions_files):
+        # Читаем только нужные колонки
+        df_chunk = pd.read_parquet(f, columns=["user_id", "item_id"])
+        user_set.update(df_chunk["user_id"].unique())
+        item_set.update(df_chunk["item_id"].unique())
 
-    user_ids = {uid: idx for idx, uid in enumerate(interactions_df["user_id"].unique())}
-    item_ids = {iid: idx for idx, iid in enumerate(interactions_df["item_id"].unique())}
+    user_map = {u: i for i, u in enumerate(sorted(user_set))}
+    item_map = {i: j for j, i in enumerate(sorted(item_set))}
+    print(f"Маппинги построены. Уников: users={len(user_map)}, items={len(item_map)}")
 
-    n_users, n_items = len(user_ids), len(item_ids)
-    als = TorchALS(n_users, n_items, n_factors, reg=reg, device=device)
+    # 2. ПРОХОД: Построение разреженного тензора COO на GPU
+    rows_list, cols_list, values_list = [], [], []
+    print("Второй проход: построение тензора...")
+    for f in tqdm(interactions_files):
+        df_chunk = pd.read_parquet(f, columns=["user_id", "item_id", "weight"])
+        # Применяем маппинги
+        df_chunk["user_idx"] = df_chunk["user_id"].map(user_map)
+        df_chunk["item_idx"] = df_chunk["item_id"].map(item_map)
+        df_chunk = df_chunk.dropna(subset=["user_idx", "item_idx"])  # Важно!
 
-    users = torch.tensor(interactions_df["user_id"].map(user_ids).values, device=device)
-    items = torch.tensor(interactions_df["item_id"].map(item_ids).values, device=device)
-    values = torch.tensor(
-        interactions_df["weight"].values, dtype=torch.float32, device=device
-    )
+        rows_list.append(df_chunk["user_idx"].values.astype(np.int32))
+        cols_list.append(df_chunk["item_idx"].values.astype(np.int32))
+        values_list.append(df_chunk["weight"].values.astype(np.float32))
 
+    # Конкатенация и перенос на GPU
+    rows = np.concatenate(rows_list)
+    cols = np.concatenate(cols_list)
+    values = np.concatenate(values_list)
+
+    indices = torch.tensor([rows, cols], dtype=torch.long, device=device)
+    values = torch.tensor(values, dtype=torch.float32, device=device)
     sparse_tensor = torch.sparse_coo_tensor(
-        indices=torch.vstack([users, items]),
-        values=values,
-        size=(n_users, n_items),
-        device=device,
-    ).coalesce()
-
-    als.fit(sparse_tensor, iterations=iterations, lr=lr, sample_ratio=0.1)
-    return als, user_ids, item_ids
-
-
-# -------------------- User-Items CSR для recommend --------------------
-def build_user_items_csr(
-    batch_files, user_map, item_map, dtype=torch.float32, device="cuda"
-):
-    """
-    batch_files: список parquet файлов с взаимодействиями
-    Возвращает CSR матрицу user-items на GPU
-    """
-    print("Строим CSR матрицу по батчам на GPU...")
-
-    # Создаем пустые тензоры для COO формата
-    rows = []
-    cols = []
-    values = []
-
-    for f in batch_files:
-        df = pd.read_parquet(f)
-        df["user_idx"] = df["user_id"].map(user_map).astype(np.int32)
-        df["item_idx"] = df["item_id"].map(item_map).astype(np.int32)
-
-        # Добавляем данные в COO формате
-        rows.extend(df["user_idx"].values)
-        cols.extend(df["item_idx"].values)
-        values.extend(df["weight"].values.astype(np.float32))
-
-    # Конвертируем в тензоры и переносим на GPU
-    rows_tensor = torch.tensor(rows, dtype=torch.long, device=device)
-    cols_tensor = torch.tensor(cols, dtype=torch.long, device=device)
-    values_tensor = torch.tensor(values, dtype=dtype, device=device)
-
-    # Создаем sparse матрицу на GPU
-    sparse_tensor = torch.sparse_coo_tensor(
-        torch.stack([rows_tensor, cols_tensor]),
-        values_tensor,
-        size=(len(user_map), len(item_map)),
-        device=device,
+        indices, values, size=(len(user_map), len(item_map))
     )
+    print(f"Тензор построен на GPU. Ненулевых элементов: {sparse_tensor._nnz()}")
 
-    print(f"CSR матрица построена на GPU: {sparse_tensor.shape}")
-    return sparse_tensor
+    # Обучаем ALS
+    als_model = TorchALS(
+        len(user_map), len(item_map), n_factors=n_factors, reg=reg, device=device
+    )
+    als_model.fit(sparse_tensor, iterations=500, lr=0.005, sample_ratio=0.5)
+
+    return als_model, user_map, item_map
 
 
 def build_copurchase_map(
@@ -475,318 +454,6 @@ def build_category_maps(items_df, categories_df):
     return item_to_cat, extended_cat_to_items
 
 
-# -------------------- Recommendations (ALS + recent + similar + popular) --------------------
-def generate_and_save_recommendations_iter(
-    user_batch,
-    train_orders_df,
-    user_map,
-    item_map,
-    inv_item_map,
-    user_factors,
-    item_factors,
-    user_items_sparse,
-    als_weight=0.5,
-    co_weight=0.3,
-    cat_weight=0.2,
-    top_k=100,
-    recent_n=5,
-    similar_top_n_seed=20,
-    copurchase_map=None,
-    cat_to_items=None,
-    popular_items=None,
-):
-    """
-    Кандидаты с ускорением на PyTorch (ALS + similarity батчами).
-    """
-    device = user_factors.device
-    als_recommendations = {}
-    co_recommendations = {}
-    cat_recommendations = {}
-    pop_recommendations = {}
-    sim_recommendations = {}
-
-    # === ALS ===
-    valid_user_indices = [user_map[u] for u in user_batch if u in user_map]
-    if valid_user_indices:
-        user_embeddings = user_factors[valid_user_indices]  # (B, d)
-        with torch.no_grad():
-            scores = torch.matmul(user_embeddings, item_factors.T)  # (B, N)
-
-            # маска просмотренных
-            user_interactions = user_items_sparse[valid_user_indices].to_dense()
-            scores[user_interactions > 0] = -float("inf")
-
-            top_scores, top_indices = torch.topk(scores, top_k * 2, dim=1)
-
-        for j, u in enumerate(user_batch):
-            if u in user_map:
-                als_items = [
-                    (inv_item_map[int(idx)], float(score * als_weight))
-                    for idx, score in zip(top_indices[j].cpu(), top_scores[j].cpu())
-                    if score > -float("inf") and int(idx) in inv_item_map
-                ]
-                als_recommendations[u] = als_items
-
-    # === Co-purchase ===
-    if copurchase_map is not None:
-        for u in user_batch:
-            user_orders = train_orders_df[train_orders_df.user_id == u]
-            recent_items = (
-                user_orders.sort_values("created_timestamp")["item_id"]
-                .drop_duplicates()
-                .tolist()[-recent_n:]
-            )
-            co_items = {}
-            for rit in recent_items:
-                if rit in copurchase_map:
-                    for cit, w in copurchase_map[rit]:
-                        co_items[cit] = co_items.get(cit, 0) + w * co_weight
-            co_recommendations[u] = sorted(co_items.items(), key=lambda x: -x[1])[
-                :top_k
-            ]
-
-    # === Похожие товары (батчем) ===
-    for u in user_batch:
-        user_orders = train_orders_df[train_orders_df.user_id == u]
-        recent_items = (
-            user_orders.sort_values("created_timestamp")["item_id"]
-            .drop_duplicates()
-            .tolist()[-recent_n:]
-        )
-        recent_indices = [item_map[it] for it in recent_items if it in item_map]
-        sim_items = []
-        if recent_indices:
-            rit_embeddings = item_factors[recent_indices]  # (R, d)
-            with torch.no_grad():
-                similarities = torch.matmul(item_factors, rit_embeddings.T)  # (N, R)
-                topk_vals, topk_idx = torch.topk(
-                    similarities, similar_top_n_seed + 1, dim=0
-                )
-            for col in range(len(recent_indices)):
-                for idx in topk_idx[1:, col].cpu().numpy():
-                    if int(idx) in inv_item_map:
-                        sim_items.append(inv_item_map[int(idx)])
-            sim_items = list(dict.fromkeys(sim_items))[:top_k]
-        sim_recommendations[u] = [(it, 1.0) for it in sim_items]
-
-    # === Категории ===
-    if cat_to_items is not None:
-        for u in user_batch:
-            user_orders = train_orders_df[train_orders_df.user_id == u]
-            recent_items = (
-                user_orders.sort_values("created_timestamp")["item_id"]
-                .drop_duplicates()
-                .tolist()[-recent_n:]
-            )
-            cat_items = {}
-            for rit in recent_items:
-                for cit in cat_to_items.get(rit, []):
-                    cat_items[cit] = cat_items.get(cit, 0) + cat_weight
-            cat_recommendations[u] = sorted(cat_items.items(), key=lambda x: -x[1])[
-                :top_k
-            ]
-
-    # === Популярные ===
-    if popular_items is not None:
-        pop_recommendations = {
-            u: [(it, 1.0) for it in popular_items[:top_k]] for u in user_batch
-        }
-
-    # === Объединение ===
-    final_recommendations = {}
-    for u in user_batch:
-        combined = defaultdict(float)
-        for source in [
-            als_recommendations,
-            co_recommendations,
-            sim_recommendations,
-            cat_recommendations,
-            pop_recommendations,
-        ]:
-            if u in source:
-                for it, score in source[u]:
-                    combined[it] += score
-        final_recommendations[u] = sorted(combined.items(), key=lambda x: -x[1])[:top_k]
-
-    return final_recommendations
-
-
-def evaluate_ndcg_iter_optimized(
-    model,
-    user_map,
-    item_map,
-    user_items_csr,
-    test_df,
-    popularity_s,
-    users_df,
-    interactions_files,
-    recent_items_map=None,
-    top_k=100,
-    recent_n=5,
-    similar_top_n_seed=20,
-    blend_sim_beta=0.3,
-):
-    import pandas as pd
-    from tqdm import tqdm
-
-    recent_items_map = recent_items_map or {}
-    inv_item_map = {int(v): int(k) for k, v in item_map.items()}
-    popular_items = popularity_s.index.tolist()
-    popular_set = set(popular_items)
-
-    # ======== Предварительно создаем ground truth ========
-    gt = test_df.groupby("user_id")["item_id"].apply(set).to_dict()
-
-    # ======== Предзагрузка всех интеракций ========
-    user_interactions_dict = {}
-    for f in interactions_files:
-        df = pd.read_parquet(f)
-        for uid, df_user in df.groupby("user_id"):
-            if uid in user_interactions_dict:
-                user_interactions_dict[uid] = pd.concat(
-                    [user_interactions_dict[uid], df_user], ignore_index=True
-                )
-            else:
-                user_interactions_dict[uid] = df_user
-
-    ndcg_sum = 0.0
-    n_users = 0
-
-    for user_id in tqdm(users_df["user_id"], desc="Evaluate NDCG iter"):
-        try:
-            user_idx_int = user_map.get(user_id)
-            user_tracker = user_interactions_dict.get(
-                user_id,
-                pd.DataFrame(columns=["user_id", "item_id", "weight", "timestamp"]),
-            )
-            user_bought_items = set(user_tracker[user_tracker["weight"] > 0]["item_id"])
-            tracker_scored = (
-                user_tracker[["item_id", "weight"]].drop_duplicates().values.tolist()
-            )
-
-            # ======== ALS рекомендации ========
-            als_scored = []
-            if user_idx_int is not None and user_idx_int < user_items_csr.shape[0]:
-                try:
-                    rec = model.recommend(
-                        userid=user_idx_int,
-                        user_items=user_items_csr[user_idx_int],
-                        N=top_k * 2,
-                        filter_already_liked_items=True,
-                        recalculate_user=True,
-                    )
-                    als_items = [
-                        (inv_item_map[int(r[0])], float(r[1]))
-                        for r in rec
-                        if len(r) == 2 and int(r[0]) in inv_item_map
-                    ]
-                    als_scored = [
-                        (it, score * 0.5)
-                        for it, score in als_items
-                        if it not in user_bought_items
-                    ]
-                except Exception as e:
-                    print(f"Ошибка ALS для пользователя {user_id}: {e}")
-
-            # ======== Последние товары ========
-            recent_items = recent_items_map.get(user_id, [])
-            recent_scored = [
-                (it, 1.0)
-                for it in recent_items[:recent_n]
-                if it not in user_bought_items
-            ]
-
-            # ======== Похожие товары ========
-            sim_items = []
-            for rit in recent_items:
-                if rit in item_map:
-                    try:
-                        sims = model.similar_items(
-                            int(item_map[rit]), N=similar_top_n_seed
-                        )
-                        sim_items.extend(
-                            [
-                                inv_item_map[int(si[0])]
-                                for si in sims
-                                if len(si) == 2 and int(si[0]) in inv_item_map
-                            ]
-                        )
-                    except Exception:
-                        continue
-            sim_items = list(dict.fromkeys(sim_items))
-            sim_quota = int(top_k * blend_sim_beta)
-            sim_scored = [
-                (it, 0.5) for it in sim_items[:sim_quota] if it not in user_bought_items
-            ]
-
-            # ======== Популярные товары ========
-            if als_scored:
-                min_score = min((s for _, s in als_scored))
-            else:
-                min_score = 0.1
-            pop_scored = [
-                (it, min_score * 0.1)
-                for it in popular_items
-                if it not in user_bought_items
-            ]
-
-            # ======== Объединяем кандидатов ========
-            all_candidates = (
-                tracker_scored + als_scored + recent_scored + sim_scored + pop_scored
-            )
-            all_candidates = sorted(all_candidates, key=lambda x: x[1], reverse=True)
-
-            seen, final = set(), []
-            for it, _ in all_candidates:
-                if it not in seen:
-                    final.append(it)
-                    seen.add(it)
-                if len(final) >= top_k:
-                    break
-            recommended = final if final else popular_items[:top_k]
-
-            # ======== NDCG ========
-            user_gt = gt.get(user_id, set())
-            ndcg_sum += ndcg_at_k(recommended, user_gt, k=top_k)
-            n_users += 1
-
-        except Exception as e:
-            print(f"Ошибка для пользователя {user_id}: {e}")
-            continue
-
-    return ndcg_sum / n_users if n_users > 0 else 0.0
-
-
-# -------------------- Строим словарь "какие товары похожи на какой" --------------------
-def get_similar_by_category_tree(items_df, categories_df, top_n=20):
-    """
-    Строит словарь похожих товаров через иерархию категорий
-    """
-    # Группировка: категория -> список товаров
-    catalog_items = items_df.groupby("catalogid")["item_id"].apply(list).to_dict()
-    # Иерархия категорий
-    cat_tree = categories_df.set_index("catalogid")["ids"].to_dict()
-
-    # Предрассчитаем "расширенные" категории сразу
-    extended_cat_items = {}
-    for cat_id, items in catalog_items.items():
-        all_items = set(items)
-        if cat_id in cat_tree:
-            for parent_cat in cat_tree[cat_id]:
-                all_items.update(catalog_items.get(parent_cat, []))
-        extended_cat_items[cat_id] = list(all_items)
-
-    # Для каждого товара ищем похожие
-    similar_map = {}
-    for item, cat in items_df[["item_id", "catalogid"]].values:
-        sim_items = extended_cat_items.get(cat, [])
-        if sim_items:
-            similar_map[item] = [x for x in sim_items if x != item][:top_n]
-        else:
-            similar_map[item] = []
-    return similar_map
-
-
 # -------------------- Метрики --------------------
 def ndcg_at_k(recommended, ground_truth, k=100, device="cuda"):
     """
@@ -824,31 +491,6 @@ def ndcg_at_k(recommended, ground_truth, k=100, device="cuda"):
     )
 
     return (dcg / idcg).item() if idcg > 0 else 0.0
-
-
-def evaluate_ndcg(recommendations, test_df, k=100, device="cuda"):
-    """
-    Считаем средний NDCG@k по всем пользователям
-    recommendations: dict[user_id -> список рекомендованных item_id]
-    test_df: DataFrame с (user_id, item_id)
-    """
-    print("Считаем NDCG...")
-
-    # Собираем ground truth в dict[user -> set(items)]
-    gt = defaultdict(set)
-    for r in test_df.itertuples():
-        gt[r.user_id].add(r.item_id)
-
-    ndcg_scores = []
-    for uid, recs in recommendations.items():
-        ndcg_scores.append(ndcg_at_k(recs, gt.get(uid, set()), k=k, device=device))
-
-    print("NDCG рассчитан")
-    return (
-        float(torch.tensor(ndcg_scores, device=device).mean().item())
-        if ndcg_scores
-        else 0.0
-    )
 
 
 def build_recent_items_map_from_batches(batch_dir, recent_n=5, device="cuda"):
@@ -1670,6 +1312,450 @@ class LightGBMRecommender:
         return recommendations
 
 
+def build_user_features_dict(interactions_files, orders_df, device="cuda"):
+    """
+    Создает словарь {user_id: {feature_name: value}} с признаками пользователей.
+    Использует interactions_files (трекер) и orders_df (заказы).
+    """
+    print("Построение словаря пользовательских признаков...")
+    user_stats_dict = {}
+
+    # 1. АГРЕГАЦИЯ ПО ТРЕКЕРУ (взаимодействия)
+    for f in tqdm(interactions_files, desc="Обработка трекера"):
+        df_chunk = pd.read_parquet(f)
+
+        # Группируем по пользователю
+        chunk_stats = df_chunk.groupby("user_id").agg(
+            {
+                "weight": ["count", "mean", "sum", "std", "max", "min"],
+                "timestamp": ["max", "min"],
+            }
+        )
+
+        # Обновляем общий словарь
+        for user_id, stats in chunk_stats.iterrows():
+            if user_id not in user_stats_dict:
+                user_stats_dict[user_id] = {
+                    "user_count": 0,
+                    "user_mean": 0,
+                    "user_sum": 0,
+                    "user_std": 0,
+                    "user_max": 0,
+                    "user_min": 0,
+                    "user_last_ts": pd.Timestamp.min,
+                    "user_first_ts": pd.Timestamp.max,
+                    "user_orders_count": 0,
+                    "user_avg_order_value": 0,
+                }
+
+            # Обновляем статистику по взаимодействиям
+            user_stats_dict[user_id]["user_count"] += stats[("weight", "count")]
+            user_stats_dict[user_id]["user_sum"] += stats[("weight", "sum")]
+            user_stats_dict[user_id]["user_max"] = max(
+                user_stats_dict[user_id]["user_max"], stats[("weight", "max")]
+            )
+            user_stats_dict[user_id]["user_min"] = min(
+                user_stats_dict[user_id]["user_min"], stats[("weight", "min")]
+            )
+            user_stats_dict[user_id]["user_last_ts"] = max(
+                user_stats_dict[user_id]["user_last_ts"], stats[("timestamp", "max")]
+            )
+            user_stats_dict[user_id]["user_first_ts"] = min(
+                user_stats_dict[user_id]["user_first_ts"], stats[("timestamp", "min")]
+            )
+
+    # 2. АГРЕГАЦИЯ ПО ЗАКАЗАМ
+    print("Агрегация по заказам...")
+    order_stats = (
+        orders_df.groupby("user_id")
+        .agg({"item_id": "count", "created_timestamp": ["min", "max"]})
+        .reset_index()
+    )
+
+    order_stats.columns = [
+        "user_id",
+        "user_orders_count",
+        "user_first_order_ts",
+        "user_last_order_ts",
+    ]
+
+    for _, row in order_stats.iterrows():
+        user_id = row["user_id"]
+        if user_id not in user_stats_dict:
+            user_stats_dict[user_id] = {
+                "user_count": 0,
+                "user_mean": 0,
+                "user_sum": 0,
+                "user_std": 0,
+                "user_max": 0,
+                "user_min": 0,
+                "user_last_ts": pd.Timestamp.min,
+                "user_first_ts": pd.Timestamp.max,
+                "user_orders_count": 0,
+                "user_avg_order_value": 0,
+            }
+
+        user_stats_dict[user_id]["user_orders_count"] = row["user_orders_count"]
+        user_stats_dict[user_id]["user_last_order_ts"] = row["user_last_order_ts"]
+        user_stats_dict[user_id]["user_first_order_ts"] = row["user_first_order_ts"]
+
+    # 3. ВЫЧИСЛЕНИЕ ПРОИЗВОДНЫХ ПРИЗНАКОВ
+    print("Вычисление производных признаков...")
+    current_time = pd.Timestamp.now()
+
+    for user_id in user_stats_dict:
+        stats = user_stats_dict[user_id]
+
+        # Время с последнего взаимодействия
+        if stats["user_last_ts"] > pd.Timestamp.min:
+            stats["user_days_since_last"] = (current_time - stats["user_last_ts"]).days
+        else:
+            stats["user_days_since_last"] = 365  # большое значение если нет данных
+
+        # Время с первого взаимодействия
+        if stats["user_first_ts"] < pd.Timestamp.max:
+            stats["user_days_since_first"] = (
+                current_time - stats["user_first_ts"]
+            ).days
+        else:
+            stats["user_days_since_first"] = 365
+
+        # Время с последнего заказа
+        if "user_last_order_ts" in stats and pd.notna(stats["user_last_order_ts"]):
+            stats["user_days_since_last_order"] = (
+                current_time - stats["user_last_order_ts"]
+            ).days
+        else:
+            stats["user_days_since_last_order"] = 365
+
+        # Средний вес взаимодействия
+        if stats["user_count"] > 0:
+            stats["user_mean"] = stats["user_sum"] / stats["user_count"]
+        else:
+            stats["user_mean"] = 0
+
+    print(
+        f"Словарь пользовательских признаков построен. Записей: {len(user_stats_dict)}"
+    )
+    return user_stats_dict
+
+
+def build_item_features_dict(
+    interactions_files, items_df, orders_df, embeddings_dict, device="cuda"
+):
+    """
+    Создает словарь {item_id: {feature_name: value}} с признаками товаров.
+    """
+    print("Построение словаря товарных признаков...")
+    item_stats_dict = {}
+
+    # 1. АГРЕГАЦИЯ ПО ТРЕКЕРУ И ЗАКАЗАМ (популярность)
+    for f in tqdm(interactions_files, desc="Обработка взаимодействий"):
+        df_chunk = pd.read_parquet(f)
+
+        chunk_stats = df_chunk.groupby("item_id").agg(
+            {
+                "weight": ["count", "mean", "sum", "std", "max", "min"],
+                "timestamp": ["max", "min"],
+            }
+        )
+
+        for item_id, stats in chunk_stats.iterrows():
+            if item_id not in item_stats_dict:
+                item_stats_dict[item_id] = {
+                    "item_count": 0,
+                    "item_mean": 0,
+                    "item_sum": 0,
+                    "item_std": 0,
+                    "item_max": 0,
+                    "item_min": 0,
+                    "item_last_ts": pd.Timestamp.min,
+                    "item_first_ts": pd.Timestamp.max,
+                    "item_orders_count": 0,
+                }
+
+            item_stats_dict[item_id]["item_count"] += stats[("weight", "count")]
+            item_stats_dict[item_id]["item_sum"] += stats[("weight", "sum")]
+            item_stats_dict[item_id]["item_max"] = max(
+                item_stats_dict[item_id]["item_max"], stats[("weight", "max")]
+            )
+            item_stats_dict[item_id]["item_min"] = min(
+                item_stats_dict[item_id]["item_min"], stats[("weight", "min")]
+            )
+            item_stats_dict[item_id]["item_last_ts"] = max(
+                item_stats_dict[item_id]["item_last_ts"], stats[("timestamp", "max")]
+            )
+            item_stats_dict[item_id]["item_first_ts"] = min(
+                item_stats_dict[item_id]["item_first_ts"], stats[("timestamp", "min")]
+            )
+
+    # 2. ДОБАВЛЕНИЕ ДАННЫХ ИЗ ЗАКАЗОВ
+    order_item_stats = (
+        orders_df.groupby("item_id").agg({"user_id": "count"}).reset_index()
+    )
+    order_item_stats.columns = ["item_id", "item_orders_count"]
+
+    for _, row in order_item_stats.iterrows():
+        item_id = row["item_id"]
+        if item_id not in item_stats_dict:
+            item_stats_dict[item_id] = {
+                "item_count": 0,
+                "item_mean": 0,
+                "item_sum": 0,
+                "item_std": 0,
+                "item_max": 0,
+                "item_min": 0,
+                "item_last_ts": pd.Timestamp.min,
+                "item_first_ts": pd.Timestamp.max,
+                "item_orders_count": 0,
+            }
+        item_stats_dict[item_id]["item_orders_count"] = row["item_orders_count"]
+
+    # 3. ДОБАВЛЕНИЕ ДАННЫХ ИЗ items_df
+    print("Добавление данных из items_df...")
+    items_features = (
+        items_df.drop_duplicates(subset=["item_id"])
+        .set_index("item_id")[["catalogid"]]
+        .to_dict("index")
+    )
+
+    for item_id, features in items_features.items():
+        if item_id not in item_stats_dict:
+            item_stats_dict[item_id] = {
+                "item_count": 0,
+                "item_mean": 0,
+                "item_sum": 0,
+                "item_std": 0,
+                "item_max": 0,
+                "item_min": 0,
+                "item_last_ts": pd.Timestamp.min,
+                "item_first_ts": pd.Timestamp.max,
+                "item_orders_count": 0,
+                "item_category": 0,
+            }
+        item_stats_dict[item_id]["item_category"] = features["catalogid"]
+
+    # 4. ДОБАВЛЕНИЕ ЭМБЕДДИНГОВ (первые N компонент)
+    print("Добавление эмбеддингов...")
+    for item_id, embedding in embeddings_dict.items():
+        if item_id not in item_stats_dict:
+            continue
+
+        for i in range(min(5, len(embedding))):
+            item_stats_dict[item_id][f"fclip_embed_{i}"] = embedding[i]
+
+    # 5. ВЫЧИСЛЕНИЕ ПРОИЗВОДНЫХ ПРИЗНАКОВ
+    print("Вычисление производных признаков...")
+    current_time = pd.Timestamp.now()
+
+    for item_id in item_stats_dict:
+        stats = item_stats_dict[item_id]
+
+        # Время с последнего взаимодействия
+        if stats["item_last_ts"] > pd.Timestamp.min:
+            stats["item_days_since_last"] = (current_time - stats["item_last_ts"]).days
+        else:
+            stats["item_days_since_last"] = 365
+
+        # Время с первого взаимодействия
+        if stats["item_first_ts"] < pd.Timestamp.max:
+            stats["item_days_since_first"] = (
+                current_time - stats["item_first_ts"]
+            ).days
+        else:
+            stats["item_days_since_first"] = 365
+
+        # Средний вес взаимодействия
+        if stats["item_count"] > 0:
+            stats["item_mean"] = stats["item_sum"] / stats["item_count"]
+        else:
+            stats["item_mean"] = 0
+
+    print(f"Словарь товарных признаков построен. Записей: {len(item_stats_dict)}")
+    return item_stats_dict
+
+
+def build_user_item_features_dict(interactions_files, device="cuda"):
+    """
+    Создает словарь {(user_id, item_id): {feature_name: value}}.
+    """
+    print("Построение словаря пользователь-товарных признаков...")
+    user_item_stats_dict = {}
+
+    for f in tqdm(interactions_files, desc="Обработка взаимодействий"):
+        df_chunk = pd.read_parquet(f)
+
+        chunk_stats = df_chunk.groupby(["user_id", "item_id"]).agg(
+            {
+                "weight": ["count", "mean", "sum", "std", "max", "min"],
+                "timestamp": ["max", "min"],
+            }
+        )
+
+        for (user_id, item_id), stats in chunk_stats.iterrows():
+            key = (user_id, item_id)
+            if key not in user_item_stats_dict:
+                user_item_stats_dict[key] = {
+                    "ui_count": 0,
+                    "ui_mean": 0,
+                    "ui_sum": 0,
+                    "ui_std": 0,
+                    "ui_max": 0,
+                    "ui_min": 0,
+                    "ui_last_ts": pd.Timestamp.min,
+                    "ui_first_ts": pd.Timestamp.max,
+                }
+
+            user_item_stats_dict[key]["ui_count"] += stats[("weight", "count")]
+            user_item_stats_dict[key]["ui_sum"] += stats[("weight", "sum")]
+            user_item_stats_dict[key]["ui_max"] = max(
+                user_item_stats_dict[key]["ui_max"], stats[("weight", "max")]
+            )
+            user_item_stats_dict[key]["ui_min"] = min(
+                user_item_stats_dict[key]["ui_min"], stats[("weight", "min")]
+            )
+            user_item_stats_dict[key]["ui_last_ts"] = max(
+                user_item_stats_dict[key]["ui_last_ts"], stats[("timestamp", "max")]
+            )
+            user_item_stats_dict[key]["ui_first_ts"] = min(
+                user_item_stats_dict[key]["ui_first_ts"], stats[("timestamp", "min")]
+            )
+
+    # ВЫЧИСЛЕНИЕ ПРОИЗВОДНЫХ ПРИЗНАКОВ
+    print("Вычисление производных признаков...")
+    current_time = pd.Timestamp.now()
+
+    for key in user_item_stats_dict:
+        stats = user_item_stats_dict[key]
+
+        # Время с последнего взаимодействия
+        if stats["ui_last_ts"] > pd.Timestamp.min:
+            stats["ui_days_since_last"] = (current_time - stats["ui_last_ts"]).days
+        else:
+            stats["ui_days_since_last"] = 365
+
+        # Время с первого взаимодействия
+        if stats["ui_first_ts"] < pd.Timestamp.max:
+            stats["ui_days_since_first"] = (current_time - stats["ui_first_ts"]).days
+        else:
+            stats["ui_days_since_first"] = 365
+
+        # Средний вес взаимодействия
+        if stats["ui_count"] > 0:
+            stats["ui_mean"] = stats["ui_sum"] / stats["ui_count"]
+        else:
+            stats["ui_mean"] = 0
+
+    print(
+        f"Словарь пользователь-товарных признаков построен. Записей: {len(user_item_stats_dict)}"
+    )
+    return user_item_stats_dict
+
+
+def build_category_features_dict(category_df, items_df):
+    """
+    Создает дополнительные признаки на основе категорий.
+    """
+    print("Построение категорийных признаков...")
+
+    # Создаем маппинг товар -> категория
+    item_to_cat = items_df.set_index("item_id")["catalogid"].to_dict()
+
+    # Создаем маппинг категория -> уровень в иерархии
+    cat_to_level = {}
+    for _, row in category_df.iterrows():
+        catalogid = row["catalogid"]
+        # Уровень = количество родителей в иерархии
+        level = (
+            len(row["ids"]) - 1
+        )  # -1 потому что ids включает сам catalogid и всех родителей
+        cat_to_level[catalogid] = max(0, level)
+
+    # Создаем словарь с категорийными признаками
+    category_features_dict = {}
+    for item_id, catalogid in item_to_cat.items():
+        category_features_dict[item_id] = {
+            "item_category": catalogid,
+            "category_level": cat_to_level.get(catalogid, 0),
+        }
+
+    print(f"Категорийные признаки построены. Записей: {len(category_features_dict)}")
+    return category_features_dict
+
+
+def prepare_lgbm_training_data(
+    user_features_dict,
+    item_features_dict,
+    user_item_features_dict,
+    category_features_dict,
+    test_orders_df,
+    all_items,  # список всех item_id
+    sample_fraction=0.1,
+):
+    """
+    Подготавливает данные для обучения LightGBM:
+    1 положительный пример -> 1 негативный пример.
+    """
+    print("Подготовка данных для обучения LightGBM...")
+
+    # Берем sample от тестовых заказов
+    test_sample = test_orders_df.sample(frac=sample_fraction, random_state=42)
+
+    train_examples = []
+
+    for _, row in test_sample.iterrows():
+        user_id = row["user_id"]
+        pos_item_id = row["item_id"]
+
+        # ---------- Положительный ----------
+        features = {}
+        if user_id in user_features_dict:
+            features.update(user_features_dict[user_id])
+        if pos_item_id in item_features_dict:
+            features.update(item_features_dict[pos_item_id])
+        if (user_id, pos_item_id) in user_item_features_dict:
+            features.update(user_item_features_dict[(user_id, pos_item_id)])
+        if pos_item_id in category_features_dict:
+            features.update(category_features_dict[pos_item_id])
+
+        features["target"] = 1
+        features["user_id"] = user_id
+        features["item_id"] = pos_item_id
+        train_examples.append(features)
+
+        # ---------- Негативный ----------
+        neg_item_id = random.choice(all_items)
+        while neg_item_id == pos_item_id:
+            neg_item_id = random.choice(all_items)
+
+        neg_features = {}
+        if user_id in user_features_dict:
+            neg_features.update(user_features_dict[user_id])
+        if neg_item_id in item_features_dict:
+            neg_features.update(item_features_dict[neg_item_id])
+        if (user_id, neg_item_id) in user_item_features_dict:
+            neg_features.update(user_item_features_dict[(user_id, neg_item_id)])
+        if neg_item_id in category_features_dict:
+            neg_features.update(category_features_dict[neg_item_id])
+
+        neg_features["target"] = 0
+        neg_features["user_id"] = user_id
+        neg_features["item_id"] = neg_item_id
+        train_examples.append(neg_features)
+
+    # Создаем DataFrame
+    train_df = pd.DataFrame(train_examples)
+
+    # Заполняем пропуски только для числовых
+    numeric_cols = train_df.select_dtypes(include=[np.number]).columns
+    train_df[numeric_cols] = train_df[numeric_cols].fillna(0)
+
+    print(
+        f"Данные подготовлены. Размер: {len(train_df)} (положительных: {len(test_sample)}, негативных: {len(test_sample)})"
+    )
+    return train_df
+
+
 def load_and_process_embeddings(
     items_ddf, embedding_column="fclip_embed", device="cuda", max_items=0
 ):
@@ -1768,7 +1854,9 @@ if __name__ == "__main__":
     model, user_map, item_map = train_als(
         interactions_files, n_factors=64, reg=1e-3, device="cuda"
     )
+    inv_item_map = {v: k for k, v in item_map.items()}  # Создаем обратный маппинг
     popularity_s = compute_global_popularity(train_orders_df)
+    popular_items = popularity_s.index.tolist()
 
     print("=== ПОСТРОЕНИЕ ДОПОЛНИТЕЛЬНЫХ ДАННЫХ ===")
     # Строим co-purchase map
@@ -1778,6 +1866,16 @@ if __name__ == "__main__":
     items_df = items_ddf.compute()
     categories_df = categories_ddf.compute()
     item_to_cat, cat_to_items = build_category_maps(items_df, categories_df)
+
+    # ЗАГРУЗКА/ПОДГОТОВКА ЭМБЕДДИНГОВ
+    embeddings_dict = load_and_process_embeddings(items_ddf)
+
+    print("=== ПРЕДВАРИТЕЛЬНЫЙ РАСЧЕТ ПРИЗНАКОВ ДЛЯ LGBM ===")
+    user_features_dict = build_user_features_dict(interactions_files, orders_ddf)
+    item_features_dict = build_item_features_dict(
+        interactions_files, items_df, orders_ddf, embeddings_dict
+    )
+    user_item_features_dict = build_user_item_features_dict(interactions_files)
 
     print("=== ПОДГОТОВКА ДАННЫХ ДЛЯ LightGBM ===")
     recommender = LightGBMRecommender()
@@ -1838,23 +1936,28 @@ if __name__ == "__main__":
     feature_importance = feature_importance.sort_values("importance", ascending=False)
     print(feature_importance.head(20))
 
-    print("=== СОХРАНЕНИЕ МОДЕЛИ ===")
-    os.makedirs("/home/root6/python/e_cup/rec_system/src/models", exist_ok=True)
+    # СОХРАНЕНИЕ МОДЕЛИ И ВАЖНЫХ ДАННЫХ
+    print("=== СОХРАНЕНИЕ МОДЕЛИ И ПРИЗНАКОВ ===")
+    save_data = {
+        "lgbm_model": recommender.model,
+        "feature_columns": recommender.feature_columns,
+        "als_model": model,
+        "user_map": user_map,
+        "item_map": item_map,
+        "inv_item_map": inv_item_map,  # Сохраняем обратный маппинг!
+        "popular_items": popular_items,
+        "user_features_dict": user_features_dict,  # Сохраняем словари признаков
+        "item_features_dict": item_features_dict,
+        "user_item_features_dict": user_item_features_dict,
+        "recent_items_map": recent_items_map,
+        "copurchase_map": copurchase_map,
+        "item_to_cat": item_to_cat,
+    }
     with open(
-        "/home/root6/python/e_cup/rec_system/src/models/lgbm_model.pkl", "wb"
+        "/home/root6/python/e_cup/rec_system/src/models/lgbm_model_full.pkl", "wb"
     ) as f:
-        pickle.dump(
-            {
-                "model": recommender.model,
-                "feature_columns": recommender.feature_columns,
-                "user_map": user_map,
-                "item_map": item_map,
-                "popularity_s": popularity_s,
-                "embeddings_dict": embeddings_dict,
-            },
-            f,
-        )
+        pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    print("Обучение завершено! Модель сохранена.")
+    print("Обучение и подготовка данных завершены! Модель и признаки сохранены.")
     elapsed_time = timedelta(seconds=time.time() - start_time)
-    print(f"Время подготовки модели: {elapsed_time}")
+    print(f"Общее время выполнения: {elapsed_time}")
