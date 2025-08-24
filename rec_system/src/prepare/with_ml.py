@@ -25,7 +25,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=0):
+def load_train_data(max_parts=0, max_rows=1000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Если колонка отсутствует в файле, пропускаем её.
@@ -102,12 +102,13 @@ def load_train_data(max_parts=0, max_rows=0):
 # -------------------- Фильтрация данных --------------------
 def filter_data(orders_ddf, tracker_ddf, items_ddf):
     """
-    Фильтруем: берём только доставленные заказы и ограниченные действия в tracker.
+    Фильтруем: берём только доставленные заказы и действия page_view, favorite, to_cart.
     """
     print("Фильтрация данных...")
     orders_ddf = orders_ddf[orders_ddf["last_status"] == "delivered_orders"]
-    allowed_actions = ["page_view", "favorite", "to_cart"]
-    tracker_ddf = tracker_ddf[tracker_ddf["action_type"].isin(allowed_actions)]
+    tracker_ddf = tracker_ddf[
+        tracker_ddf["action_type"].isin(["page_view", "favorite", "to_cart"])
+    ]
     print("Фильтрация завершена")
     return orders_ddf, tracker_ddf, items_ddf
 
@@ -115,33 +116,24 @@ def filter_data(orders_ddf, tracker_ddf, items_ddf):
 # -------------------- Train/Test split по времени --------------------
 def train_test_split_by_time(orders_df, test_size=0.2):
     """
-    Быстрый temporal split на train/test для каждого пользователя без Python loop.
-    Возвращаем train_df, test_df и cutoff_ts_per_user.
+    Temporal split на train/test для каждого пользователя без Python loop.
     """
     print("Делаем train/test split...")
     orders_df = orders_df.copy()
     orders_df["created_timestamp"] = pd.to_datetime(orders_df["created_timestamp"])
-
-    # сортируем
     orders_df = orders_df.sort_values(["user_id", "created_timestamp"])
 
-    # для каждого пользователя считаем размер теста
-    user_counts = orders_df.groupby("user_id").size()
-    test_counts = (user_counts * test_size).apply(lambda x: max(1, int(x)))
+    user_counts = orders_df.groupby("user_id")["item_id"].transform("count")
+    test_counts = (user_counts * test_size).astype(int).clip(lower=1)
 
-    # индекс последнего train
     orders_df["cumcount"] = orders_df.groupby("user_id").cumcount()
-    orders_df["test_count"] = orders_df["user_id"].map(test_counts)
+    max_cum = orders_df.groupby("user_id")["cumcount"].transform("max")
 
-    mask_test = orders_df["cumcount"] >= (
-        orders_df.groupby("user_id")["cumcount"].transform("max")
-        + 1
-        - orders_df["test_count"]
-    )
-    train_df = orders_df[~mask_test].drop(columns=["cumcount", "test_count"])
-    test_df = orders_df[mask_test].drop(columns=["cumcount", "test_count"])
+    mask_test = orders_df["cumcount"] >= (max_cum + 1 - test_counts)
 
-    # cutoff timestamp для каждого пользователя
+    train_df = orders_df.loc[~mask_test].drop(columns="cumcount")
+    test_df = orders_df.loc[mask_test].drop(columns="cumcount")
+
     cutoff_ts_per_user = test_df.groupby("user_id")["created_timestamp"].min().to_dict()
 
     print("Split завершён")
@@ -162,7 +154,6 @@ def prepare_interactions(
     scale_days=60,
     output_dir="/home/root6/python/e_cup/rec_system/data/processed/prepare_interactions_batches",
 ):
-
     print("Формируем матрицу взаимодействий по батчам...")
 
     if action_weights is None:
@@ -176,52 +167,50 @@ def prepare_interactions(
     print("... для orders")
     n_rows = len(train_orders_df)
     for start in range(0, n_rows, batch_size):
-        batch_orders = train_orders_df.iloc[start : start + batch_size].copy()
-        batch_orders["days_ago"] = (
-            ref_time - batch_orders["created_timestamp"]
-        ).dt.days.clip(lower=1)
-        batch_orders["time_factor"] = np.log1p(batch_orders["days_ago"] / scale_days)
-        batch_orders["weight"] = 5.0 * batch_orders["time_factor"]
-        batch_orders = batch_orders.rename(columns={"created_timestamp": "timestamp"})
-        batch_orders = batch_orders[["user_id", "item_id", "weight", "timestamp"]]
+        batch = train_orders_df.iloc[start : start + batch_size].copy()
+        days_ago = (ref_time - batch["created_timestamp"]).dt.days.clip(lower=1)
+        time_factor = np.log1p(days_ago / scale_days)
+        batch = batch.assign(
+            timestamp=batch["created_timestamp"],
+            weight=5.0 * time_factor,
+        )[["user_id", "item_id", "weight", "timestamp"]]
 
-        orders_file = os.path.join(output_dir, f"orders_batch_{start}.parquet")
-        batch_orders.to_parquet(orders_file, index=False, engine="pyarrow")
-        batch_files.append(orders_file)
-        del batch_orders
+        path = os.path.join(output_dir, f"orders_batch_{start}.parquet")
+        batch.to_parquet(path, index=False, engine="pyarrow")
+        batch_files.append(path)
+        del batch
         gc.collect()
-        print(f"Сохранен orders-батч строк {start}-{min(start+batch_size, n_rows)}")
+        print(f"Сохранен orders-батч {start}-{min(start+batch_size, n_rows)}")
 
     # ====== Tracker ======
     print("... для tracker")
     tracker_ddf = tracker_ddf[["user_id", "item_id", "timestamp", "action_type"]]
-    n_rows = tracker_ddf.shape[0].compute()  # число строк
+    n_rows = tracker_ddf.size.compute() // 4  # 4 колонки
 
     for start in range(0, n_rows, batch_size):
-        batch_ddf = tracker_ddf.partitions[
+        part = tracker_ddf.partitions[
             start // batch_size : (start + batch_size) // batch_size
         ]
-        batch_tracker = batch_ddf.compute()
-        batch_tracker["timestamp"] = pd.to_datetime(batch_tracker["timestamp"])
-        batch_tracker["aw"] = batch_tracker["action_type"].map(action_weights).fillna(0)
-        batch_tracker["cutoff"] = batch_tracker["user_id"].map(cutoff_ts_per_user)
-        batch_tracker = batch_tracker[
-            (batch_tracker["cutoff"].isna())
-            | (batch_tracker["timestamp"] < batch_tracker["cutoff"])
-        ]
-        batch_tracker["days_ago"] = (
-            ref_time - batch_tracker["timestamp"]
-        ).dt.days.clip(lower=1)
-        batch_tracker["time_factor"] = np.log1p(batch_tracker["days_ago"] / scale_days)
-        batch_tracker["weight"] = batch_tracker["aw"] * batch_tracker["time_factor"]
-        batch_tracker = batch_tracker[["user_id", "item_id", "weight", "timestamp"]]
+        batch = part.compute()
+        batch["timestamp"] = pd.to_datetime(batch["timestamp"])
+        batch["cutoff"] = batch["user_id"].map(cutoff_ts_per_user)
 
-        tracker_file = os.path.join(output_dir, f"tracker_batch_{start}.parquet")
-        batch_tracker.to_parquet(tracker_file, index=False, engine="pyarrow")
-        batch_files.append(tracker_file)
-        del batch_tracker
+        mask = batch["cutoff"].isna() | (batch["timestamp"] < batch["cutoff"])
+        batch = batch.loc[mask]
+
+        aw = batch["action_type"].map(action_weights).fillna(0)
+        days_ago = (ref_time - batch["timestamp"]).dt.days.clip(lower=1)
+        time_factor = np.log1p(days_ago / scale_days)
+        batch = batch.assign(weight=aw * time_factor)[
+            ["user_id", "item_id", "weight", "timestamp"]
+        ]
+
+        path = os.path.join(output_dir, f"tracker_batch_{start}.parquet")
+        batch.to_parquet(path, index=False, engine="pyarrow")
+        batch_files.append(path)
+        del batch
         gc.collect()
-        print(f"Сохранен tracker-батч строк {start}-{min(start+batch_size, n_rows)}")
+        print(f"Сохранен tracker-батч {start}-{min(start+batch_size, n_rows)}")
 
     print("Все батчи сохранены на диск.")
     return batch_files
@@ -330,38 +319,52 @@ def build_user_items_csr(
     return sparse_tensor
 
 
-def build_copurchase_map(train_orders_df, min_co_items=2, top_n=10):
+def build_copurchase_map(train_orders_df, min_co_items=2, top_n=10, device="cuda"):
     """
-    Улучшенная версия: строим словарь совместных покупок с весами
+    Быстрая версия: строим словарь совместных покупок на GPU.
     """
-    print("Строим улучшенный словарь co-purchase...")
-    copurchase_dict = defaultdict(lambda: defaultdict(float))
+    print("Строим co-purchase матрицу на GPU...")
 
-    # Группируем покупки по пользователям и времени
-    grouped = train_orders_df.groupby(["user_id", "created_timestamp"])[
-        "item_id"
-    ].apply(list)
+    # Группируем по (user_id, timestamp) и оставляем только корзины с min_co_items
+    baskets = (
+        train_orders_df.groupby(["user_id", "created_timestamp"])["item_id"]
+        .apply(list)
+        .tolist()
+    )
+    baskets = [b for b in baskets if len(b) >= min_co_items]
 
-    for items in grouped:
-        if len(items) >= min_co_items:
-            # Взвешиваем по количеству товаров в корзине (чем больше корзина, тем слабее связи)
-            weight = 1.0 / len(items)
-            for i, item1 in enumerate(items):
-                for j, item2 in enumerate(items):
-                    if i != j:
-                        copurchase_dict[item1][item2] += weight
+    # Словарь {item_id -> index} для построения матрицы
+    unique_items = train_orders_df["item_id"].unique()
+    item2idx = {it: i for i, it in enumerate(unique_items)}
+    idx2item = {i: it for it, i in item2idx.items()}
+    n_items = len(unique_items)
 
-    # Нормализуем и оставляем топ-N
+    # Sparse co-occurrence матрица
+    co_matrix = torch.zeros((n_items, n_items), dtype=torch.float32, device=device)
+
+    for items in baskets:
+        idxs = torch.tensor([item2idx[it] for it in items], device=device)
+        # Строим матрицу смежности корзины (ones)
+        mask = torch.ones((len(idxs), len(idxs)), device=device)
+        mask.fill_diagonal_(0.0)  # не считаем item→item
+        weight = 1.0 / len(items)
+        co_matrix[idxs.unsqueeze(1), idxs.unsqueeze(0)] += mask * weight
+
+    # Нормализация построчно
+    row_sums = co_matrix.sum(dim=1, keepdim=True).clamp(min=1e-9)
+    norm_matrix = co_matrix / row_sums
+
+    # Формируем финальный словарь топ-N для каждого item
     final_copurchase = {}
-    for item, co_items in copurchase_dict.items():
-        total = sum(co_items.values())
-        # Нормализуем и сортируем
-        sorted_items = sorted(
-            co_items.items(), key=lambda x: x[1] / total, reverse=True
-        )
-        final_copurchase[item] = [
-            (it, weight / total) for it, weight in sorted_items[:top_n]
-        ]
+    for i in range(n_items):
+        row = norm_matrix[i]
+        if row.sum() > 0:
+            topk_vals, topk_idx = torch.topk(row, k=min(top_n, n_items))
+            final_copurchase[idx2item[i]] = [
+                (idx2item[j.item()], v.item())
+                for j, v in zip(topk_idx, topk_vals)
+                if v.item() > 0
+            ]
 
     print(f"Co-purchase словарь построен для {len(final_copurchase)} товаров")
     return final_copurchase
@@ -369,323 +372,168 @@ def build_copurchase_map(train_orders_df, min_co_items=2, top_n=10):
 
 def build_category_maps(items_df, categories_df):
     """
-    Строим маппинги товаров к категориям и категорий к товарам
+    Ускоренная версия: строим маппинги товаров и категорий.
     """
     print("Построение категорийных маппингов...")
 
     # Товар -> категория
-    item_to_cat = items_df.set_index("item_id")["catalogid"].to_dict()
+    item_to_cat = dict(zip(items_df["item_id"], items_df["catalogid"]))
 
     # Категория -> список товаров
-    cat_to_items = items_df.groupby("catalogid")["item_id"].apply(list).to_dict()
+    cat_to_items = (
+        items_df.groupby("catalogid")["item_id"].apply(lambda x: x.to_numpy()).to_dict()
+    )
 
     # Иерархия категорий
-    cat_tree = categories_df.set_index("catalogid")["ids"].to_dict()
+    cat_tree = dict(zip(categories_df["catalogid"], categories_df["ids"]))
 
-    # Расширяем cat_to_items с учетом иерархии
+    # Расширение категорий через иерархию (векторизированно)
     extended_cat_to_items = {}
     for cat_id, items_list in cat_to_items.items():
         all_items = set(items_list)
-        if cat_id in cat_tree:
-            for parent_cat in cat_tree[cat_id]:
-                if parent_cat in cat_to_items:
-                    all_items.update(cat_to_items[parent_cat])
-        extended_cat_to_items[cat_id] = list(all_items)
+        parents = cat_tree.get(cat_id, [])
+        for parent in parents:
+            if parent in cat_to_items:
+                all_items.update(cat_to_items[parent])
+        extended_cat_to_items[cat_id] = np.array(list(all_items))
 
     return item_to_cat, extended_cat_to_items
 
 
 # -------------------- Recommendations (ALS + recent + similar + popular) --------------------
 def generate_and_save_recommendations_iter(
-    model,
+    user_batch,
+    train_orders_df,
     user_map,
     item_map,
-    user_items_csr,
-    interactions_files,
-    popularity_s,
-    users_df,
-    recent_items_map=None,
-    copurchase_map=None,
+    inv_item_map,
+    user_factors,
+    item_factors,
+    user_items_sparse,
+    als_weight=0.5,
+    co_weight=0.3,
+    cat_weight=0.2,
     top_k=100,
     recent_n=5,
     similar_top_n_seed=20,
-    blend_sim_beta=0.3,
-    blend_cat_beta=0.3,
-    batch_size=10_000,
-    filename="/home/root6/python/e_cup/rec_system/result/submission.csv",
-    item_to_cat=None,
+    copurchase_map=None,
     cat_to_items=None,
-    device="cuda",
+    popular_items=None,
 ):
-    recent_items_map = recent_items_map or {}
-    copurchase_map = copurchase_map or {}
-    inv_item_map = {int(v): int(k) for k, v in item_map.items()}
-    popular_items = popularity_s.index.tolist()
+    """
+    Кандидаты с ускорением на PyTorch (ALS + similarity батчами).
+    """
+    device = user_factors.device
+    als_recommendations = {}
+    co_recommendations = {}
+    cat_recommendations = {}
+    pop_recommendations = {}
+    sim_recommendations = {}
 
-    # Переносим модель и данные на GPU
-    user_factors = torch.tensor(model.user_factors, device=device, dtype=torch.float32)
-    item_factors = torch.tensor(model.item_factors, device=device, dtype=torch.float32)
+    # === ALS ===
+    valid_user_indices = [user_map[u] for u in user_batch if u in user_map]
+    if valid_user_indices:
+        user_embeddings = user_factors[valid_user_indices]  # (B, d)
+        with torch.no_grad():
+            scores = torch.matmul(user_embeddings, item_factors.T)  # (B, N)
 
-    # Конвертируем CSR в torch sparse tensor на GPU
-    user_items_sparse = torch.sparse_csr_tensor(
-        user_items_csr.indptr,
-        user_items_csr.indices,
-        user_items_csr.data,
-        size=user_items_csr.shape,
-        dtype=torch.float32,
-        device=device,
-    )
+            # маска просмотренных
+            user_interactions = user_items_sparse[valid_user_indices].to_dense()
+            scores[user_interactions > 0] = -float("inf")
 
-    # Предзагрузка всех интеракций в память для быстрого доступа
-    print("Предзагрузка интеракций пользователей...")
-    user_interactions_dict = {}
-    for f in tqdm(interactions_files, desc="Загрузка файлов интеракций"):
-        df = pd.read_parquet(f)
-        for uid, group in df.groupby("user_id"):
-            if uid not in user_interactions_dict:
-                user_interactions_dict[uid] = group
-            else:
-                user_interactions_dict[uid] = pd.concat(
-                    [user_interactions_dict[uid], group]
-                )
+            top_scores, top_indices = torch.topk(scores, top_k * 2, dim=1)
 
-    first_run = True
-    if os.path.exists(filename):
-        os.remove(filename)
+        for j, u in enumerate(user_batch):
+            if u in user_map:
+                als_items = [
+                    (inv_item_map[int(idx)], float(score * als_weight))
+                    for idx, score in zip(top_indices[j].cpu(), top_scores[j].cpu())
+                    if score > -float("inf") and int(idx) in inv_item_map
+                ]
+                als_recommendations[u] = als_items
 
-    batch_rows = []
-
-    # Векторизованная обработка пользователей
-    user_ids_list = users_df["user_id"].tolist()
-
-    for i in tqdm(
-        range(0, len(user_ids_list), batch_size), desc="Обработка пользователей батчами"
-    ):
-        user_batch = user_ids_list[i : i + batch_size]
-
-        try:
-            # ======== Пакетная обработка ALS рекомендаций на GPU ========
-            user_indices = [user_map.get(uid, -1) for uid in user_batch]
-            valid_user_mask = [
-                idx != -1 and idx < user_items_sparse.shape[0] for idx in user_indices
-            ]
-            valid_user_indices = [
-                idx for idx, valid in zip(user_indices, valid_user_mask) if valid
+    # === Co-purchase ===
+    if copurchase_map is not None:
+        for u in user_batch:
+            user_orders = train_orders_df[train_orders_df.user_id == u]
+            recent_items = (
+                user_orders.sort_values("created_timestamp")["item_id"]
+                .drop_duplicates()
+                .tolist()[-recent_n:]
+            )
+            co_items = {}
+            for rit in recent_items:
+                if rit in copurchase_map:
+                    for cit, w in copurchase_map[rit]:
+                        co_items[cit] = co_items.get(cit, 0) + w * co_weight
+            co_recommendations[u] = sorted(co_items.items(), key=lambda x: -x[1])[
+                :top_k
             ]
 
-            als_recommendations = {}
-            if valid_user_indices:
-                # Получаем эмбеддинги пользователей
-                user_embeddings = user_factors[valid_user_indices]
-
-                # Вычисляем scores на GPU
-                with torch.no_grad():
-                    scores = torch.matmul(item_factors, user_embeddings.T).T
-
-                    # Создаем маску для уже просмотренных товаров
-                    user_interactions_mask = torch.zeros(
-                        (len(valid_user_indices), item_factors.shape[0]),
-                        device=device,
-                        dtype=torch.bool,
-                    )
-
-                    for j, user_idx in enumerate(valid_user_indices):
-                        user_interactions = user_items_sparse[user_idx].to_dense()
-                        user_interactions_mask[j] = user_interactions > 0
-
-                    # Маскируем уже просмотренные
-                    scores[user_interactions_mask] = -float("inf")
-
-                    # Берем топ-K для каждого пользователя
-                    top_scores, top_indices = torch.topk(scores, top_k * 2, dim=1)
-
-                    for j, user_idx in enumerate(valid_user_indices):
-                        user_id = [
-                            uid
-                            for uid, idx in zip(user_batch, user_indices)
-                            if idx == user_idx
-                        ][0]
-                        als_items = [
-                            (inv_item_map[int(idx)], float(score * 0.5))
-                            for idx, score in zip(
-                                top_indices[j].cpu(), top_scores[j].cpu()
-                            )
-                            if score > -float("inf") and int(idx) in inv_item_map
-                        ]
-                        als_recommendations[user_id] = als_items
-
-            # Обрабатываем каждого пользователя в батче
-            for user_id in user_batch:
-                try:
-                    # ======== Загружаем интеракции пользователя из предзагруженного словаря ========
-                    user_tracker = user_interactions_dict.get(
-                        user_id,
-                        pd.DataFrame(
-                            columns=["user_id", "item_id", "weight", "timestamp"]
-                        ),
-                    )
-
-                    user_bought_items = set(
-                        user_tracker[user_tracker["weight"] > 0]["item_id"]
-                    )
-                    tracker_scored = (
-                        user_tracker[["item_id", "weight"]]
-                        .drop_duplicates()
-                        .values.tolist()
-                    )
-
-                    # ======== ALS рекомендации из пакетного результата ========
-                    als_scored = als_recommendations.get(user_id, [])
-                    als_scored = [
-                        (it, score)
-                        for it, score in als_scored
-                        if it not in user_bought_items
-                    ]
-
-                    # ======== Последние товары ========
-                    recent_items = recent_items_map.get(user_id, [])
-                    recent_scored = [
-                        (it, 1.0)
-                        for it in recent_items[:recent_n]
-                        if it not in user_bought_items
-                    ]
-
-                    # ======== Похожие товары ========
-                    sim_items = []
-                    for rit in recent_items:
-                        if rit in item_map:
-                            try:
-                                # Векторизованный поиск похожих товаров на GPU
-                                rit_idx = item_map[rit]
-                                rit_embedding = item_factors[rit_idx].unsqueeze(0)
-
-                                with torch.no_grad():
-                                    similarities = torch.matmul(
-                                        item_factors, rit_embedding.T
-                                    ).squeeze()
-                                    top_similar = torch.topk(
-                                        similarities, similar_top_n_seed + 1
-                                    )
-
-                                    similar_ids = [
-                                        inv_item_map[int(idx)]
-                                        for idx in top_similar.indices[
-                                            1:
-                                        ].cpu()  # пропускаем сам товар
-                                        if int(idx) in inv_item_map
-                                    ]
-                                    sim_items.extend(similar_ids)
-
-                            except Exception:
-                                continue
-
-                    sim_items = list(dict.fromkeys(sim_items))
-                    sim_quota = int(top_k * blend_sim_beta)
-                    sim_scored = [
-                        (it, 0.5)
-                        for it in sim_items[:sim_quota]
-                        if it not in user_bought_items
-                    ]
-
-                    # ======== Товары из категорий последних покупок ========
-                    category_scored = []
-                    if item_to_cat and cat_to_items:
-                        for rit in recent_items:
-                            cat = item_to_cat.get(rit)
-                            if cat:
-                                cat_items = [
-                                    i
-                                    for i in cat_to_items[cat]
-                                    if i != rit and i not in user_bought_items
-                                ]
-                                quota = int(top_k * blend_cat_beta)
-                                category_scored.extend(
-                                    [(i, 0.8) for i in cat_items[:quota]]
-                                )
-
-                    # ======== Co-purchase рекомендации ========
-                    copurchase_scored = []
-                    for rit in recent_items:
-                        for co_item in copurchase_map.get(rit, []):
-                            if co_item not in user_bought_items:
-                                copurchase_scored.append((co_item, 0.8))
-
-                    # ======== Популярные товары ========
-                    min_score = min((s for _, s in als_scored), default=0.1)
-                    pop_scored = [
-                        (it, min_score * 0.1)
-                        for it in popular_items
-                        if it not in user_bought_items
-                    ]
-
-                    # ======== Объединяем все кандидаты ========
-                    all_candidates = (
-                        tracker_scored
-                        + als_scored
-                        + recent_scored
-                        + sim_scored
-                        + category_scored
-                        + copurchase_scored
-                        + pop_scored
-                    )
-                    all_candidates = sorted(
-                        all_candidates, key=lambda x: x[1], reverse=True
-                    )
-
-                    seen, final = set(), []
-                    for it, _ in all_candidates:
-                        if it not in seen:
-                            final.append(it)
-                            seen.add(it)
-                        if len(final) >= top_k:
-                            break
-
-                    # если не хватает, добавляем популярные
-                    if len(final) < top_k:
-                        for it in popular_items:
-                            if it not in seen:
-                                final.append(it)
-                                seen.add(it)
-                            if len(final) >= top_k:
-                                break
-
-                    top_items = final[:top_k]
-
-                    batch_rows.append(
-                        {
-                            "user_id": user_id,
-                            "item_id_1 item_id_2 ... item_id_100": " ".join(
-                                map(str, top_items)
-                            ),
-                        }
-                    )
-
-                except Exception as e:
-                    print(f"Ошибка для пользователя {user_id}: {e}")
-                    continue
-
-            # Записываем батч
-            if batch_rows:
-                pd.DataFrame(batch_rows).to_csv(
-                    filename,
-                    index=False,
-                    mode="w" if first_run else "a",
-                    header=first_run,
-                )
-                first_run = False
-                batch_rows = []
-
-            # Очищаем память GPU
-            torch.cuda.empty_cache()
-
-        except Exception as e:
-            print(f"Ошибка в батче пользователей: {e}")
-            continue
-
-    if batch_rows:
-        pd.DataFrame(batch_rows).to_csv(
-            filename, index=False, mode="w" if first_run else "a", header=first_run
+    # === Похожие товары (батчем) ===
+    for u in user_batch:
+        user_orders = train_orders_df[train_orders_df.user_id == u]
+        recent_items = (
+            user_orders.sort_values("created_timestamp")["item_id"]
+            .drop_duplicates()
+            .tolist()[-recent_n:]
         )
+        recent_indices = [item_map[it] for it in recent_items if it in item_map]
+        sim_items = []
+        if recent_indices:
+            rit_embeddings = item_factors[recent_indices]  # (R, d)
+            with torch.no_grad():
+                similarities = torch.matmul(item_factors, rit_embeddings.T)  # (N, R)
+                topk_vals, topk_idx = torch.topk(
+                    similarities, similar_top_n_seed + 1, dim=0
+                )
+            for col in range(len(recent_indices)):
+                for idx in topk_idx[1:, col].cpu().numpy():
+                    if int(idx) in inv_item_map:
+                        sim_items.append(inv_item_map[int(idx)])
+            sim_items = list(dict.fromkeys(sim_items))[:top_k]
+        sim_recommendations[u] = [(it, 1.0) for it in sim_items]
+
+    # === Категории ===
+    if cat_to_items is not None:
+        for u in user_batch:
+            user_orders = train_orders_df[train_orders_df.user_id == u]
+            recent_items = (
+                user_orders.sort_values("created_timestamp")["item_id"]
+                .drop_duplicates()
+                .tolist()[-recent_n:]
+            )
+            cat_items = {}
+            for rit in recent_items:
+                for cit in cat_to_items.get(rit, []):
+                    cat_items[cit] = cat_items.get(cit, 0) + cat_weight
+            cat_recommendations[u] = sorted(cat_items.items(), key=lambda x: -x[1])[
+                :top_k
+            ]
+
+    # === Популярные ===
+    if popular_items is not None:
+        pop_recommendations = {
+            u: [(it, 1.0) for it in popular_items[:top_k]] for u in user_batch
+        }
+
+    # === Объединение ===
+    final_recommendations = {}
+    for u in user_batch:
+        combined = defaultdict(float)
+        for source in [
+            als_recommendations,
+            co_recommendations,
+            sim_recommendations,
+            cat_recommendations,
+            pop_recommendations,
+        ]:
+            if u in source:
+                for it, score in source[u]:
+                    combined[it] += score
+        final_recommendations[u] = sorted(combined.items(), key=lambda x: -x[1])[:top_k]
+
+    return final_recommendations
 
 
 def evaluate_ndcg_iter_optimized(
@@ -836,49 +684,99 @@ def get_similar_by_category_tree(items_df, categories_df, top_n=50):
     """
     Строит словарь похожих товаров через иерархию категорий
     """
+    # Группировка: категория -> список товаров
     catalog_items = items_df.groupby("catalogid")["item_id"].apply(list).to_dict()
+    # Иерархия категорий
     cat_tree = categories_df.set_index("catalogid")["ids"].to_dict()
 
+    # Предрассчитаем "расширенные" категории сразу
+    extended_cat_items = {}
+    for cat_id, items in catalog_items.items():
+        all_items = set(items)
+        if cat_id in cat_tree:
+            for parent_cat in cat_tree[cat_id]:
+                all_items.update(catalog_items.get(parent_cat, []))
+        extended_cat_items[cat_id] = list(all_items)
+
+    # Для каждого товара ищем похожие
     similar_map = {}
     for item, cat in items_df[["item_id", "catalogid"]].values:
-        sim_items = []
-        if cat in cat_tree:
-            for parent_cat in cat_tree[cat]:
-                sim_items.extend(catalog_items.get(parent_cat, []))
-        sim_items = [x for x in sim_items if x != item]
-        similar_map[item] = sim_items[:top_n]
+        sim_items = extended_cat_items.get(cat, [])
+        if sim_items:
+            similar_map[item] = [x for x in sim_items if x != item][:top_n]
+        else:
+            similar_map[item] = []
     return similar_map
 
 
 # -------------------- Метрики --------------------
-def ndcg_at_k(recommended, ground_truth, k=100):
+def ndcg_at_k(recommended, ground_truth, k=100, device="cuda"):
+    """
+    NDCG@K: считаем через torch на GPU
+    recommended: список рекомендованных item_id
+    ground_truth: множество/список правильных item_id
+    """
     if not ground_truth:
         return 0.0
-    dcg = 0.0
-    for i, item in enumerate(recommended[:k], start=1):
-        if item in ground_truth:
-            dcg += 1.0 / np.log2(i + 1)
-    idcg = sum(1.0 / np.log2(i + 1) for i in range(1, min(len(ground_truth), k) + 1))
-    return dcg / idcg if idcg > 0 else 0.0
+
+    # Берём топ-k рекомендаций
+    rec_k = torch.tensor(recommended[:k], device=device)
+
+    # Множество правильных товаров
+    gt_set = set(ground_truth)
+    gt_mask = torch.tensor(
+        [1 if x.item() in gt_set else 0 for x in rec_k],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    # Позиции (1..k)
+    positions = torch.arange(1, len(rec_k) + 1, device=device, dtype=torch.float32)
+
+    # DCG: релевантность / log2(позиция+1)
+    dcg = torch.sum(gt_mask / torch.log2(positions + 1))
+
+    # IDCG: идеальный порядок
+    ideal_len = min(len(ground_truth), k)
+    idcg = torch.sum(
+        1.0
+        / torch.log2(
+            torch.arange(1, ideal_len + 1, device=device, dtype=torch.float32) + 1
+        )
+    )
+
+    return (dcg / idcg).item() if idcg > 0 else 0.0
 
 
-def evaluate_ndcg(recommendations, test_df, k=100):
+def evaluate_ndcg(recommendations, test_df, k=100, device="cuda"):
+    """
+    Считаем средний NDCG@k по всем пользователям
+    recommendations: dict[user_id -> список рекомендованных item_id]
+    test_df: DataFrame с (user_id, item_id)
+    """
     print("Считаем NDCG...")
+
+    # Собираем ground truth в dict[user -> set(items)]
     gt = defaultdict(set)
     for r in test_df.itertuples():
         gt[r.user_id].add(r.item_id)
-    scores = [
-        ndcg_at_k(recs, gt.get(uid, set()), k) for uid, recs in recommendations.items()
-    ]
+
+    ndcg_scores = []
+    for uid, recs in recommendations.items():
+        ndcg_scores.append(ndcg_at_k(recs, gt.get(uid, set()), k=k, device=device))
+
     print("NDCG рассчитан")
-    return float(np.mean(scores)) if scores else 0.0
+    return (
+        float(torch.tensor(ndcg_scores, device=device).mean().item())
+        if ndcg_scores
+        else 0.0
+    )
 
 
-def build_recent_items_map_from_batches(batch_dir, recent_n=5):
+def build_recent_items_map_from_batches(batch_dir, recent_n=5, device="cuda"):
     """
-    batch_dir: путь к папке с батчами interactions (orders + tracker)
-    recent_n: сколько последних товаров хранить для каждого пользователя
-    Возвращает словарь user_id -> list последних item_id
+    Строим словарь user_id -> последние item_id (макс recent_n).
+    Используем torch для ускорения сортировки и агрегации.
     """
     recent_items_map = {}
     batch_files = sorted(Path(batch_dir).glob("*.parquet"))
@@ -886,72 +784,71 @@ def build_recent_items_map_from_batches(batch_dir, recent_n=5):
     for f in batch_files:
         print(f"Обрабатываем батч: {f}")
         df = pd.read_parquet(f, columns=["user_id", "item_id", "timestamp"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        df = df.sort_values(["user_id", "timestamp"], ascending=[True, False])
+        df["timestamp"] = pd.to_datetime(df["timestamp"]).astype("int64")
 
-        for uid, g in df.groupby("user_id"):
-            items = g["item_id"].head(recent_n).tolist()
+        # В тензоры
+        user_ids = torch.tensor(df["user_id"].values, device=device)
+        item_ids = torch.tensor(df["item_id"].values, device=device)
+        ts = torch.tensor(df["timestamp"].values, device=device)
+
+        # Сортировка: сначала по user_id, затем по timestamp (по убыванию)
+        sort_idx = torch.argsort(user_ids * 1_000_000_000_000 - ts, stable=True)
+        user_ids = user_ids[sort_idx]
+        item_ids = item_ids[sort_idx]
+
+        # Группировка
+        unique_users, counts = torch.unique_consecutive(user_ids, return_counts=True)
+        splits = torch.split(item_ids, counts.tolist())
+
+        for uid, items in zip(unique_users.tolist(), splits):
+            last_items = items[:recent_n].tolist()
             if uid not in recent_items_map:
-                recent_items_map[uid] = items
+                recent_items_map[uid] = last_items
             else:
-                # объединяем предыдущие и новые, сортируем по времени и оставляем последние recent_n
-                combined = pd.Series(recent_items_map[uid] + items)
-                recent_items_map[uid] = combined.head(recent_n).tolist()
+                combined = (recent_items_map[uid] + last_items)[:recent_n]
+                recent_items_map[uid] = combined
 
-        del df
+        del df, user_ids, item_ids, ts
         gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
     return recent_items_map
 
 
 # -------------------- Сохранение --------------------
-def save_model(
-    model,
-    user_map,
-    item_map,
-    path="/home/root6/python/e_cup/rec_system/src/models/model_als.pkl",
-):
+def save_model(model, user_map, item_map, path="src/models/model_als.pkl"):
+    """
+    Сохраняет модель и маппинги в pickle.
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    data = {
+        "model": model,
+        "user_map": user_map,
+        "item_map": item_map,
+    }
+
     with open(path, "wb") as f:
-        pickle.dump({"model": model, "user_map": user_map, "item_map": item_map}, f)
-    print(f"Модель сохранена в {path}")
+        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-
-def save_submission_csv(
-    recommendations,
-    top_k=100,
-    filename="/home/root6/python/e_cup/rec_system/result/submission.csv",
-    popularity_s=None,
-):
-    print("Сохраняем submission CSV...")
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
-    popular_items = popularity_s.index.tolist() if popularity_s is not None else []
-
-    submission_data = []
-    for user_id, items in tqdm(recommendations.items(), desc="Save CSV"):
-        items = list(items[:top_k])
-        missing = top_k - len(items)
-        if missing > 0 and popular_items:
-            items.extend([x for x in popular_items if x not in items][:missing])
-
-        submission_data.append(
-            {
-                "user_id": user_id,
-                "item_id_1 item_id_2 ... item_id_100": " ".join(
-                    map(str, items[:top_k])
-                ),
-            }
-        )
-
-    pd.DataFrame(submission_data).to_csv(filename, index=False)
-    print(f"CSV сохранён: {filename}")
+    print(f"✅ Модель сохранена: {path}")
 
 
 # -------------------- Метрики --------------------
-def ndcg_at_k_grouped(predictions, targets, groups, k=100):
+def ndcg_at_k_grouped(predictions, targets, groups, k=100, device="cpu"):
     """
-    Вычисление NDCG@k для сгруппированных данных (пользователей)
+    Вычисление NDCG@k для сгруппированных данных (например, пользователей) с использованием PyTorch.
+
+    predictions: 1D массив предсказанных score (list, np.array или torch.tensor)
+    targets:     1D массив целевых значений (0/1) той же длины
+    groups:      список размеров групп (например, сколько айтемов у каждого пользователя)
+    k:           топ-K для метрики
+    device:      "cpu" или "cuda"
     """
+    preds = torch.as_tensor(predictions, dtype=torch.float32, device=device)
+    targs = torch.as_tensor(targets, dtype=torch.float32, device=device)
+
     ndcg_scores = []
     start_idx = 0
 
@@ -960,34 +857,32 @@ def ndcg_at_k_grouped(predictions, targets, groups, k=100):
             continue
 
         end_idx = start_idx + group_size
-        group_preds = predictions[start_idx:end_idx]
-        group_targets = targets[start_idx:end_idx]
+        group_preds = preds[start_idx:end_idx]
+        group_targs = targs[start_idx:end_idx]
 
-        # Сортируем предсказания и цели по убыванию score
-        sorted_indices = np.argsort(group_preds)[::-1]
-        sorted_targets = group_targets[sorted_indices]
+        # сортировка по убыванию предсказаний
+        sorted_idx = torch.argsort(group_preds, descending=True)
+        sorted_targs = group_targs[sorted_idx]
 
-        # Вычисляем DCG
-        dcg = 0.0
-        for i in range(min(k, len(sorted_targets))):
-            if sorted_targets[i] > 0:
-                dcg += 1.0 / np.log2(i + 2)  # i+2 потому что индекс с 1
+        # DCG
+        denom = torch.log2(
+            torch.arange(2, 2 + min(k, group_size), device=device, dtype=torch.float32)
+        )
+        dcg = (sorted_targs[:k] / denom).sum()
 
-        # Вычисляем IDCG
-        ideal_sorted = np.sort(group_targets)[::-1]
-        idcg = 0.0
-        for i in range(min(k, len(ideal_sorted))):
-            if ideal_sorted[i] > 0:
-                idcg += 1.0 / np.log2(i + 2)
+        # IDCG
+        ideal_sorted = torch.sort(group_targs, descending=True).values
+        idcg = (ideal_sorted[:k] / denom).sum()
 
-        if idcg > 0:
-            ndcg_scores.append(dcg / idcg)
-        else:
-            ndcg_scores.append(0.0)
+        ndcg = (dcg / idcg) if idcg > 0 else torch.tensor(0.0, device=device)
+        ndcg_scores.append(ndcg)
 
         start_idx = end_idx
 
-    return np.mean(ndcg_scores) if ndcg_scores else 0.0
+    if not ndcg_scores:
+        return 0.0
+
+    return float(torch.stack(ndcg_scores).mean().cpu())
 
 
 class LightGBMRecommender:
@@ -1467,7 +1362,7 @@ class LightGBMRecommender:
             valid_names=valid_names,
             callbacks=[
                 lgb.log_evaluation(50),
-                lgb.early_stopping(50),
+                lgb.early_stopping(5),
             ],
         )
 
@@ -1570,7 +1465,7 @@ if __name__ == "__main__":
     TEST_SIZE = 0.2
 
     # Параметры масштабирования
-    SCALING_STAGE = "full"  # small, medium, large, full
+    SCALING_STAGE = "small"  # small, medium, large, full
 
     scaling_config = {
         "small": {"sample_users": 500, "sample_fraction": 0.1},
