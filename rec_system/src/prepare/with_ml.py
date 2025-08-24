@@ -341,10 +341,10 @@ def build_user_items_csr(
 
 
 def build_copurchase_map(
-    train_orders_df, min_co_items=2, top_n=5, device="cuda", max_items=1_000_000
+    train_orders_df, min_co_items=2, top_n=20, device="cuda", max_items=1_000_000
 ):
     """
-    Экономная версия: строим словарь совместных покупок для топ-N товаров
+    строим словарь совместных покупок для топ-N товаров
     """
     print("Строим co-purchase матрицу для топ-N товаров...")
 
