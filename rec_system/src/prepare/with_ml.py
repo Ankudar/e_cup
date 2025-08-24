@@ -27,7 +27,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=0):
+def load_train_data(max_parts=0, max_rows=1000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Если колонка отсутствует в файле, пропускаем её.
@@ -735,7 +735,10 @@ def evaluate_ndcg_iter_optimized(
             ]
 
             # ======== Популярные товары ========
-            min_score = min((s for _, s in als_scored), default=0.1)
+            if als_scored:
+                min_score = min((s for _, s in als_scored))
+            else:
+                min_score = 0.1
             pop_scored = [
                 (it, min_score * 0.1)
                 for it in popular_items
@@ -1175,9 +1178,13 @@ class LightGBMRecommender:
         all_items = list(item_map.keys())
 
         # Взаимодействия по пользователям (быстрая версия)
-        user_interacted_items = (
-            interactions_df.groupby("user_id")["item_id"].apply(set).to_dict()
-        )
+        user_interacted_items = {}
+        for f in tqdm(interactions_files, desc="Сбор истории взаимодействий"):
+            df_chunk = pd.read_parquet(f, columns=["user_id", "item_id"])
+            for user_id, group in df_chunk.groupby("user_id"):
+                if user_id not in user_interacted_items:
+                    user_interacted_items[user_id] = set()
+                user_interacted_items[user_id].update(group["item_id"].values)
 
         # 5. Векторизованное негативное сэмплирование
         print("Векторизованное негативное сэмплирование...")
@@ -1619,7 +1626,7 @@ class LightGBMRecommender:
 
 
 def load_and_process_embeddings(
-    items_ddf, embedding_column="fclip_embed", device="cuda", max_items=50000
+    items_ddf, embedding_column="fclip_embed", device="cuda", max_items=0
 ):
     """
     Потоковая обработка эмбеддингов для больших таблиц.
@@ -1627,8 +1634,11 @@ def load_and_process_embeddings(
     """
     print("Оптимизированная потоковая загрузка эмбеддингов...")
 
-    # Берем только нужные колонки и ограничиваем количество
-    items_sample = items_ddf[["item_id", embedding_column]].head(max_items)
+    # Ограничение количества элементов, если max_items > 0
+    if max_items > 0:
+        items_sample = items_ddf[["item_id", embedding_column]].head(max_items)
+    else:
+        items_sample = items_ddf[["item_id", embedding_column]]
 
     embeddings_dict = {}
     valid_count = 0
@@ -1676,7 +1686,7 @@ if __name__ == "__main__":
     TEST_SIZE = 0.2
 
     # Параметры масштабирования
-    SCALING_STAGE = "full"  # small, medium, large, full
+    SCALING_STAGE = "small"  # small, medium, large, full
 
     scaling_config = {
         "small": {"sample_users": 500, "sample_fraction": 0.1},
