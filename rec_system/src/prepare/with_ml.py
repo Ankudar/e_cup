@@ -12,6 +12,7 @@ import dask.dataframe as dd
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import polars as pl
 import torch
 import torch.nn.functional as F
 import torch.sparse
@@ -29,7 +30,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=1000):
+def load_train_data(max_parts=0, max_rows=10000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы.
@@ -493,72 +494,53 @@ def ndcg_at_k(recommended, ground_truth, k=100, device="cuda"):
     return (dcg / idcg).item() if idcg > 0 else 0.0
 
 
-def build_recent_items_map_from_batches(batch_dir, recent_n=5, device="cuda"):
-    """
-    Оптимизированная версия с обработкой на GPU
-    """
+def build_recent_items_map_from_batches(batch_dir, recent_n=5):
+    """Версия где weight влияет на порядок items"""
     batch_files = sorted(Path(batch_dir).glob("*.parquet"))
     recent_items_map = {}
 
     for f in tqdm(batch_files, desc="Обработка батчей"):
         try:
-            # Читаем весь файл
-            df = pd.read_parquet(f, columns=["user_id", "item_id", "timestamp"])
-
-            # ПРАВИЛЬНОЕ преобразование timestamp в числовой формат
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
-            # Используем astype вместо view
-            df["timestamp_numeric"] = df["timestamp"].astype("int64") // 10**9
-
-            # Конвертируем в тензоры на GPU
-            user_ids = torch.tensor(
-                df["user_id"].values, device=device, dtype=torch.long
-            )
-            item_ids = torch.tensor(
-                df["item_id"].values, device=device, dtype=torch.long
-            )
-            timestamps = torch.tensor(
-                df["timestamp_numeric"].values, device=device, dtype=torch.long
+            # Читаем с weight
+            df = pl.read_parquet(
+                f, columns=["user_id", "item_id", "timestamp", "weight"]
             )
 
-            # Сортируем на GPU - более простая и эффективная сортировка
-            # Сначала сортируем массив индексов
-            indices = torch.arange(len(user_ids), device=device)
-
-            # Сортируем сначала по user_id, затем по timestamp (по убыванию)
-            sort_mask = user_ids * 10**12 + (
-                10**12 - timestamps
-            )  # Комбинированный ключ для сортировки
-            sorted_indices = torch.argsort(sort_mask)
-
-            user_ids = user_ids[sorted_indices]
-            item_ids = item_ids[sorted_indices]
-
-            # Находим уникальных пользователей и их counts
-            unique_users, counts = torch.unique_consecutive(
-                user_ids, return_counts=True
+            df = df.with_columns(
+                [
+                    pl.col("user_id").cast(pl.Int64),
+                    pl.col("item_id").cast(pl.Int64),
+                    pl.col("timestamp").dt.epoch("s").alias("ts_epoch"),
+                    pl.col("weight").cast(pl.Float64),
+                ]
             )
 
-            # Обрабатываем каждого пользователя
-            start = 0
-            for i, user_id in enumerate(unique_users.cpu().numpy()):
-                count = counts[i].item()
-                user_items = (
-                    item_ids[start : start + count][:recent_n].cpu().numpy().tolist()
-                )
-                start += count
+            # Создаем комбинированный score: weight + временной коэффициент
+            # (новые взаимодействия имеют небольшое преимущество)
+            df = df.with_columns(
+                (
+                    pl.col("weight") * 0.8
+                    + pl.col("ts_epoch") / pl.col("ts_epoch").max() * 0.2
+                ).alias("score")
+            )
+
+            # Сортируем по score
+            df_sorted = df.sort(["user_id", "score"], descending=[False, True])
+
+            # Группируем и берем топ-N
+            grouped = df_sorted.group_by("user_id").agg(
+                pl.col("item_id").head(recent_n).alias("items")
+            )
+
+            # Обновляем словарь (простая версия)
+            for row in grouped.iter_rows():
+                user_id, items = row[0], row[1]
 
                 if user_id not in recent_items_map:
-                    recent_items_map[user_id] = user_items
+                    recent_items_map[user_id] = items
                 else:
-                    # Объединяем и берем последние recent_n
-                    combined = (recent_items_map[user_id] + user_items)[:recent_n]
+                    combined = (recent_items_map[user_id] + items)[:recent_n]
                     recent_items_map[user_id] = combined
-
-            # Очищаем память
-            del user_ids, item_ids, timestamps, sort_mask, sorted_indices
-            if device == "cuda":
-                torch.cuda.empty_cache()
 
         except Exception as e:
             print(f"Ошибка обработки файла {f}: {e}")

@@ -1,185 +1,198 @@
 import os
 import pickle
 import time
+from collections import defaultdict
 from datetime import timedelta
 
 import dask.dataframe as dd
 import numpy as np
 import pandas as pd
-import torch
+from sklearn.metrics.pairwise import cosine_similarity
 from tqdm.auto import tqdm
 
 
 class SubmissionGenerator:
     def __init__(self, model_path, use_gpu=True):
-        print("Загрузка модели...")
+        print("Загрузка модели и данных...")
         with open(model_path, "rb") as f:
             model_data = pickle.load(f)
 
-        self.model = model_data["model"]
+        self.model = model_data["lgbm_model"]
         self.feature_columns = model_data["feature_columns"]
         self.user_map = model_data["user_map"]
         self.item_map = model_data["item_map"]
-        self.popularity_s = model_data["popularity_s"]
-        self.embeddings_dict = model_data.get("embeddings_dict", {})
+        self.inv_item_map = model_data["inv_item_map"]
+        self.popular_items = model_data["popular_items"]
+
+        # Все дополнительные данные
+        self.user_features_dict = model_data.get("user_features_dict", {})
+        self.item_features_dict = model_data.get("item_features_dict", {})
+        self.recent_items_map = model_data.get("recent_items_map", {})
+        self.copurchase_map = model_data.get("copurchase_map", {})
+        self.item_to_cat = model_data.get("item_to_cat", {})
         self.user_embeddings = model_data.get("user_embeddings")
         self.item_embeddings = model_data.get("item_embeddings")
 
-        self.use_gpu = use_gpu and torch.cuda.is_available()
-        self.device = torch.device("cuda" if self.use_gpu else "cpu")
-        print(f"Использование устройства: {self.device}")
-
-        self.inv_item_map = {v: k for k, v in self.item_map.items()}
-        self.popular_items = self.popularity_s.sort_values(
-            ascending=False
-        ).index.tolist()[:1000]
-
-        self.all_items_features = self._prepare_all_items_features()
-        self.default_user_features = self._create_default_user_features()
-
-        # Индексы user-фичей
-        self.user_col_indices = np.array(
-            [i for i, col in enumerate(self.feature_columns) if col.startswith("user_")]
-        )
+        # Веса взаимодействий
+        self.interaction_weights = {"page_view": 2.0, "favorite": 4.0, "to_cart": 6.0}
 
         print(f"Модель загружена: {len(self.feature_columns)} признаков")
         print(f"Пользователей: {len(self.user_map)}, Товаров: {len(self.item_map)}")
+        print(f"Недавних взаимодействий: {len(self.recent_items_map)}")
 
-    def _create_default_user_features(self):
+    def _get_user_recent_items(self, user_id):
+        """Получаем последние товары пользователя с учетом весов"""
+        if user_id in self.recent_items_map:
+            return self.recent_items_map[user_id]
+        return []
+
+    def _get_similar_items(self, item_id, top_n=20):
+        """Находим похожие товары по ALS эмбеддингам"""
+        if self.item_embeddings is None or item_id not in self.item_map:
+            return []
+
+        item_idx = self.item_map[item_id]
+        item_embedding = self.item_embeddings[item_idx].reshape(1, -1)
+
+        # Вычисляем косинусную близость со всеми товарами
+        similarities = cosine_similarity(item_embedding, self.item_embeddings)[0]
+
+        # Берем топ-N похожих товаров (исключая сам товар)
+        similar_indices = np.argsort(-similarities)[1 : top_n + 1]
+        return [self.inv_item_map[idx] for idx in similar_indices]
+
+    def _get_category_items(self, user_id, top_n=15):
+        """Товары из категорий, которые пользователь просматривал"""
+        if user_id not in self.recent_items_map:
+            return []
+
+        user_categories = set()
+        for item_id in self.recent_items_map[user_id][:10]:  # последние 10 товаров
+            if item_id in self.item_to_cat:
+                user_categories.add(self.item_to_cat[item_id])
+
+        category_items = []
+        for cat in user_categories:
+            for item_id, item_cat in self.item_to_cat.items():
+                if item_cat == cat and item_id not in category_items:
+                    category_items.append(item_id)
+                    if len(category_items) >= top_n:
+                        break
+            if len(category_items) >= top_n:
+                break
+
+        return category_items
+
+    def _get_copurchased_items(self, user_id, top_n=10):
+        """Товары, которые покупают вместе с просмотренными"""
+        if user_id not in self.recent_items_map:
+            return []
+
+        copurchased = set()
+        for item_id in self.recent_items_map[user_id][:5]:  # последние 5 товаров
+            if item_id in self.copurchase_map:
+                for copurchased_id in self.copurchase_map[item_id][
+                    :3
+                ]:  # топ-3 совместных покупок
+                    if copurchased_id != item_id:
+                        copurchased.add(copurchased_id)
+                        if len(copurchased) >= top_n:
+                            break
+
+        return list(copurchased)[:top_n]
+
+    def _create_combined_features(self, user_id, item_ids):
+        """Создает комбинированные фичи для пользователя и товаров"""
         n_features = len(self.feature_columns)
-        default_features = np.zeros(n_features, dtype=np.float32)
+        n_items = len(item_ids)
 
-        if self.user_embeddings is not None:
-            user_als_cols = [
-                col for col in self.feature_columns if col.startswith("user_als_")
-            ]
-            for col in user_als_cols:
-                col_idx = self.feature_columns.index(col)
-                als_idx = int(col.split("_")[-1])
-                if als_idx < self.user_embeddings.shape[1]:
-                    default_features[col_idx] = np.mean(
-                        self.user_embeddings[:, als_idx]
-                    )
+        features_matrix = np.zeros((n_items, n_features), dtype=np.float32)
 
-        return default_features
+        # Заполняем item features
+        for i, item_id in enumerate(item_ids):
+            if item_id in self.item_features_dict:
+                item_feats = self.item_features_dict[item_id]
+                if isinstance(item_feats, dict):
+                    for feat_name, value in item_feats.items():
+                        if feat_name in self.feature_columns:
+                            idx = self.feature_columns.index(feat_name)
+                            features_matrix[i, idx] = float(value)
+                elif isinstance(item_feats, (list, np.ndarray)):
+                    for idx, value in enumerate(item_feats):
+                        if idx < n_features:
+                            features_matrix[i, idx] = float(value)
 
-    def _prepare_all_items_features(self):
-        print("Подготовка фичей для всех товаров...")
-        n_items = len(self.item_map)
-        feature_dict = {
-            col: np.zeros(n_items, dtype=np.float32) for col in self.feature_columns
-        }
-        item_ids = [self.inv_item_map[idx] for idx in range(n_items)]
+        # Добавляем user features
+        if user_id in self.user_features_dict:
+            user_feats = self.user_features_dict[user_id]
+            if isinstance(user_feats, dict):
+                for feat_name, value in user_feats.items():
+                    if feat_name in self.feature_columns:
+                        idx = self.feature_columns.index(feat_name)
+                        features_matrix[:, idx] = float(
+                            value
+                        )  # одинаково для всех товаров
+            elif isinstance(user_feats, (list, np.ndarray)):
+                for idx, value in enumerate(user_feats):
+                    if idx < n_features:
+                        features_matrix[:, idx] = float(value)
 
-        for idx, item_id in enumerate(tqdm(item_ids, desc="Обработка товаров")):
-            feature_dict["item_popularity"][idx] = self.popularity_s.get(item_id, 0.0)
-            if self.item_embeddings is not None:
-                n_als = min(10, self.item_embeddings.shape[1])
-                for i in range(n_als):
-                    col_name = f"item_als_{i}"
-                    if col_name in self.feature_columns:
-                        feature_dict[col_name][idx] = self.item_embeddings[idx, i]
+        return features_matrix
 
-            n_fclip = 10
-            for i in range(n_fclip):
-                col_name = f"fclip_embed_{i}"
-                embed = self.embeddings_dict.get(item_id)
-                if (
-                    embed is not None
-                    and i < len(embed)
-                    and col_name in self.feature_columns
-                ):
-                    feature_dict[col_name][idx] = embed[i]
-
-        features_df = pd.DataFrame(feature_dict, index=item_ids)
-        features_df = features_df[self.feature_columns]
-        tensor_features = torch.tensor(
-            features_df.values.astype(np.float16), device=self.device
-        )
-        return tensor_features
-
-    def _prepare_user_features(self, user_ids):
-        n_features = len(self.feature_columns)
-        batch_features = np.zeros((len(user_ids), n_features), dtype=np.float32)
-
-        for i, user_id in enumerate(
-            tqdm(user_ids, desc="Подготовка фичей пользователей")
-        ):
-            if user_id in self.user_map and self.user_embeddings is not None:
-                user_idx = self.user_map[user_id]
-                n_als = min(10, self.user_embeddings.shape[1])
-                for j in range(n_als):
-                    col_name = f"user_als_{j}"
-                    if col_name in self.feature_columns:
-                        col_idx = self.feature_columns.index(col_name)
-                        batch_features[i, col_idx] = self.user_embeddings[user_idx, j]
-            else:
-                batch_features[i] = self.default_user_features
-
-        return batch_features
-
-    def _ensure_exactly_100_items(self, items_list):
-        if len(items_list) >= 100:
-            return items_list[:100]
-        missing_count = 100 - len(items_list)
-        added_items = [item for item in self.popular_items if item not in items_list][
-            :missing_count
-        ]
-        return items_list + added_items
-
-    def load_test_users(self, test_users_path):
-        print("Загрузка тестовых пользователей...")
-        test_users_ddf = dd.read_parquet(test_users_path, columns=["user_id"])
-        test_users_df = test_users_ddf.compute()
-        print(f"Загружено {len(test_users_df)} тестовых пользователей")
-        return test_users_df
-
-    def generate_recommendations_gpu(
-        self, test_users_df, output_path, top_k=100, batch_size=1000
-    ):
-        print("GPU-ускоренная генерация рекомендаций...")
-        n_items = self.all_items_features.shape[0]
+    def generate_personalized_recommendations(self, test_users_df, output_path):
+        """Генерация рекомендаций с учетом всех факторов"""
+        print("Генерация персонализированных рекомендаций...")
         submission_data = []
 
-        # Весь массив item-фичей
-        items_features_np = self.all_items_features.cpu().numpy()
+        for user_id in tqdm(test_users_df["user_id"], desc="Пользователи"):
+            try:
+                # 1. Базовые кандидаты из модели
+                all_items = list(self.item_map.keys())
+                combined_features = self._create_combined_features(user_id, all_items)
+                base_scores = self.model.predict(combined_features, num_iteration=-1)
 
-        # Разделяем колонки на user и item
-        item_cols = [c for c in self.feature_columns if not c.startswith("user_")]
-        user_cols = [c for c in self.feature_columns if c.startswith("user_")]
-        items_features_np = pd.DataFrame(
-            items_features_np, columns=self.feature_columns
-        )[item_cols].values
+                # 2. Создаем итоговый scoring с весами
+                final_scores = base_scores.copy()
 
-        # Индексы user-фичей внутри combined_features
-        user_col_indices_in_all = np.arange(len(user_cols))
+                # 3. Добавляем бонусы за различные факторы
+                recent_items = self._get_user_recent_items(user_id)
 
-        # Прогресс по батчам
-        for i in tqdm(
-            range(0, len(test_users_df), batch_size), desc="Батчи пользователей"
-        ):
-            batch_users = test_users_df["user_id"].iloc[i : i + batch_size]
-            user_features_batch = self._prepare_user_features(batch_users.tolist())
-            user_features_batch = pd.DataFrame(
-                user_features_batch, columns=self.feature_columns
-            )[user_cols].values
+                # Бонус за последние просмотры
+                for i, item_id in enumerate(all_items):
+                    if item_id in recent_items:
+                        # Больший бонус за более свежие взаимодействия
+                        recency_bonus = (
+                            0.5
+                            * (len(recent_items) - recent_items.index(item_id))
+                            / len(recent_items)
+                        )
+                        final_scores[i] += recency_bonus
 
-            for user_idx, user_id in enumerate(
-                tqdm(batch_users, desc="Пользователи батча", leave=False)
-            ):
-                combined_features = np.zeros(
-                    (n_items, len(item_cols) + len(user_cols)), dtype=np.float32
-                )
-                combined_features[:, : len(item_cols)] = items_features_np
-                user_vector = user_features_batch[user_idx]  # вектор user-фич
-                combined_features[:, len(item_cols) :] = np.tile(
-                    user_vector, (n_items, 1)
-                )  # дублируем для всех item
+                # Бонус за похожие товары
+                for recent_item in recent_items[:3]:  # для 3 последних товаров
+                    similar_items = self._get_similar_items(recent_item)
+                    for item_id in similar_items:
+                        if item_id in self.item_map:
+                            idx = all_items.index(item_id)
+                            final_scores[idx] += 0.3  # бонус за похожесть
 
-                scores = self.model.predict(combined_features, num_iteration=-1)
-                top_indices = np.argsort(-scores)[:top_k]
-                recommended_items = [self.inv_item_map[idx] for idx in top_indices]
-                recommended_items = self._ensure_exactly_100_items(recommended_items)
+                # Бонус за товары из тех же категорий
+                category_items = self._get_category_items(user_id)
+                for item_id in category_items:
+                    if item_id in self.item_map:
+                        idx = all_items.index(item_id)
+                        final_scores[idx] += 0.2
+
+                # Бонус за совместные покупки
+                copurchased = self._get_copurchased_items(user_id)
+                for item_id in copurchased:
+                    if item_id in self.item_map:
+                        idx = all_items.index(item_id)
+                        final_scores[idx] += 0.4
+
+                # 4. Ранжируем по итоговому scoring
+                top_indices = np.argsort(-final_scores)[:100]
+                recommended_items = [all_items[idx] for idx in top_indices]
 
                 submission_data.append(
                     {
@@ -190,37 +203,52 @@ class SubmissionGenerator:
                     }
                 )
 
-            if len(submission_data) >= 5000:
+            except Exception as e:
+                print(f"Ошибка для пользователя {user_id}: {e}")
+                # Fallback: популярные товары
+                submission_data.append(
+                    {
+                        "user_id": user_id,
+                        "item_id_1 item_id_2 ... item_id_100": " ".join(
+                            map(str, self.popular_items[:100])
+                        ),
+                    }
+                )
+
+            # Периодическое сохранение
+            if len(submission_data) % 1000 == 0:
                 self._save_submission_batch(submission_data, output_path)
                 submission_data = []
 
         if submission_data:
             self._save_submission_batch(submission_data, output_path)
 
-        print(f"Рекомендации сгенерированы для {len(test_users_df)} пользователей")
-
     def _save_submission_batch(self, submission_data, output_path):
         df = pd.DataFrame(submission_data)
         file_exists = os.path.exists(output_path)
         df.to_csv(output_path, index=False, mode="a", header=not file_exists)
-        print(f"Сохранено {len(submission_data)} пользователей")
+
+    def load_test_users(self, test_users_path):
+        print("Загрузка тестовых пользователей...")
+        test_users_ddf = dd.read_parquet(test_users_path, columns=["user_id"])
+        return test_users_ddf.compute()
 
 
 # -------------------- Основной запуск --------------------
 if __name__ == "__main__":
-    start_time = time.time()
-    MODEL_PATH = "/home/root6/python/e_cup/rec_system/src/models/lgbm_model.pkl"
+    MODEL_PATH = "/home/root6/python/e_cup/rec_system/src/models/lgbm_model_full.pkl"
     TEST_USERS_PATH = "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_test_for_participants/test_for_participants/*.parquet"
     OUTPUT_PATH = "/home/root6/python/e_cup/rec_system/result/submission.csv"
 
     try:
         generator = SubmissionGenerator(MODEL_PATH)
-        test_users_df = generator.load_test_users(TEST_USERS_PATH)
-        generator.generate_recommendations_gpu(
-            test_users_df, OUTPUT_PATH, top_k=100, batch_size=1000
-        )
+        test_users = generator.load_test_users(TEST_USERS_PATH)
+        generator.generate_personalized_recommendations(test_users, OUTPUT_PATH)
     except Exception as e:
         print(f"Критическая ошибка: {e}")
+        import traceback
+
+        traceback.print_exc()
     finally:
         if os.path.exists(OUTPUT_PATH):
             df = pd.read_csv(OUTPUT_PATH).drop_duplicates(
@@ -237,7 +265,6 @@ if __name__ == "__main__":
 
     elapsed_time = timedelta(seconds=time.time() - start_time)
     print(f"Время подготовки рекомендаций: {elapsed_time}")
-
 
 # что сейчас учитывается
 # 1) Полный список факторов для формирования рекомендаций:
