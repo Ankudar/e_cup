@@ -2,6 +2,7 @@ import gc
 import os
 import pickle
 import random
+import tempfile
 import time
 from collections import defaultdict
 from datetime import timedelta
@@ -63,8 +64,47 @@ def load_train_data(max_parts=0, max_rows=0):
             print(f"{name}: parquet файлы не найдены в {folder}")
             return dd.from_pandas(pd.DataFrame(), npartitions=1)
 
-        # читаем все файлы
-        ddf = dd.read_parquet(files)
+        # Индивидуальные настройки типов для разных наборов данных
+        dtype_profiles = {
+            "orders": {
+                "user_id": "int32",
+                "item_id": "int32",
+                "created_timestamp": "datetime64[ns]",
+                "last_status": "category",
+            },
+            "tracker": {
+                "user_id": "int32",
+                "item_id": "int32",
+                "timestamp": "datetime64[ns]",
+                "action_type": "category",
+            },
+            "items": {
+                "item_id": "int32",
+                "catalogid": "int32",
+                "itemname": "string",
+                "fclip_embed": "object",  # оставляем как object для массивов
+            },
+            "categories": {
+                "catalogid": "int32",
+                "catalogpath": "string",
+                "ids": "string",
+            },
+            "test_users": {"user_id": "int32"},
+        }
+
+        # Выбираем подходящий профиль типов по имени
+        current_dtypes = dtype_profiles.get(name, {})
+
+        # Фильтруем только те типы, которые есть в запрошенных колонках
+        if columns is not None:
+            filtered_dtypes = {}
+            for col in columns:
+                if col in current_dtypes:
+                    filtered_dtypes[col] = current_dtypes[col]
+            current_dtypes = filtered_dtypes
+
+        # читаем все файлы с указанием типов
+        ddf = dd.read_parquet(files, dtype=current_dtypes if current_dtypes else None)
 
         if columns is not None:
             available_cols = [c for c in columns if c in ddf.columns]
@@ -80,19 +120,13 @@ def load_train_data(max_parts=0, max_rows=0):
         else:
             used_parts = total_parts
 
-        # ПРАВИЛЬНОЕ ограничение max_rows:
         if max_rows > 0:
-            # Сначала вычисляем общее количество строк
             total_rows = ddf.map_partitions(len).compute().sum()
 
             if total_rows <= max_rows:
-                # Если данных меньше или равно лимиту, берем все
                 df_all = ddf.compute()
             else:
-                # Берем случайную выборку размера max_rows
-                df_all = ddf.sample(
-                    frac=max_rows / total_rows, random_state=42
-                ).compute()
+                df_all = ddf.compute().tail(max_rows)
 
             ddf = dd.from_pandas(df_all, npartitions=1)
 
@@ -262,10 +296,8 @@ def compute_global_popularity(train_orders_df):
 # -------------------- Обучение ALS --------------------
 def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
     """
-    Инкрементальное обучение с обработкой файлов по одному
+    Версия с сохранением батчей на указанный диск
     """
-    import polars as pl
-
     # 1. ПРОХОД: Построение маппингов
     user_set = set()
     item_set = set()
@@ -280,12 +312,12 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
     item_map = {i: j for j, i in enumerate(sorted(item_set))}
     print(f"Маппинги построены. Уников: users={len(user_map)}, items={len(item_map)}")
 
-    # 2. ПРОХОД: Инкрементальное обучение
-    print("Инкрементальное обучение...")
+    # 2. ПРОХОД: Сохранение батчей на указанный диск
+    print("Сохранение батчей на диск...")
 
-    als_model = TorchALS(
-        len(user_map), len(item_map), n_factors=n_factors, reg=reg, device=device
-    )
+    # Используем указанный адрес вместо временной директории
+    batch_dir = "/home/root6/python/e_cup/rec_system/data/processed/als_batches/"
+    os.makedirs(batch_dir, exist_ok=True)
 
     user_map_df = pl.DataFrame(
         {"user_id": list(user_map.keys()), "user_idx": list(user_map.values())}
@@ -294,36 +326,73 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
         {"item_id": list(item_map.keys()), "item_idx": list(item_map.values())}
     )
 
-    for f in tqdm(interactions_files):
+    batch_files = []
+    for i, f in enumerate(tqdm(interactions_files)):
         df = pl.read_parquet(f, columns=["user_id", "item_id", "weight"])
 
-        # Join с маппингами
         df = df.join(user_map_df, on="user_id", how="inner")
         df = df.join(item_map_df, on="item_id", how="inner")
 
         if len(df) > 0:
-            # Создаем sparse tensor для текущего файла
-            rows = df["user_idx"].to_numpy().astype(np.int32)
-            cols = df["item_idx"].to_numpy().astype(np.int32)
-            values = df["weight"].to_numpy().astype(np.float32)
+            # Сохраняем батч на указанный диск
+            batch_path = os.path.join(batch_dir, f"batch_{i:04d}.npz")
+            np.savez(
+                batch_path,
+                rows=df["user_idx"].to_numpy().astype(np.int32),
+                cols=df["item_idx"].to_numpy().astype(np.int32),
+                vals=df["weight"].to_numpy().astype(np.float32),
+            )
+            batch_files.append(batch_path)
 
-            indices = torch.tensor([rows, cols], dtype=torch.long, device=device)
-            values_tensor = torch.tensor(values, dtype=torch.float32, device=device)
+    # 3. Постепенная загрузка и обучение
+    print("Постепенное обучение...")
 
+    als_model = TorchALS(len(user_map), len(item_map), n_factors=64, device="cuda")
+
+    for batch_path in tqdm(batch_files):
+        try:
+            # Загружаем батч с диска
+            data = np.load(batch_path)
+            rows = data["rows"]
+            cols = data["cols"]
+            vals = data["vals"]
+
+            # Создаем sparse tensor для батча
+            indices = torch.tensor([rows, cols], dtype=torch.long, device="cuda")
+            values = torch.tensor(vals, dtype=torch.float32, device="cuda")
             sparse_batch = torch.sparse_coo_tensor(
-                indices,
-                values_tensor,
-                size=(len(user_map), len(item_map)),
-                device=device,
+                indices, values, size=(len(user_map), len(item_map)), device="cuda"
             )
 
-            # Обучаем на одном файле
-            als_model.partial_fit(sparse_batch, iterations=10, lr=0.005)
+            # Обучаем на одном батче
+            als_model.partial_fit(sparse_batch, iterations=5, lr=0.005)
 
-            # Очищаем память
-            del sparse_batch, indices, values_tensor
+            # Очищаем
+            del sparse_batch, indices, values
             if device == "cuda":
                 torch.cuda.empty_cache()
+
+        except Exception as e:
+            print(f"Ошибка обработки батча {batch_path}: {e}")
+            continue
+
+    # Опционально: удаляем временные файлы после обучения
+    print("Очистка временных файлов...")
+    for batch_path in batch_files:
+        try:
+            os.remove(batch_path)
+        except Exception as e:
+            print(f"Ошибка удаления файла {batch_path}: {e}")
+
+    # Проверяем, пуста ли директория и удаляем ее
+    try:
+        if not os.listdir(batch_dir):
+            os.rmdir(batch_dir)
+            print("Директория батчей удалена")
+        else:
+            print("В директории остались файлы, не удаляем")
+    except Exception as e:
+        print(f"Ошибка удаления директории: {e}")
 
     print("Обучение завершено!")
     return als_model, user_map, item_map
@@ -665,73 +734,51 @@ class TorchALS(nn.Module):
         )
         self.reg = reg
         self.device = device
+        self.partial_optimizer = None  # Оптимизатор для partial_fit
         self.to(device)
 
     def forward(self, user, item):
         return (self.user_factors[user] * self.item_factors[item]).sum(1)
 
-    def fit(
-        self,
-        sparse_tensor,
-        iterations=500,
-        lr=0.005,
-        show_progress=True,
-        sample_ratio=0.5,
-        early_stop_patience=10,
-    ):
-        """Обучение ALS с семплированием и ранней остановкой"""
-        optimizer = torch.optim.Adam(self.parameters(), lr=lr, weight_decay=self.reg)
-        if not sparse_tensor.is_coalesced():
-            sparse_tensor = sparse_tensor.coalesce()
-        users_coo, items_coo = sparse_tensor.indices()
-        values = sparse_tensor.values()
-        n_interactions = len(values)
+    def partial_fit(self, sparse_batch, iterations=5, lr=0.005, show_progress=False):
+        """
+        Инкрементальное обучение на ВСЕХ данных батча
+        """
+        # Подготавливаем sparse tensor
+        if not sparse_batch.is_coalesced():
+            sparse_batch = sparse_batch.coalesce()
 
-        best_loss = float("inf")
-        patience_counter = 0
+        users_coo, items_coo = sparse_batch.indices()
+        values = sparse_batch.values()
 
+        # Инициализируем оптимизатор при первом вызове
+        if self.partial_optimizer is None:
+            self.partial_optimizer = torch.optim.Adam(
+                self.parameters(), lr=lr, weight_decay=self.reg
+            )
+        else:
+            # Обновляем learning rate
+            for param_group in self.partial_optimizer.param_groups:
+                param_group["lr"] = lr
+
+        # Обучаем на всех данных батча (без семплирования!)
         for epoch in range(iterations):
-            sample_size = int(n_interactions * sample_ratio)
-            sample_indices = torch.randint(
-                0, n_interactions, (sample_size,), device=self.device
-            )
-            optimizer.zero_grad()
-            batch_users = users_coo[sample_indices]
-            batch_items = items_coo[sample_indices]
-            batch_values = values[sample_indices]
+            self.partial_optimizer.zero_grad()
 
-            pred = self.forward(batch_users, batch_items)
-            loss = F.mse_loss(pred, batch_values)
+            # Предсказания для всех взаимодействий в батче
+            pred = self.forward(users_coo, items_coo)
+            loss = F.mse_loss(pred, values)
 
-            user_reg = (
-                self.reg
-                * self.user_factors[batch_users].pow(2).sum()
-                / sample_size
-                * n_interactions
-            )
-            item_reg = (
-                self.reg
-                * self.item_factors[batch_items].pow(2).sum()
-                / sample_size
-                * n_interactions
-            )
+            # Регуляризация на всех данных
+            user_reg = self.reg * self.user_factors[users_coo].pow(2).mean()
+            item_reg = self.reg * self.item_factors[items_coo].pow(2).mean()
             total_loss = loss + user_reg + item_reg
 
             total_loss.backward()
-            optimizer.step()
+            self.partial_optimizer.step()
 
-            if show_progress and (epoch % 50 == 0 or epoch == iterations - 1):
-                print(f"Epoch {epoch}, Loss: {total_loss.item():.6f}")
-
-            # Ранняя остановка
-            if total_loss.item() < best_loss:
-                best_loss = total_loss.item()
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= early_stop_patience:
-                    print(f"Early stopping at epoch {epoch}")
-                    break
+            if show_progress and (epoch % 10 == 0 or epoch == iterations - 1):
+                print(f"Partial fit epoch {epoch}, Loss: {total_loss.item():.6f}")
 
 
 class LightGBMRecommender:
