@@ -8,11 +8,12 @@ import dask.dataframe as dd
 import numpy as np
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.neighbors import NearestNeighbors
 from tqdm.auto import tqdm
 
 
-class SubmissionGenerator:
-    def __init__(self, model_path, use_gpu=True):
+class FastSubmissionGenerator:
+    def __init__(self, model_path):
         print("Загрузка модели и данных...")
         with open(model_path, "rb") as f:
             model_data = pickle.load(f)
@@ -30,193 +31,206 @@ class SubmissionGenerator:
         self.recent_items_map = model_data.get("recent_items_map", {})
         self.copurchase_map = model_data.get("copurchase_map", {})
         self.item_to_cat = model_data.get("item_to_cat", {})
-        self.user_embeddings = model_data.get("user_embeddings")
         self.item_embeddings = model_data.get("item_embeddings")
 
-        # Веса взаимодействий
-        self.interaction_weights = {"page_view": 2.0, "favorite": 4.0, "to_cart": 6.0}
+        # Предварительные вычисления
+        self.all_items = list(self.item_map.keys())
+        self.n_items = len(self.all_items)
 
-        print(f"Модель загружена: {len(self.feature_columns)} признаков")
-        print(f"Пользователей: {len(self.user_map)}, Товаров: {len(self.item_map)}")
-        print(f"Недавних взаимодействий: {len(self.recent_items_map)}")
+        # Предварительно вычисляем матрицу item features
+        print("Предварительная подготовка item features...")
+        self.item_features_matrix = self._prepare_item_features_matrix()
 
-    def _get_user_recent_items(self, user_id):
-        """Получаем последние товары пользователя с учетом весов"""
-        if user_id in self.recent_items_map:
-            return self.recent_items_map[user_id]
-        return []
+        # Предварительно вычисляем похожие товары для популярных items
+        print("Предварительный расчет похожих товаров...")
+        self.similar_items_cache = self._precompute_similar_items()
 
-    def _get_similar_items(self, item_id, top_n=20):
-        """Находим похожие товары по ALS эмбеддингам"""
-        if self.item_embeddings is None or item_id not in self.item_map:
-            return []
+        # Предварительно вычисляем товары по категориям
+        print("Предварительная группировка по категориям...")
+        self.category_items_dict = self._precompute_category_items()
 
-        item_idx = self.item_map[item_id]
-        item_embedding = self.item_embeddings[item_idx].reshape(1, -1)
+        print(f"Готово! Пользователей: {len(self.user_map)}, Товаров: {self.n_items}")
 
-        # Вычисляем косинусную близость со всеми товарами
-        similarities = cosine_similarity(item_embedding, self.item_embeddings)[0]
-
-        # Берем топ-N похожих товаров (исключая сам товар)
-        similar_indices = np.argsort(-similarities)[1 : top_n + 1]
-        return [self.inv_item_map[idx] for idx in similar_indices]
-
-    def _get_category_items(self, user_id, top_n=15):
-        """Товары из категорий, которые пользователь просматривал"""
-        if user_id not in self.recent_items_map:
-            return []
-
-        user_categories = set()
-        for item_id in self.recent_items_map[user_id][:10]:  # последние 10 товаров
-            if item_id in self.item_to_cat:
-                user_categories.add(self.item_to_cat[item_id])
-
-        category_items = []
-        for cat in user_categories:
-            for item_id, item_cat in self.item_to_cat.items():
-                if item_cat == cat and item_id not in category_items:
-                    category_items.append(item_id)
-                    if len(category_items) >= top_n:
-                        break
-            if len(category_items) >= top_n:
-                break
-
-        return category_items
-
-    def _get_copurchased_items(self, user_id, top_n=10):
-        """Товары, которые покупают вместе с просмотренными"""
-        if user_id not in self.recent_items_map:
-            return []
-
-        copurchased = set()
-        for item_id in self.recent_items_map[user_id][:5]:  # последние 5 товаров
-            if item_id in self.copurchase_map:
-                for copurchased_id in self.copurchase_map[item_id][
-                    :3
-                ]:  # топ-3 совместных покупок
-                    if copurchased_id != item_id:
-                        copurchased.add(copurchased_id)
-                        if len(copurchased) >= top_n:
-                            break
-
-        return list(copurchased)[:top_n]
-
-    def _create_combined_features(self, user_id, item_ids):
-        """Создает комбинированные фичи для пользователя и товаров"""
+    def _prepare_item_features_matrix(self):
+        """Предварительно создаем матрицу всех item features"""
         n_features = len(self.feature_columns)
-        n_items = len(item_ids)
+        features_matrix = np.zeros((self.n_items, n_features), dtype=np.float32)
 
-        features_matrix = np.zeros((n_items, n_features), dtype=np.float32)
-
-        # Заполняем item features
-        for i, item_id in enumerate(item_ids):
+        for idx, item_id in enumerate(self.all_items):
             if item_id in self.item_features_dict:
                 item_feats = self.item_features_dict[item_id]
                 if isinstance(item_feats, dict):
                     for feat_name, value in item_feats.items():
                         if feat_name in self.feature_columns:
-                            idx = self.feature_columns.index(feat_name)
-                            features_matrix[i, idx] = float(value)
+                            feat_idx = self.feature_columns.index(feat_name)
+                            features_matrix[idx, feat_idx] = float(value)
                 elif isinstance(item_feats, (list, np.ndarray)):
-                    for idx, value in enumerate(item_feats):
-                        if idx < n_features:
-                            features_matrix[i, idx] = float(value)
-
-        # Добавляем user features
-        if user_id in self.user_features_dict:
-            user_feats = self.user_features_dict[user_id]
-            if isinstance(user_feats, dict):
-                for feat_name, value in user_feats.items():
-                    if feat_name in self.feature_columns:
-                        idx = self.feature_columns.index(feat_name)
-                        features_matrix[:, idx] = float(
-                            value
-                        )  # одинаково для всех товаров
-            elif isinstance(user_feats, (list, np.ndarray)):
-                for idx, value in enumerate(user_feats):
-                    if idx < n_features:
-                        features_matrix[:, idx] = float(value)
+                    for feat_idx, value in enumerate(item_feats):
+                        if feat_idx < n_features:
+                            features_matrix[idx, feat_idx] = float(value)
 
         return features_matrix
 
-    def generate_personalized_recommendations(self, test_users_df, output_path):
-        """Генерация рекомендаций с учетом всех факторов"""
-        print("Генерация персонализированных рекомендаций...")
+    def _precompute_similar_items(self, top_n=20):
+        """Предварительно вычисляем похожие товары для всех items"""
+        if self.item_embeddings is None:
+            return {}
+
+        print("Вычисление похожих товаров...")
+        # Используем NearestNeighbors для быстрого поиска
+        nn = NearestNeighbors(n_neighbors=top_n + 1, metric="cosine")
+        nn.fit(self.item_embeddings)
+
+        similar_items_cache = {}
+        for item_id in tqdm(self.all_items[:10000]):  # только для популярных товаров
+            if item_id in self.item_map:
+                item_idx = self.item_map[item_id]
+                distances, indices = nn.kneighbors(
+                    self.item_embeddings[item_idx].reshape(1, -1)
+                )
+                # Исключаем сам товар
+                similar_indices = indices[0][1 : top_n + 1]
+                similar_items_cache[item_id] = [
+                    self.inv_item_map[idx] for idx in similar_indices
+                ]
+
+        return similar_items_cache
+
+    def _precompute_category_items(self):
+        """Предварительно группируем товары по категориям"""
+        category_items = defaultdict(list)
+        for item_id, category in self.item_to_cat.items():
+            category_items[category].append(item_id)
+        return category_items
+
+    def _get_user_features_vector(self, user_id):
+        """Быстрое получение user features"""
+        if user_id in self.user_features_dict:
+            user_feats = self.user_features_dict[user_id]
+            n_features = len(self.feature_columns)
+            user_vector = np.zeros(n_features, dtype=np.float32)
+
+            if isinstance(user_feats, dict):
+                for feat_name, value in user_feats.items():
+                    if feat_name in self.feature_columns:
+                        feat_idx = self.feature_columns.index(feat_name)
+                        user_vector[feat_idx] = float(value)
+            elif isinstance(user_feats, (list, np.ndarray)):
+                for feat_idx, value in enumerate(user_feats):
+                    if feat_idx < n_features:
+                        user_vector[feat_idx] = float(value)
+
+            return user_vector
+        return None
+
+    def _create_batch_features(self, user_ids):
+        """Создает features для батча пользователей"""
+        n_users = len(user_ids)
+        n_features = self.item_features_matrix.shape[1]
+
+        # Создаем большую матрицу для батча
+        batch_features = np.zeros(
+            (n_users * self.n_items, n_features), dtype=np.float32
+        )
+
+        # Копируем item features для всех пользователей
+        for i in range(n_users):
+            start_idx = i * self.n_items
+            end_idx = start_idx + self.n_items
+            batch_features[start_idx:end_idx] = self.item_features_matrix
+
+        # Добавляем user features
+        for i, user_id in enumerate(user_ids):
+            user_vector = self._get_user_features_vector(user_id)
+            if user_vector is not None:
+                start_idx = i * self.n_items
+                end_idx = start_idx + self.n_items
+
+                # Добавляем user features ко всем товарам этого пользователя
+                for feat_idx in range(n_features):
+                    if self.feature_columns[feat_idx].startswith("user_"):
+                        batch_features[start_idx:end_idx, feat_idx] = user_vector[
+                            feat_idx
+                        ]
+
+        return batch_features
+
+    def _apply_dynamic_boosts(self, base_scores, user_id, user_items_slice):
+        """Применяет динамические бонусы к базовым scores"""
+        boosted_scores = base_scores.copy()
+
+        if user_id in self.recent_items_map:
+            recent_items = self.recent_items_map[user_id]
+
+            # Бонус за последние просмотры (векторизовано)
+            for i, item_id in enumerate(self.all_items):
+                if item_id in recent_items:
+                    recency_idx = recent_items.index(item_id)
+                    recency_bonus = (
+                        0.5 * (len(recent_items) - recency_idx) / len(recent_items)
+                    )
+                    boosted_scores[i] += recency_bonus
+
+        return boosted_scores
+
+    def generate_recommendations_batch(
+        self, test_users_df, output_path, batch_size=100
+    ):
+        """Генерация рекомендаций батчами"""
+        print("Быстрая генерация рекомендаций...")
+        user_ids = test_users_df["user_id"].tolist()
+        n_users = len(user_ids)
+
         submission_data = []
 
-        for user_id in tqdm(test_users_df["user_id"], desc="Пользователи"):
+        for batch_start in tqdm(range(0, n_users, batch_size), desc="Обработка батчей"):
+            batch_end = min(batch_start + batch_size, n_users)
+            batch_user_ids = user_ids[batch_start:batch_end]
+
             try:
-                # 1. Базовые кандидаты из модели
-                all_items = list(self.item_map.keys())
-                combined_features = self._create_combined_features(user_id, all_items)
-                base_scores = self.model.predict(combined_features, num_iteration=-1)
+                # 1. Создаем features для всего батча
+                batch_features = self._create_batch_features(batch_user_ids)
 
-                # 2. Создаем итоговый scoring с весами
-                final_scores = base_scores.copy()
+                # 2. Предсказываем scores для всего батча
+                batch_scores = self.model.predict(batch_features, num_iteration=-1)
 
-                # 3. Добавляем бонусы за различные факторы
-                recent_items = self._get_user_recent_items(user_id)
+                # 3. Обрабатываем каждого пользователя в батче
+                for i, user_id in enumerate(batch_user_ids):
+                    user_scores = batch_scores[
+                        i * self.n_items : (i + 1) * self.n_items
+                    ]
 
-                # Бонус за последние просмотры
-                for i, item_id in enumerate(all_items):
-                    if item_id in recent_items:
-                        # Больший бонус за более свежие взаимодействия
-                        recency_bonus = (
-                            0.5
-                            * (len(recent_items) - recent_items.index(item_id))
-                            / len(recent_items)
-                        )
-                        final_scores[i] += recency_bonus
+                    # 4. Применяем динамические бонусы
+                    final_scores = self._apply_dynamic_boosts(user_scores, user_id, i)
 
-                # Бонус за похожие товары
-                for recent_item in recent_items[:3]:  # для 3 последних товаров
-                    similar_items = self._get_similar_items(recent_item)
-                    for item_id in similar_items:
-                        if item_id in self.item_map:
-                            idx = all_items.index(item_id)
-                            final_scores[idx] += 0.3  # бонус за похожесть
+                    # 5. Берем топ-100
+                    top_indices = np.argsort(-final_scores)[:100]
+                    recommended_items = [self.all_items[idx] for idx in top_indices]
 
-                # Бонус за товары из тех же категорий
-                category_items = self._get_category_items(user_id)
-                for item_id in category_items:
-                    if item_id in self.item_map:
-                        idx = all_items.index(item_id)
-                        final_scores[idx] += 0.2
-
-                # Бонус за совместные покупки
-                copurchased = self._get_copurchased_items(user_id)
-                for item_id in copurchased:
-                    if item_id in self.item_map:
-                        idx = all_items.index(item_id)
-                        final_scores[idx] += 0.4
-
-                # 4. Ранжируем по итоговому scoring
-                top_indices = np.argsort(-final_scores)[:100]
-                recommended_items = [all_items[idx] for idx in top_indices]
-
-                submission_data.append(
-                    {
-                        "user_id": user_id,
-                        "item_id_1 item_id_2 ... item_id_100": " ".join(
-                            map(str, recommended_items)
-                        ),
-                    }
-                )
+                    submission_data.append(
+                        {
+                            "user_id": user_id,
+                            "item_id_1 item_id_2 ... item_id_100": " ".join(
+                                map(str, recommended_items)
+                            ),
+                        }
+                    )
 
             except Exception as e:
-                print(f"Ошибка для пользователя {user_id}: {e}")
-                # Fallback: популярные товары
-                submission_data.append(
-                    {
-                        "user_id": user_id,
-                        "item_id_1 item_id_2 ... item_id_100": " ".join(
-                            map(str, self.popular_items[:100])
-                        ),
-                    }
-                )
+                print(f"Ошибка в батче {batch_start}: {e}")
+                # Fallback для всего батча
+                for user_id in batch_user_ids:
+                    submission_data.append(
+                        {
+                            "user_id": user_id,
+                            "item_id_1 item_id_2 ... item_id_100": " ".join(
+                                map(str, self.popular_items[:100])
+                            ),
+                        }
+                    )
 
             # Периодическое сохранение
-            if len(submission_data) % 1000 == 0:
+            if len(submission_data) >= 10000:
                 self._save_submission_batch(submission_data, output_path)
                 submission_data = []
 
@@ -236,14 +250,17 @@ class SubmissionGenerator:
 
 # -------------------- Основной запуск --------------------
 if __name__ == "__main__":
+    start_time = time.time()
     MODEL_PATH = "/home/root6/python/e_cup/rec_system/src/models/lgbm_model_full.pkl"
     TEST_USERS_PATH = "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_test_for_participants/test_for_participants/*.parquet"
     OUTPUT_PATH = "/home/root6/python/e_cup/rec_system/result/submission.csv"
 
     try:
-        generator = SubmissionGenerator(MODEL_PATH)
+        generator = FastSubmissionGenerator(MODEL_PATH)
         test_users = generator.load_test_users(TEST_USERS_PATH)
-        generator.generate_personalized_recommendations(test_users, OUTPUT_PATH)
+        generator.generate_recommendations_batch(
+            test_users, OUTPUT_PATH, batch_size=500
+        )
     except Exception as e:
         print(f"Критическая ошибка: {e}")
         import traceback
@@ -263,8 +280,9 @@ if __name__ == "__main__":
             df.to_csv(OUTPUT_PATH, index=False)
             print(f"✅ Сабмит сохранен: {OUTPUT_PATH}")
 
-    elapsed_time = timedelta(seconds=time.time() - start_time)
-    print(f"Время подготовки рекомендаций: {elapsed_time}")
+    elapsed = time.time() - start_time
+    print(f"Общее время: {timedelta(seconds=elapsed)}")
+    print(f"Скорость: {len(test_users) / elapsed:.1f} users/sec")
 
 # что сейчас учитывается
 # 1) Полный список факторов для формирования рекомендаций:
