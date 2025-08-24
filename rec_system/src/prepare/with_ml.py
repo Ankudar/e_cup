@@ -30,7 +30,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=10000):
+def load_train_data(max_parts=0, max_rows=0):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы.
@@ -80,11 +80,20 @@ def load_train_data(max_parts=0, max_rows=10000):
         else:
             used_parts = total_parts
 
-        # Правильное ограничение max_rows:
+        # ПРАВИЛЬНОЕ ограничение max_rows:
         if max_rows > 0:
-            df_all = ddf.head(
-                max_rows, compute=True
-            )  # читаем только первые max_rows строк
+            # Сначала вычисляем общее количество строк
+            total_rows = ddf.map_partitions(len).compute().sum()
+
+            if total_rows <= max_rows:
+                # Если данных меньше или равно лимиту, берем все
+                df_all = ddf.compute()
+            else:
+                # Берем случайную выборку размера max_rows
+                df_all = ddf.sample(
+                    frac=max_rows / total_rows, random_state=42
+                ).compute()
+
             ddf = dd.from_pandas(df_all, npartitions=1)
 
         count = ddf.map_partitions(len).compute().sum()
@@ -168,7 +177,7 @@ def prepare_interactions(
     train_orders_df,
     tracker_ddf,
     cutoff_ts_per_user,
-    batch_size=100_000_000,
+    batch_size=300_000_000,
     action_weights=None,
     scale_days=60,
     output_dir="/home/root6/python/e_cup/rec_system/data/processed/prepare_interactions_batches",
@@ -253,55 +262,70 @@ def compute_global_popularity(train_orders_df):
 # -------------------- Обучение ALS --------------------
 def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
     """
-    Обучение ALS с итеративной загрузкой данных для построения маппингов.
-    Фактическое обучение происходит на сжатом sparse тензоре.
+    Инкрементальное обучение с обработкой файлов по одному
     """
-    # 1. ПРОХОД: Собираем все user_id и item_id для построения маппингов
+    import polars as pl
+
+    # 1. ПРОХОД: Построение маппингов
     user_set = set()
     item_set = set()
     print("Первый проход: построение маппингов...")
+
     for f in tqdm(interactions_files):
-        # Читаем только нужные колонки
-        df_chunk = pd.read_parquet(f, columns=["user_id", "item_id"])
-        user_set.update(df_chunk["user_id"].unique())
-        item_set.update(df_chunk["item_id"].unique())
+        df = pl.read_parquet(f, columns=["user_id", "item_id"])
+        user_set.update(df["user_id"].unique().to_list())
+        item_set.update(df["item_id"].unique().to_list())
 
     user_map = {u: i for i, u in enumerate(sorted(user_set))}
     item_map = {i: j for j, i in enumerate(sorted(item_set))}
     print(f"Маппинги построены. Уников: users={len(user_map)}, items={len(item_map)}")
 
-    # 2. ПРОХОД: Построение разреженного тензора COO на GPU
-    rows_list, cols_list, values_list = [], [], []
-    print("Второй проход: построение тензора...")
-    for f in tqdm(interactions_files):
-        df_chunk = pd.read_parquet(f, columns=["user_id", "item_id", "weight"])
-        # Применяем маппинги
-        df_chunk["user_idx"] = df_chunk["user_id"].map(user_map)
-        df_chunk["item_idx"] = df_chunk["item_id"].map(item_map)
-        df_chunk = df_chunk.dropna(subset=["user_idx", "item_idx"])  # Важно!
+    # 2. ПРОХОД: Инкрементальное обучение
+    print("Инкрементальное обучение...")
 
-        rows_list.append(df_chunk["user_idx"].values.astype(np.int32))
-        cols_list.append(df_chunk["item_idx"].values.astype(np.int32))
-        values_list.append(df_chunk["weight"].values.astype(np.float32))
-
-    # Конкатенация и перенос на GPU
-    rows = np.concatenate(rows_list)
-    cols = np.concatenate(cols_list)
-    values = np.concatenate(values_list)
-
-    indices = torch.tensor([rows, cols], dtype=torch.long, device=device)
-    values = torch.tensor(values, dtype=torch.float32, device=device)
-    sparse_tensor = torch.sparse_coo_tensor(
-        indices, values, size=(len(user_map), len(item_map))
-    )
-    print(f"Тензор построен на GPU. Ненулевых элементов: {sparse_tensor._nnz()}")
-
-    # Обучаем ALS
     als_model = TorchALS(
         len(user_map), len(item_map), n_factors=n_factors, reg=reg, device=device
     )
-    als_model.fit(sparse_tensor, iterations=500, lr=0.005, sample_ratio=0.5)
 
+    user_map_df = pl.DataFrame(
+        {"user_id": list(user_map.keys()), "user_idx": list(user_map.values())}
+    )
+    item_map_df = pl.DataFrame(
+        {"item_id": list(item_map.keys()), "item_idx": list(item_map.values())}
+    )
+
+    for f in tqdm(interactions_files):
+        df = pl.read_parquet(f, columns=["user_id", "item_id", "weight"])
+
+        # Join с маппингами
+        df = df.join(user_map_df, on="user_id", how="inner")
+        df = df.join(item_map_df, on="item_id", how="inner")
+
+        if len(df) > 0:
+            # Создаем sparse tensor для текущего файла
+            rows = df["user_idx"].to_numpy().astype(np.int32)
+            cols = df["item_idx"].to_numpy().astype(np.int32)
+            values = df["weight"].to_numpy().astype(np.float32)
+
+            indices = torch.tensor([rows, cols], dtype=torch.long, device=device)
+            values_tensor = torch.tensor(values, dtype=torch.float32, device=device)
+
+            sparse_batch = torch.sparse_coo_tensor(
+                indices,
+                values_tensor,
+                size=(len(user_map), len(item_map)),
+                device=device,
+            )
+
+            # Обучаем на одном файле
+            als_model.partial_fit(sparse_batch, iterations=10, lr=0.005)
+
+            # Очищаем память
+            del sparse_batch, indices, values_tensor
+            if device == "cuda":
+                torch.cuda.empty_cache()
+
+    print("Обучение завершено!")
     return als_model, user_map, item_map
 
 
@@ -1926,9 +1950,9 @@ if __name__ == "__main__":
         "als_model": model,
         "user_map": user_map,
         "item_map": item_map,
-        "inv_item_map": inv_item_map,  # Сохраняем обратный маппинг!
+        "inv_item_map": inv_item_map,
         "popular_items": popular_items,
-        "user_features_dict": user_features_dict,  # Сохраняем словари признаков
+        "user_features_dict": user_features_dict,
         "item_features_dict": item_features_dict,
         "user_item_features_dict": user_item_features_dict,
         "recent_items_map": recent_items_map,
