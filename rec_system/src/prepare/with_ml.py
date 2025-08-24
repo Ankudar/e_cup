@@ -1447,18 +1447,84 @@ class LightGBMRecommender:
                     )
                 )
 
-        # === FCLIP ЭМБЕДДИНГИ ===
+        # === FCLIP ЭМБЕДДИНГИ С ИСПОЛЬЗОВАНИЕМ GPU ===
         if self.external_embeddings_dict:
-            print("Добавление внешних эмбеддингов...")
+            print("Ускоренная обработка FCLIP эмбеддингов на GPU...")
+
+            # Переносим эмбеддинги на GPU
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+            # Создаем тензор всех эмбеддингов на GPU
+            all_item_ids = list(self.external_embeddings_dict.keys())
             sample_embedding = next(iter(self.external_embeddings_dict.values()))
-            for i in range(min(10, len(sample_embedding))):
-                data[f"fclip_embed_{i}"] = data["item_id"].map(
-                    lambda x: (
-                        self.external_embeddings_dict.get(x, np.zeros(1))[i]
-                        if x in self.external_embeddings_dict
-                        else 0.0
-                    )
+            embedding_dim = len(sample_embedding)
+            n_fclip_dims = min(10, embedding_dim)
+
+            # Создаем тензор всех эмбеддингов [n_items, embedding_dim]
+            embeddings_tensor = torch.zeros(
+                len(all_item_ids), embedding_dim, device=device
+            )
+            for idx, item_id in enumerate(all_item_ids):
+                embeddings_tensor[idx] = torch.tensor(
+                    self.external_embeddings_dict[item_id],
+                    device=device,
+                    dtype=torch.float32,
                 )
+
+            # Создаем маппинг item_id -> index в тензоре
+            item_id_to_idx = {item_id: idx for idx, item_id in enumerate(all_item_ids)}
+
+            # Обрабатываем данные батчами на GPU
+            batch_size = 100000
+            total_rows = len(data)
+
+            for i in range(n_fclip_dims):
+                print(f"Обработка FCLIP измерения {i+1}/{n_fclip_dims} на GPU...")
+
+                # Создаем колонку заранее
+                data[f"fclip_embed_{i}"] = 0.0
+
+                # Обрабатываем батчами
+                for start_idx in range(0, total_rows, batch_size):
+                    end_idx = min(start_idx + batch_size, total_rows)
+                    batch_data = data.iloc[start_idx:end_idx]
+
+                    # Получаем item_ids для батча
+                    batch_item_ids = batch_data["item_id"].values
+
+                    # Создаем маску для товаров, которые есть в эмбеддингах
+                    valid_mask = np.array(
+                        [item_id in item_id_to_idx for item_id in batch_item_ids]
+                    )
+                    valid_indices = np.where(valid_mask)[0]
+                    valid_item_ids = batch_item_ids[valid_mask]
+
+                    if len(valid_item_ids) > 0:
+                        # Получаем индексы в тензоре эмбеддингов
+                        tensor_indices = [
+                            item_id_to_idx[item_id] for item_id in valid_item_ids
+                        ]
+                        tensor_indices = torch.tensor(tensor_indices, device=device)
+
+                        # Извлекаем нужное измерение эмбеддингов
+                        batch_embeddings = (
+                            embeddings_tensor[tensor_indices, i].cpu().numpy()
+                        )
+
+                        # Заполняем значения
+                        data.iloc[
+                            start_idx + valid_indices,
+                            data.columns.get_loc(f"fclip_embed_{i}"),
+                        ] = batch_embeddings
+
+                    # Очистка памяти
+                    del batch_data, batch_item_ids
+                    if start_idx % (batch_size * 5) == 0:
+                        torch.cuda.empty_cache()
+
+            # Освобождаем GPU память
+            del embeddings_tensor, item_id_to_idx
+            torch.cuda.empty_cache()
 
         # === ИНТЕРАКЦИОННЫЕ ПРИЗНАКИ ===
         data["user_item_affinity"] = data["ui_mean"] * data["user_mean"]
