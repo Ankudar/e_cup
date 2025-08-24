@@ -26,7 +26,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=0):
+def load_train_data(max_parts=0, max_rows=1000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Если колонка отсутствует в файле, пропускаем её.
@@ -340,7 +340,7 @@ def build_user_items_csr(
 
 
 def build_copurchase_map(
-    train_orders_df, min_co_items=2, top_n=10, device="cuda", max_items=50000
+    train_orders_df, min_co_items=2, top_n=5, device="cuda", max_items=1_000_000
 ):
     """
     Экономная версия: строим словарь совместных покупок для топ-N товаров
@@ -769,7 +769,7 @@ def evaluate_ndcg_iter_optimized(
 
 
 # -------------------- Строим словарь "какие товары похожи на какой" --------------------
-def get_similar_by_category_tree(items_df, categories_df, top_n=50):
+def get_similar_by_category_tree(items_df, categories_df, top_n=20):
     """
     Строит словарь похожих товаров через иерархию категорий
     """
@@ -1618,58 +1618,52 @@ class LightGBMRecommender:
 
 
 def load_and_process_embeddings(
-    items_ddf, embedding_column="fclip_embed", device="cuda"
+    items_ddf,
+    embedding_column="fclip_embed",
+    device="cuda",
+    max_items=50000,  # Ограничиваем количество
 ):
     """
-    Загрузка и обработка эмбеддингов товаров
+    Оптимизированная загрузка эмбеддингов
     """
-    print("Загрузка эмбеддингов товаров...")
+    print("Оптимизированная загрузка эмбеддингов...")
 
-    with ProgressBar():
-        items_df = items_ddf.compute()
-
-    if embedding_column not in items_df.columns:
-        print(f"Колонка {embedding_column} не найдена в items данных")
-        return None
+    # Берем только нужные колонки и ограничиваем количество
+    items_sample = items_ddf[["item_id", embedding_column]].head(max_items)
 
     embeddings_dict = {}
-    valid_items = []
+    valid_count = 0
 
-    for idx, row in tqdm(
-        items_df.iterrows(), desc="Обработка эмбеддингов", total=len(items_df)
+    for _, row in tqdm(
+        items_sample.iterrows(), desc="Обработка эмбеддингов", total=len(items_sample)
     ):
         item_id = row["item_id"]
-        embedding_str = row[embedding_column]
+        embedding_data = row[embedding_column]
 
-        if isinstance(embedding_str, str) and pd.notna(embedding_str):
-            try:
+        if pd.isna(embedding_data):
+            continue
+
+        try:
+            # Обработка разных форматов
+            if isinstance(embedding_data, str):
+                # Из строки: "[0.1, 0.2, 0.3]"
                 embedding = np.fromstring(
-                    embedding_str.strip("[]"), sep=" ", dtype=np.float32
+                    embedding_data.strip("[]"), sep=",", dtype=np.float32
                 )
-                if embedding.size > 0:
-                    # Сохраняем как numpy array для совместимости с LightGBM
-                    embeddings_dict[item_id] = embedding
-                    valid_items.append(item_id)
-            except Exception as e:
-                print(f"Ошибка обработки эмбеддинга для товара {item_id}: {e}")
-                continue
-        elif isinstance(embedding_str, (list, np.ndarray)):
-            arr = np.array(embedding_str, dtype=np.float32)
-            if arr.size > 0:
-                embeddings_dict[item_id] = arr
-                valid_items.append(item_id)
-        elif hasattr(embedding_str, "__array__"):
-            # Для случаев, когда это уже тензор или array-like объект
-            try:
-                arr = np.array(embedding_str, dtype=np.float32)
-                if arr.size > 0:
-                    embeddings_dict[item_id] = arr
-                    valid_items.append(item_id)
-            except Exception as e:
-                print(f"Ошибка конвертации эмбеддинга для товара {item_id}: {e}")
+            elif isinstance(embedding_data, (list, np.ndarray)):
+                # Уже массив
+                embedding = np.array(embedding_data, dtype=np.float32)
+            else:
                 continue
 
-    print(f"Загружено эмбеддингов для {len(embeddings_dict)} товаров")
+            if embedding.size > 0:
+                embeddings_dict[item_id] = embedding
+                valid_count += 1
+
+        except Exception as e:
+            continue
+
+    print(f"Загружено эмбеддингов для {valid_count} товаров")
     return embeddings_dict
 
 
@@ -1681,7 +1675,7 @@ if __name__ == "__main__":
     TEST_SIZE = 0.2
 
     # Параметры масштабирования
-    SCALING_STAGE = "full"  # small, medium, large, full
+    SCALING_STAGE = "small"  # small, medium, large, full
 
     scaling_config = {
         "small": {"sample_users": 500, "sample_fraction": 0.1},
