@@ -11,6 +11,7 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import torch.sparse
 from dask.diagnostics import ProgressBar
 from implicit.als import AlternatingLeastSquares
@@ -231,7 +232,12 @@ def compute_global_popularity(train_orders_df):
 
 # -------------------- Обучение ALS --------------------
 def train_als(
-    batch_files, factors=64, iterations=100, dtype=np.float32, random_state=42
+    batch_files,
+    factors=64,
+    iterations=100,
+    dtype=np.float32,
+    random_state=42,
+    device="cuda",
 ):
     """
     batch_files: список parquet файлов с взаимодействиями (user_id, item_id, weight)
@@ -252,27 +258,41 @@ def train_als(
 
     print(f"Всего пользователей: {len(user_ids)}, товаров: {len(item_ids)}")
 
-    coo_batches = []
+    # Собираем данные для COO матрицы
+    rows, cols, values = [], [], []
 
     print("Формируем sparse матрицу по батчам...")
     for f in batch_files:
         df = pd.read_parquet(f)
         df["user_idx"] = df["user_id"].map(user_map).astype(np.int32)
         df["item_idx"] = df["item_id"].map(item_map).astype(np.int32)
-        coo = coo_matrix(
-            (df["weight"].astype(dtype), (df["user_idx"], df["item_idx"])),
-            shape=(len(user_ids), len(item_ids)),
-        )
-        coo_batches.append(coo)
 
-    sparse_interactions = vstack(coo_batches)
-    print(f"Общая COO матрица: {sparse_interactions.shape}")
+        rows.extend(df["user_idx"].values)
+        cols.extend(df["item_idx"].values)
+        values.extend(df["weight"].astype(dtype).values)
 
-    model = AlternatingLeastSquares(
-        factors=factors, iterations=iterations, random_state=random_state
+    # Создаем torch sparse tensor на GPU
+    rows_tensor = torch.tensor(rows, dtype=torch.long, device=device)
+    cols_tensor = torch.tensor(cols, dtype=torch.long, device=device)
+    values_tensor = torch.tensor(values, dtype=torch.float32, device=device)
+
+    sparse_tensor = torch.sparse_coo_tensor(
+        torch.stack([rows_tensor, cols_tensor]),
+        values_tensor,
+        size=(len(user_ids), len(item_ids)),
+        device=device,
     )
 
-    model.fit(sparse_interactions.T, show_progress=True)
+    # КРИТИЧЕСКИ ВАЖНО: coalesce tensor перед использованием
+    sparse_tensor = sparse_tensor.coalesce()
+
+    print(f"Общая COO матрица на GPU: {sparse_tensor.shape}")
+    print(f"Ненулевых элементов: {sparse_tensor._nnz()}")
+
+    # Обучаем ALS на GPU
+    model = TorchALS(len(user_ids), len(item_ids), factors, device=device)
+    model.fit(sparse_tensor, iterations=iterations)
+
     print("ALS обучение завершено")
     return model, user_map, item_map
 
@@ -885,6 +905,99 @@ def ndcg_at_k_grouped(predictions, targets, groups, k=100, device="cpu"):
     return float(torch.stack(ndcg_scores).mean().cpu())
 
 
+class TorchALS(nn.Module):
+    def __init__(
+        self, n_users, n_items, n_factors, reg=0.1, dtype=torch.float32, device="cuda"
+    ):
+        super().__init__()
+        self.user_factors = nn.Parameter(
+            torch.randn(n_users, n_factors, dtype=dtype, device=device) * 0.01
+        )
+        self.item_factors = nn.Parameter(
+            torch.randn(n_items, n_factors, dtype=dtype, device=device) * 0.01
+        )
+        self.reg = reg
+        self.device = device
+        self.to(device)
+
+    def forward(self, user, item):
+        return (self.user_factors[user] * self.item_factors[item]).sum(1)
+
+    def fit(
+        self,
+        sparse_tensor,
+        iterations=100,
+        lr=0.01,
+        show_progress=True,
+        sample_ratio=0.1,
+    ):
+        """Обучение ALS с семплированием для больших данных"""
+        optimizer = torch.optim.Adam(self.parameters(), lr=lr, weight_decay=self.reg)
+
+        if not sparse_tensor.is_coalesced():
+            sparse_tensor = sparse_tensor.coalesce()
+
+        users_coo, items_coo = sparse_tensor.indices()
+        values = sparse_tensor.values()
+        n_interactions = len(values)
+
+        for epoch in range(iterations):
+            # Семплируем часть взаимодействий
+            sample_size = int(n_interactions * sample_ratio)
+            sample_indices = torch.randint(
+                0, n_interactions, (sample_size,), device=self.device
+            )
+
+            optimizer.zero_grad()
+
+            batch_users = users_coo[sample_indices]
+            batch_items = items_coo[sample_indices]
+            batch_values = values[sample_indices]
+
+            pred = self.forward(batch_users, batch_items)
+            loss = F.mse_loss(pred, batch_values)
+
+            user_reg = (
+                self.reg
+                * self.user_factors[batch_users].pow(2).sum()
+                / sample_size
+                * n_interactions
+            )
+            item_reg = (
+                self.reg
+                * self.item_factors[batch_items].pow(2).sum()
+                / sample_size
+                * n_interactions
+            )
+            total_loss = loss + user_reg + item_reg
+
+            total_loss.backward()
+            optimizer.step()
+
+            if show_progress and (epoch % 10 == 0 or epoch == iterations - 1):
+                print(f"Iteration {epoch}, Loss: {total_loss.item():.6f}")
+
+    def recommend(self, user_ids, user_items=None, N=10, filter_already_liked=True):
+        """Рекомендации для пользователей"""
+        if isinstance(user_ids, int):
+            user_ids = [user_ids]
+
+        user_embeddings = self.user_factors[user_ids]  # (B, factors)
+        scores = torch.matmul(user_embeddings, self.item_factors.T)  # (B, n_items)
+
+        if filter_already_liked and user_items is not None:
+            # Маскируем уже просмотренные товары
+            scores[user_items[user_ids].to_dense() > 0] = -float("inf")
+
+        # Получаем топ-N товаров
+        top_scores, top_indices = torch.topk(scores, k=min(N, scores.size(1)), dim=1)
+
+        return [
+            (indices.cpu().numpy(), scores.cpu().numpy())
+            for indices, scores in zip(top_indices, top_scores)
+        ]
+
+
 class LightGBMRecommender:
     def __init__(self):
         self.model = None
@@ -972,7 +1085,7 @@ class LightGBMRecommender:
             available_negatives = list(all_items_set - user_interacted - user_positives)
 
             if available_negatives:
-                n_negatives = min(3, len(available_negatives))
+                n_negatives = min(5, len(available_negatives))
 
                 available_in_popularity = [
                     item
