@@ -171,7 +171,10 @@ class SubmissionGenerator:
                     (n_items, len(item_cols) + len(user_cols)), dtype=np.float32
                 )
                 combined_features[:, : len(item_cols)] = items_features_np
-                combined_features[:, len(item_cols) :] = user_features_batch[user_idx]
+                user_vector = user_features_batch[user_idx]  # вектор user-фич
+                combined_features[:, len(item_cols) :] = np.tile(
+                    user_vector, (n_items, 1)
+                )  # дублируем для всех item
 
                 scores = self.model.predict(combined_features, num_iteration=-1)
                 top_indices = np.argsort(-scores)[:top_k]

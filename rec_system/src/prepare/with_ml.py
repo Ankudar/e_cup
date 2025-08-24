@@ -4,6 +4,7 @@ import pickle
 import time
 from collections import defaultdict
 from datetime import timedelta
+from glob import glob
 from pathlib import Path
 
 import dask.dataframe as dd
@@ -30,14 +31,14 @@ tqdm.pandas()
 def load_train_data(max_parts=0, max_rows=1000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
-    Если колонка отсутствует в файле, пропускаем её.
+    Ищем рекурсивно по папкам все .parquet файлы.
     """
     paths = {
-        "orders": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_orders_data/*/*.parquet",
-        "tracker": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_tracker_data/*/*.parquet",
-        "items": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_items_data/*.parquet",
-        "categories": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train_final_categories_tree/*.parquet",
-        "test_users": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_test_for_participants/test_for_participants/*.parquet",
+        "orders": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_orders_data/",
+        "tracker": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_tracker_data/",
+        "items": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_items_data/",
+        "categories": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train_final_categories_tree/",
+        "test_users": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_test_for_participants/test_for_participants/",
     }
 
     columns_map = {
@@ -48,9 +49,21 @@ def load_train_data(max_parts=0, max_rows=1000):
         "test_users": ["user_id"],
     }
 
-    def read_sample(path, columns=None, name=""):
-        ddf = dd.read_parquet(path)
-        # оставляем только колонки, которые реально есть
+    def find_parquet_files(folder):
+        # Рекурсивно ищем все .parquet
+        return [f for f in glob(os.path.join(folder, "**/*.parquet"), recursive=True)]
+
+    def read_sample(
+        folder, columns=None, name="", max_parts=max_parts, max_rows=max_rows
+    ):
+        files = find_parquet_files(folder)
+        if not files:
+            print(f"{name}: parquet файлы не найдены в {folder}")
+            return dd.from_pandas(pd.DataFrame(), npartitions=1)
+
+        # читаем все файлы
+        ddf = dd.read_parquet(files)
+
         if columns is not None:
             available_cols = [c for c in columns if c in ddf.columns]
             if not available_cols:
@@ -61,16 +74,18 @@ def load_train_data(max_parts=0, max_rows=1000):
         total_parts = ddf.npartitions
         if max_parts > 0:
             used_parts = min(total_parts, max_parts)
-            ddf = ddf.partitions[:used_parts]
+            ddf = dd.concat([ddf.get_partition(i) for i in range(used_parts)])
         else:
             used_parts = total_parts
 
+        # Правильное ограничение max_rows:
         if max_rows > 0:
-            actual_rows = min(max_rows, len(ddf))
-            sample_df = ddf.head(actual_rows, compute=True)
-            ddf = dd.from_pandas(sample_df, npartitions=1)
+            df_all = ddf.head(
+                max_rows, compute=True
+            )  # читаем только первые max_rows строк
+            ddf = dd.from_pandas(df_all, npartitions=1)
 
-        count = ddf.shape[0].compute()
+        count = ddf.map_partitions(len).compute().sum()
         mem_bytes = (
             ddf.map_partitions(lambda df: df.memory_usage(deep=True).sum())
             .compute()
@@ -233,69 +248,39 @@ def compute_global_popularity(train_orders_df):
 
 # -------------------- Обучение ALS --------------------
 def train_als(
-    batch_files,
-    factors=64,
-    iterations=500,
-    dtype=np.float32,
-    random_state=42,
-    device="cuda",
+    interactions_files, n_factors=64, lr=0.01, reg=0.1, iterations=100, device="cuda"
 ):
     """
-    batch_files: список parquet файлов с взаимодействиями (user_id, item_id, weight)
-    Возвращает: model, user_map, item_map
+    Тренируем TorchALS с семплированием на GPU.
     """
-    print("Подсчитываем уникальные user_id и item_id по всем батчам...")
-    user_set, item_set = set(), set()
-    for f in batch_files:
-        df = pd.read_parquet(f)
-        user_set.update(df["user_id"].unique())
-        item_set.update(df["item_id"].unique())
+    # Чтение всех взаимодействий в один DataFrame
+    chunks = [
+        pd.read_parquet(f, columns=["user_id", "item_id", "weight"])
+        for f in interactions_files
+    ]
+    interactions_df = pd.concat(chunks, ignore_index=True)
 
-    user_ids = sorted(user_set)
-    item_ids = sorted(item_set)
+    user_ids = {uid: idx for idx, uid in enumerate(interactions_df["user_id"].unique())}
+    item_ids = {iid: idx for idx, iid in enumerate(interactions_df["item_id"].unique())}
 
-    user_map = {u: i for i, u in enumerate(user_ids)}
-    item_map = {i: j for j, i in enumerate(item_ids)}
+    n_users, n_items = len(user_ids), len(item_ids)
+    als = TorchALS(n_users, n_items, n_factors, reg=reg, device=device)
 
-    print(f"Всего пользователей: {len(user_ids)}, товаров: {len(item_ids)}")
-
-    # Собираем данные для COO матрицы
-    rows, cols, values = [], [], []
-
-    print("Формируем sparse матрицу по батчам...")
-    for f in batch_files:
-        df = pd.read_parquet(f)
-        df["user_idx"] = df["user_id"].map(user_map).astype(np.int32)
-        df["item_idx"] = df["item_id"].map(item_map).astype(np.int32)
-
-        rows.extend(df["user_idx"].values)
-        cols.extend(df["item_idx"].values)
-        values.extend(df["weight"].astype(dtype).values)
-
-    # Создаем torch sparse tensor на GPU
-    rows_tensor = torch.tensor(rows, dtype=torch.long, device=device)
-    cols_tensor = torch.tensor(cols, dtype=torch.long, device=device)
-    values_tensor = torch.tensor(values, dtype=torch.float32, device=device)
-
-    sparse_tensor = torch.sparse_coo_tensor(
-        torch.stack([rows_tensor, cols_tensor]),
-        values_tensor,
-        size=(len(user_ids), len(item_ids)),
-        device=device,
+    users = torch.tensor(interactions_df["user_id"].map(user_ids).values, device=device)
+    items = torch.tensor(interactions_df["item_id"].map(item_ids).values, device=device)
+    values = torch.tensor(
+        interactions_df["weight"].values, dtype=torch.float32, device=device
     )
 
-    # КРИТИЧЕСКИ ВАЖНО: coalesce tensor перед использованием
-    sparse_tensor = sparse_tensor.coalesce()
+    sparse_tensor = torch.sparse_coo_tensor(
+        indices=torch.vstack([users, items]),
+        values=values,
+        size=(n_users, n_items),
+        device=device,
+    ).coalesce()
 
-    print(f"Общая COO матрица на GPU: {sparse_tensor.shape}")
-    print(f"Ненулевых элементов: {sparse_tensor._nnz()}")
-
-    # Обучаем ALS на GPU
-    model = TorchALS(len(user_ids), len(item_ids), factors, device=device)
-    model.fit(sparse_tensor, iterations=iterations)
-
-    print("ALS обучение завершено")
-    return model, user_map, item_map
+    als.fit(sparse_tensor, iterations=iterations, lr=lr, sample_ratio=0.1)
+    return als, user_ids, item_ids
 
 
 # -------------------- User-Items CSR для recommend --------------------
@@ -1011,14 +996,24 @@ def ndcg_at_k_grouped(predictions, targets, groups, k=100, device="cpu"):
 
 class TorchALS(nn.Module):
     def __init__(
-        self, n_users, n_items, n_factors, reg=0.1, dtype=torch.float32, device="cuda"
+        self,
+        n_users,
+        n_items,
+        n_factors=64,
+        reg=1e-3,
+        dtype=torch.float32,
+        device="cuda",
     ):
         super().__init__()
         self.user_factors = nn.Parameter(
-            torch.randn(n_users, n_factors, dtype=dtype, device=device) * 0.01
+            nn.init.xavier_normal_(
+                torch.empty(n_users, n_factors, dtype=dtype, device=device)
+            )
         )
         self.item_factors = nn.Parameter(
-            torch.randn(n_items, n_factors, dtype=dtype, device=device) * 0.01
+            nn.init.xavier_normal_(
+                torch.empty(n_items, n_factors, dtype=dtype, device=device)
+            )
         )
         self.reg = reg
         self.device = device
@@ -1030,30 +1025,29 @@ class TorchALS(nn.Module):
     def fit(
         self,
         sparse_tensor,
-        iterations=100,
-        lr=0.01,
+        iterations=500,
+        lr=0.005,
         show_progress=True,
-        sample_ratio=0.1,
+        sample_ratio=0.5,
+        early_stop_patience=10,
     ):
-        """Обучение ALS с семплированием для больших данных"""
+        """Обучение ALS с семплированием и ранней остановкой"""
         optimizer = torch.optim.Adam(self.parameters(), lr=lr, weight_decay=self.reg)
-
         if not sparse_tensor.is_coalesced():
             sparse_tensor = sparse_tensor.coalesce()
-
         users_coo, items_coo = sparse_tensor.indices()
         values = sparse_tensor.values()
         n_interactions = len(values)
 
+        best_loss = float("inf")
+        patience_counter = 0
+
         for epoch in range(iterations):
-            # Семплируем часть взаимодействий
             sample_size = int(n_interactions * sample_ratio)
             sample_indices = torch.randint(
                 0, n_interactions, (sample_size,), device=self.device
             )
-
             optimizer.zero_grad()
-
             batch_users = users_coo[sample_indices]
             batch_items = items_coo[sample_indices]
             batch_values = values[sample_indices]
@@ -1078,28 +1072,18 @@ class TorchALS(nn.Module):
             total_loss.backward()
             optimizer.step()
 
-            if show_progress and (epoch % 100 == 0 or epoch == iterations - 1):
-                print(f"Iteration {epoch}, Loss: {total_loss.item():.6f}")
+            if show_progress and (epoch % 50 == 0 or epoch == iterations - 1):
+                print(f"Epoch {epoch}, Loss: {total_loss.item():.6f}")
 
-    def recommend(self, user_ids, user_items=None, N=10, filter_already_liked=True):
-        """Рекомендации для пользователей"""
-        if isinstance(user_ids, int):
-            user_ids = [user_ids]
-
-        user_embeddings = self.user_factors[user_ids]  # (B, factors)
-        scores = torch.matmul(user_embeddings, self.item_factors.T)  # (B, n_items)
-
-        if filter_already_liked and user_items is not None:
-            # Маскируем уже просмотренные товары
-            scores[user_items[user_ids].to_dense() > 0] = -float("inf")
-
-        # Получаем топ-N товаров
-        top_scores, top_indices = torch.topk(scores, k=min(N, scores.size(1)), dim=1)
-
-        return [
-            (indices.cpu().numpy(), scores.cpu().numpy())
-            for indices, scores in zip(top_indices, top_scores)
-        ]
+            # Ранняя остановка
+            if total_loss.item() < best_loss:
+                best_loss = total_loss.item()
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= early_stop_patience:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
 
 
 class LightGBMRecommender:
@@ -1143,27 +1127,23 @@ class LightGBMRecommender:
         recent_items_map,
         test_orders_df,
         sample_fraction=0.1,
-        negatives_per_positive=3,  # 3 негативных на 1 позитивный
+        negatives_per_positive=1,
     ):
         """
-        Ускоренная подготовка данных для LightGBM
+        Векторизованная подготовка данных для LightGBM с быстрым негативным сэмплированием.
         """
         print("Подготовка данных для LightGBM...")
 
         # 1. Ограничиваем данные
         test_orders_df = test_orders_df.sample(frac=sample_fraction, random_state=42)
 
-        # 2. Быстрая загрузка взаимодействий
+        # 2. Загрузка взаимодействий
         print("Быстрая загрузка взаимодействий...")
-        chunks = []
-        for f in tqdm(interactions_files, desc="Загрузка взаимодействий"):
-            # Читаем только нужные колонки
-            df = pd.read_parquet(
-                f, columns=["user_id", "item_id", "timestamp", "weight"]
-            )
-            chunks.append(df)
-
-        interactions_df = pd.concat(chunks, ignore_index=True)
+        interactions_chunks = [
+            pd.read_parquet(f, columns=["user_id", "item_id", "timestamp", "weight"])
+            for f in tqdm(interactions_files, desc="Загрузка взаимодействий")
+        ]
+        interactions_df = pd.concat(interactions_chunks, ignore_index=True)
         interactions_df["timestamp"] = pd.to_datetime(interactions_df["timestamp"])
         max_timestamp = interactions_df["timestamp"].max()
 
@@ -1171,75 +1151,74 @@ class LightGBMRecommender:
         positive_df = test_orders_df[["user_id", "item_id"]].copy()
         positive_df["target"] = 1
 
-        # 4. Подготовка данных для негативного сэмплирования
-        print("Подготовка к негативному сэмплированию...")
+        # 4. Построение словаря пользователь → просмотренные товары
+        print("Сбор истории взаимодействий...")
+        user_interacted_items = (
+            interactions_df.groupby("user_id")["item_id"].agg(set).to_dict()
+        )
+        user_positive_items = (
+            positive_df.groupby("user_id")["item_id"].agg(set).to_dict()
+        )
 
-        # Все уникальные товары
-        all_items = list(item_map.keys())
+        # 5. Подготовка множеств для быстрого сэмплирования
+        all_items = np.array(list(item_map.keys()))
+        popular_items = set(popularity_s.nlargest(10000).index.tolist())
 
-        # Взаимодействия по пользователям (быстрая версия)
-        user_interacted_items = {}
-        for f in tqdm(interactions_files, desc="Сбор истории взаимодействий"):
-            df_chunk = pd.read_parquet(f, columns=["user_id", "item_id"])
-            for user_id, group in df_chunk.groupby("user_id"):
-                if user_id not in user_interacted_items:
-                    user_interacted_items[user_id] = set()
-                user_interacted_items[user_id].update(group["item_id"].values)
-
-        # 5. Векторизованное негативное сэмплирование
         print("Векторизованное негативное сэмплирование...")
 
         negative_samples = []
 
-        # Группируем позитивные примеры по пользователям
-        user_positive_items = (
-            positive_df.groupby("user_id")["item_id"].apply(set).to_dict()
-        )
+        # Генерируем негативы по пользователям
+        for user_id, pos_items in tqdm(
+            user_positive_items.items(), desc="Негативные сэмплы"
+        ):
+            interacted = user_interacted_items.get(user_id, set())
+            excluded = pos_items | interacted
 
-        # Подготавливаем популярные товары для быстрого доступа
-        popular_items = popularity_s.nlargest(10000).index.tolist()
-        popular_set = set(popular_items)
+            available_mask = ~np.isin(all_items, list(excluded))
+            available_items = all_items[available_mask]
 
-        # Обрабатываем пользователей батчами
-        user_ids = list(user_positive_items.keys())
-        batch_size = 1000
+            if len(available_items) == 0:
+                continue
 
-        for i in tqdm(range(0, len(user_ids), batch_size), desc="Негативные сэмплы"):
-            batch_users = user_ids[i : i + batch_size]
-            batch_negatives = []
+            n_neg = negatives_per_positive
+            popular_mask = np.isin(available_items, list(popular_items))
+            popular_candidates = available_items[popular_mask]
+            random_candidates = available_items[~popular_mask]
 
-            for user_id in batch_users:
-                # Товары, которые пользователь уже видел/покупал
-                interacted = user_interacted_items.get(user_id, set())
-                positives = user_positive_items.get(user_id, set())
-                excluded = interacted | positives
+            sampled_items = []
 
-                # Доступные для сэмплирования товары
-                available = [item for item in popular_items if item not in excluded]
-
-                if available:
-                    # Берем N случайных популярных товаров
-                    n_samples = min(negatives_per_positive, len(available))
-                    sampled_items = np.random.choice(
-                        available, n_samples, replace=False
+            if len(popular_candidates) > 0:
+                sampled_items.extend(
+                    np.random.choice(
+                        popular_candidates,
+                        min(n_neg // 2, len(popular_candidates)),
+                        replace=False,
                     )
+                )
+            if len(random_candidates) > 0:
+                sampled_items.extend(
+                    np.random.choice(
+                        random_candidates,
+                        min(n_neg - len(sampled_items), len(random_candidates)),
+                        replace=False,
+                    )
+                )
 
-                    for item_id in sampled_items:
-                        batch_negatives.append(
-                            {"user_id": user_id, "item_id": item_id, "target": 0}
-                        )
-
-            negative_samples.extend(batch_negatives)
+            negative_samples.extend(
+                {"user_id": user_id, "item_id": item_id, "target": 0}
+                for item_id in sampled_items
+            )
 
         negative_df = pd.DataFrame(negative_samples)
 
-        # 6. Объединение
+        # 6. Объединение с позитивными
         train_data = pd.concat([positive_df, negative_df], ignore_index=True)
 
-        # 7. Перемешиваем данные
+        # 7. Перемешиваем
         train_data = train_data.sample(frac=1, random_state=42).reset_index(drop=True)
 
-        # 8. Богатые признаки
+        # 8. Добавление богатых признаков
         train_data = self._add_rich_features(
             train_data,
             interactions_df,
@@ -1696,34 +1675,29 @@ def load_and_process_embeddings(
 ):
     """
     Потоковая обработка эмбеддингов для больших таблиц.
-    Использует itertuples для быстрого обхода строк.
+    Возвращает словарь item_id -> np.array
     """
     print("Оптимизированная потоковая загрузка эмбеддингов...")
 
-    # Ограничение количества элементов, если max_items > 0
     if max_items > 0:
-        items_sample = items_ddf[["item_id", embedding_column]].head(max_items)
+        items_sample = items_ddf[["item_id", embedding_column]].head(
+            max_items, compute=True
+        )
     else:
-        items_sample = items_ddf[["item_id", embedding_column]]
+        items_sample = items_ddf[["item_id", embedding_column]].compute()
 
     embeddings_dict = {}
-    valid_count = 0
-
     for row in tqdm(
         items_sample.itertuples(index=False),
         total=len(items_sample),
         desc="Обработка эмбеддингов",
     ):
         item_id = row.item_id
-        embedding_data = getattr(row, embedding_column)
-
+        embedding_data = getattr(row, embedding_column, None)
         if embedding_data is None:
             continue
-
-        # Преобразуем в np.array
         try:
             if isinstance(embedding_data, str):
-                # "[0.1, 0.2, 0.3]"
                 embedding = np.fromstring(
                     embedding_data.strip("[]"), sep=",", dtype=np.float32
                 )
@@ -1733,14 +1707,12 @@ def load_and_process_embeddings(
                 embedding = embedding_data.astype(np.float32)
             else:
                 continue
-
             if embedding.size > 0:
                 embeddings_dict[item_id] = embedding
-                valid_count += 1
         except Exception:
             continue
 
-    print(f"Загружено эмбеддингов для {valid_count} товаров")
+    print(f"Загружено эмбеддингов для {len(embeddings_dict)} товаров")
     return embeddings_dict
 
 
@@ -1752,7 +1724,7 @@ if __name__ == "__main__":
     TEST_SIZE = 0.2
 
     # Параметры масштабирования
-    SCALING_STAGE = "small"  # small, medium, large, full
+    SCALING_STAGE = "full"  # small, medium, large, full
 
     scaling_config = {
         "small": {"sample_users": 500, "sample_fraction": 0.1},
@@ -1793,7 +1765,9 @@ if __name__ == "__main__":
     recent_items_map = build_recent_items_map_from_batches(batch_dir, recent_n=RECENT_N)
 
     print("=== ОБУЧЕНИЕ ALS ДЛЯ ПРИЗНАКОВ ===")
-    model, user_map, item_map = train_als(interactions_files)
+    model, user_map, item_map = train_als(
+        interactions_files, n_factors=64, reg=1e-3, device="cuda"
+    )
     popularity_s = compute_global_popularity(train_orders_df)
 
     print("=== ПОСТРОЕНИЕ ДОПОЛНИТЕЛЬНЫХ ДАННЫХ ===")
