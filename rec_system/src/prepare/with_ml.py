@@ -19,6 +19,7 @@ from scipy.sparse import coo_matrix, csr_matrix, vstack
 from sklearn.metrics import ndcg_score
 from sklearn.model_selection import train_test_split
 from torch import nn
+from tqdm import tqdm
 from tqdm.auto import tqdm
 
 # tqdm интеграция с pandas
@@ -26,7 +27,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=1000):
+def load_train_data(max_parts=0, max_rows=0):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Если колонка отсутствует в файле, пропускаем её.
@@ -1618,15 +1619,13 @@ class LightGBMRecommender:
 
 
 def load_and_process_embeddings(
-    items_ddf,
-    embedding_column="fclip_embed",
-    device="cuda",
-    max_items=50000,  # Ограничиваем количество
+    items_ddf, embedding_column="fclip_embed", device="cuda", max_items=50000
 ):
     """
-    Оптимизированная загрузка эмбеддингов
+    Потоковая обработка эмбеддингов для больших таблиц.
+    Использует itertuples для быстрого обхода строк.
     """
-    print("Оптимизированная загрузка эмбеддингов...")
+    print("Оптимизированная потоковая загрузка эмбеддингов...")
 
     # Берем только нужные колонки и ограничиваем количество
     items_sample = items_ddf[["item_id", embedding_column]].head(max_items)
@@ -1634,33 +1633,35 @@ def load_and_process_embeddings(
     embeddings_dict = {}
     valid_count = 0
 
-    for _, row in tqdm(
-        items_sample.iterrows(), desc="Обработка эмбеддингов", total=len(items_sample)
+    for row in tqdm(
+        items_sample.itertuples(index=False),
+        total=len(items_sample),
+        desc="Обработка эмбеддингов",
     ):
-        item_id = row["item_id"]
-        embedding_data = row[embedding_column]
+        item_id = row.item_id
+        embedding_data = getattr(row, embedding_column)
 
-        if pd.isna(embedding_data):
+        if embedding_data is None:
             continue
 
+        # Преобразуем в np.array
         try:
-            # Обработка разных форматов
             if isinstance(embedding_data, str):
-                # Из строки: "[0.1, 0.2, 0.3]"
+                # "[0.1, 0.2, 0.3]"
                 embedding = np.fromstring(
                     embedding_data.strip("[]"), sep=",", dtype=np.float32
                 )
-            elif isinstance(embedding_data, (list, np.ndarray)):
-                # Уже массив
+            elif isinstance(embedding_data, list):
                 embedding = np.array(embedding_data, dtype=np.float32)
+            elif isinstance(embedding_data, np.ndarray):
+                embedding = embedding_data.astype(np.float32)
             else:
                 continue
 
             if embedding.size > 0:
                 embeddings_dict[item_id] = embedding
                 valid_count += 1
-
-        except Exception as e:
+        except Exception:
             continue
 
     print(f"Загружено эмбеддингов для {valid_count} товаров")
@@ -1675,7 +1676,7 @@ if __name__ == "__main__":
     TEST_SIZE = 0.2
 
     # Параметры масштабирования
-    SCALING_STAGE = "small"  # small, medium, large, full
+    SCALING_STAGE = "full"  # small, medium, large, full
 
     scaling_config = {
         "small": {"sample_users": 500, "sample_fraction": 0.1},

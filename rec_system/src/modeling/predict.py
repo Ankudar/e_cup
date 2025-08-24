@@ -52,61 +52,58 @@ class SubmissionGenerator:
         print(f"Пользователей: {len(self.user_map)}, Товаров: {len(self.item_map)}")
 
     def _prepare_all_items_features(self):
-        """Подготовка фичей для всех товаров"""
+        """Подготовка фичей для всех товаров сразу на GPU (float16)"""
         print("Подготовка фичей для всех товаров...")
+        n_items = len(self.item_map)
+        feature_dict = {
+            col: np.zeros(n_items, dtype=np.float32) for col in self.feature_columns
+        }
+        item_ids = [self.inv_item_map[idx] for idx in range(n_items)]
 
-        features_data = []
+        # item_popularity
+        for idx, item_id in enumerate(item_ids):
+            feature_dict["item_popularity"][idx] = self.popularity_s.get(item_id, 0.0)
 
-        for item_idx in range(len(self.item_map)):
-            item_id = self.inv_item_map[item_idx]
-            feature_row = {}
+        # ALS эмбеддинги товаров
+        if self.item_embeddings is not None:
+            n_als = min(10, self.item_embeddings.shape[1])
+            for i in range(n_als):
+                col_name = f"item_als_{i}"
+                if col_name in self.feature_columns:
+                    feature_dict[col_name][:] = self.item_embeddings[:n_items, i]
 
-            # Базовые признаки товара
-            feature_row["item_popularity"] = self.popularity_s.get(item_id, 0.0)
+        # FCLIP эмбеддинги
+        n_fclip = 10
+        for i in range(n_fclip):
+            col_name = f"fclip_embed_{i}"
+            if col_name in self.feature_columns:
+                for idx, item_id in enumerate(item_ids):
+                    embed = self.embeddings_dict.get(item_id)
+                    if embed is not None and i < len(embed):
+                        feature_dict[col_name][idx] = embed[i]
 
-            # ALS эмбеддинги товаров
-            if (
-                self.item_embeddings is not None
-                and item_idx < self.item_embeddings.shape[0]
-            ):
-                for i in range(min(10, self.item_embeddings.shape[1])):
-                    feature_row[f"item_als_{i}"] = self.item_embeddings[item_idx, i]
-
-            # FCLIP эмбеддинги
-            if item_id in self.embeddings_dict:
-                embed = self.embeddings_dict[item_id]
-                for i in range(min(10, len(embed))):
-                    feature_row[f"fclip_embed_{i}"] = embed[i]
-
-            features_data.append(feature_row)
-
-        features_df = pd.DataFrame(features_data)
-
-        # Заполняем пропущенные колонки нулями
-        for col in self.feature_columns:
-            if col not in features_df.columns:
-                features_df[col] = 0.0
-
-        # Убедимся в правильном порядке колонок
+        features_df = pd.DataFrame(feature_dict, index=item_ids)
         features_df = features_df[self.feature_columns]
+        return torch.tensor(features_df.values.astype(np.float16), device=self.device)
 
-        return features_df.values.astype(np.float32)
+    def _prepare_user_features(self, user_ids):
+        """Векторная подготовка признаков пользователей для батча"""
+        n_features = len(self.feature_columns)
+        batch_features = np.zeros((len(user_ids), n_features), dtype=np.float32)
 
-    def _prepare_user_features(self, user_id):
-        """Подготовка фичей для пользователя"""
-        user_features = np.zeros(len(self.feature_columns), dtype=np.float32)
+        if self.user_embeddings is None:
+            return batch_features
 
-        if user_id in self.user_map and self.user_embeddings is not None:
-            user_idx = self.user_map[user_id]
-            if user_idx < self.user_embeddings.shape[0]:
-                # Заполняем user ALS эмбеддинги
-                for i in range(min(10, self.user_embeddings.shape[1])):
-                    col_name = f"user_als_{i}"
+        for i, user_id in enumerate(user_ids):
+            if user_id in self.user_map:
+                user_idx = self.user_map[user_id]
+                n_als = min(10, self.user_embeddings.shape[1])
+                for j in range(n_als):
+                    col_name = f"user_als_{j}"
                     if col_name in self.feature_columns:
                         col_idx = self.feature_columns.index(col_name)
-                        user_features[col_idx] = self.user_embeddings[user_idx, i]
-
-        return user_features
+                        batch_features[i, col_idx] = self.user_embeddings[user_idx, j]
+        return batch_features
 
     def _ensure_exactly_100_items(self, items_list, user_id=None):
         """Гарантирует, что в списке будет ровно 100 товаров"""
@@ -134,147 +131,93 @@ class SubmissionGenerator:
         return test_users_df
 
     def generate_recommendations_gpu(
-        self, test_users_df, output_path, top_k=100, batch_size=1000
+        self, test_users_df, output_path, top_k=100, batch_size=15000
     ):
-        """GPU-ускоренная генерация рекомендаций с полной логикой"""
+        """GPU-ускоренная генерация рекомендаций с уникальными топ-100 для каждого пользователя"""
         print("GPU-ускоренная генерация рекомендаций...")
-
-        n_items = len(self.item_map)
-        n_features = len(self.feature_columns)
+        n_items = self.all_items_features.shape[0]
+        n_features_item = self.all_items_features.shape[1]
         submission_data = []
 
-        # Переносим item features на GPU
-        items_features_tensor = torch.tensor(
-            self.all_items_features, device=self.device
-        )
+        items_features_tensor = self.all_items_features.float()  # float32 для LGBM
 
-        # Обрабатываем пользователей батчами
         for i in tqdm(
             range(0, len(test_users_df), batch_size), desc="Генерация рекомендаций"
         ):
             batch_users = test_users_df["user_id"].iloc[i : i + batch_size]
             batch_data = []
 
-            # Подготавливаем фичи для батча пользователей
             user_features_list = []
             valid_user_ids = []
 
+            # Подготавливаем user_features для каждого пользователя
             for user_id in batch_users:
-                try:
-                    user_features = self._prepare_user_features(user_id)
+                if user_id in self.user_map and self.user_embeddings is not None:
+                    user_features = self._prepare_user_features([user_id])[0]
                     user_features_list.append(user_features)
                     valid_user_ids.append(user_id)
-                except Exception as e:
-                    print(f"Ошибка подготовки фичей для {user_id}: {e}")
+                else:
+                    # Cold-start, добавляем None
+                    user_features_list.append(None)
                     valid_user_ids.append(user_id)
-                    continue
 
-            if not user_features_list:
-                # Fallback для всего батча
-                for user_id in batch_users:
-                    recommended_items = self.popular_items[:top_k]
+            # Прогон через модель
+            for idx, user_id in enumerate(valid_user_ids):
+                if user_features_list[idx] is None:
+                    # Cold-start → топ популярных
                     recommended_items = self._ensure_exactly_100_items(
-                        recommended_items
+                        self.popular_items[:top_k]
                     )
-
-                    batch_data.append(
-                        {
-                            "user_id": user_id,
-                            "item_id_1 item_id_2 ... item_id_100": " ".join(
-                                map(str, recommended_items)
-                            ),
-                        }
-                    )
-                continue
-
-            # Создаем батч пользовательских фичей
-            user_features_batch = np.array(user_features_list, dtype=np.float32)
-
-            try:
-                # Создаем комбинированные фичи: для каждого пользователя со всеми товарами
-                # [batch_size, n_items, n_features] = user_features + item_features
-                batch_predictions = []
-
-                # Обрабатываем под-батчи для экономии памяти
-                sub_batch_size = 100  # Количество пользователей за раз
-
-                for j in range(0, len(valid_user_ids), sub_batch_size):
-                    sub_batch_users = valid_user_ids[j : j + sub_batch_size]
-                    sub_batch_features = user_features_batch[j : j + sub_batch_size]
-
-                    # Расширяем user features для всех товаров
-                    user_features_expanded = torch.tensor(
-                        sub_batch_features[
-                            :, np.newaxis, :
-                        ],  # [sub_batch, 1, features]
+                else:
+                    user_features = torch.tensor(
+                        user_features_list[idx][None, :],
+                        dtype=torch.float32,
                         device=self.device,
-                    ).expand(
-                        -1, n_items, -1
-                    )  # [sub_batch, n_items, features]
-
-                    # Комбинируем с item features
+                    )
+                    # Конкатенация user + item фич
                     combined_features = (
-                        user_features_expanded + items_features_tensor.unsqueeze(0)
-                    )
-
-                    # Изменяем форму для предсказания
-                    combined_flat = (
-                        combined_features.reshape(-1, n_features).cpu().numpy()
-                    )
-
-                    # Предсказываем
-                    scores = self.model.predict(combined_flat)
-                    scores = scores.reshape(len(sub_batch_users), n_items)
-
-                    # Для каждого пользователя выбираем топ-K товаров
-                    for k, user_id in enumerate(sub_batch_users):
-                        user_scores = scores[k]
-                        top_indices = np.argsort(user_scores)[::-1][:top_k]
-                        recommended_items = [
-                            self.inv_item_map[idx] for idx in top_indices
-                        ]
-                        recommended_items = self._ensure_exactly_100_items(
-                            recommended_items
+                        torch.cat(
+                            [
+                                user_features.expand(
+                                    n_items, -1
+                                ),  # [n_items, user_features]
+                                items_features_tensor,  # [n_items, item_features]
+                            ],
+                            dim=1,
                         )
-
-                        batch_data.append(
-                            {
-                                "user_id": user_id,
-                                "item_id_1 item_id_2 ... item_id_100": " ".join(
-                                    map(str, recommended_items)
-                                ),
-                            }
-                        )
-
-            except Exception as e:
-                print(f"Ошибка предсказания: {e}")
-                # Fallback для ошибочного батча
-                for user_id in valid_user_ids:
-                    recommended_items = self.popular_items[:top_k]
+                        .cpu()
+                        .numpy()
+                    )
+                    scores = self.model.predict(combined_features)  # [n_items]
+                    top_indices = np.argpartition(-scores, top_k)[:top_k]
+                    top_indices_sorted = top_indices[np.argsort(-scores[top_indices])]
+                    recommended_items = [
+                        self.inv_item_map[idx] for idx in top_indices_sorted
+                    ]
                     recommended_items = self._ensure_exactly_100_items(
                         recommended_items
                     )
 
-                    batch_data.append(
-                        {
-                            "user_id": user_id,
-                            "item_id_1 item_id_2 ... item_id_100": " ".join(
-                                map(str, recommended_items)
-                            ),
-                        }
-                    )
+                batch_data.append(
+                    {
+                        "user_id": user_id,
+                        "item_id_1 item_id_2 ... item_id_100": " ".join(
+                            map(str, recommended_items)
+                        ),
+                    }
+                )
 
-            # Сохраняем батч
             submission_data.extend(batch_data)
+
+            # Сохраняем каждые 10k пользователей
             if len(submission_data) >= 10000:
                 self._save_submission_batch(submission_data, output_path)
                 submission_data = []
 
-            # Очищаем память GPU
             if self.use_gpu:
                 torch.cuda.empty_cache()
 
-        # Сохраняем остаток
+        # Финальный save
         if submission_data:
             self._save_submission_batch(submission_data, output_path)
 
@@ -306,7 +249,7 @@ if __name__ == "__main__":
             test_users_df=test_users_df,
             output_path=OUTPUT_PATH,
             top_k=100,
-            batch_size=500,  # Меньший батч для стабильности
+            batch_size=20,  # Меньший батч для стабильности
         )
 
     except Exception as e:
