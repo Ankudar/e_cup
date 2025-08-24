@@ -234,7 +234,7 @@ def compute_global_popularity(train_orders_df):
 def train_als(
     batch_files,
     factors=64,
-    iterations=100,
+    iterations=500,
     dtype=np.float32,
     random_state=42,
     device="cuda",
@@ -339,54 +339,123 @@ def build_user_items_csr(
     return sparse_tensor
 
 
-def build_copurchase_map(train_orders_df, min_co_items=2, top_n=10, device="cuda"):
+def build_copurchase_map(
+    train_orders_df, min_co_items=2, top_n=10, device="cuda", max_items=50000
+):
     """
-    Быстрая версия: строим словарь совместных покупок на GPU.
+    Экономная версия: строим словарь совместных покупок для топ-N товаров
     """
-    print("Строим co-purchase матрицу на GPU...")
+    print("Строим co-purchase матрицу для топ-N товаров...")
 
-    # Группируем по (user_id, timestamp) и оставляем только корзины с min_co_items
-    baskets = (
-        train_orders_df.groupby(["user_id", "created_timestamp"])["item_id"]
-        .apply(list)
-        .tolist()
-    )
-    baskets = [b for b in baskets if len(b) >= min_co_items]
+    # 1. Находим топ-10000 популярных товаров
+    item_popularity = train_orders_df["item_id"].value_counts()
+    top_items = item_popularity.head(max_items).index.tolist()
+    popular_items_set = set(top_items)
 
-    # Словарь {item_id -> index} для построения матрицы
-    unique_items = train_orders_df["item_id"].unique()
-    item2idx = {it: i for i, it in enumerate(unique_items)}
+    print(f"Топ-{len(top_items)} популярных товаров определены")
+
+    # 2. Группируем корзины и фильтруем только популярные товары
+    baskets = []
+    for items in train_orders_df.groupby(["user_id", "created_timestamp"])[
+        "item_id"
+    ].apply(list):
+        # Фильтруем только популярные товары
+        filtered_items = [item for item in items if item in popular_items_set]
+        if len(filtered_items) >= min_co_items:
+            baskets.append(filtered_items)
+
+    if not baskets:
+        print("Нет корзин с популярными товарами")
+        return {}
+
+    print(f"Обрабатываем {len(baskets)} корзин с популярными товарами")
+
+    # 3. Словарь {item_id -> index} только для популярных товаров
+    item2idx = {it: i for i, it in enumerate(top_items)}
     idx2item = {i: it for it, i in item2idx.items()}
-    n_items = len(unique_items)
+    n_items = len(top_items)
 
-    # Sparse co-occurrence матрица
-    co_matrix = torch.zeros((n_items, n_items), dtype=torch.float32, device=device)
+    print(f"Уникальных популярных товаров: {n_items}")
 
-    for items in baskets:
-        idxs = torch.tensor([item2idx[it] for it in items], device=device)
-        # Строим матрицу смежности корзины (ones)
-        mask = torch.ones((len(idxs), len(idxs)), device=device)
-        mask.fill_diagonal_(0.0)  # не считаем item→item
-        weight = 1.0 / len(items)
-        co_matrix[idxs.unsqueeze(1), idxs.unsqueeze(0)] += mask * weight
+    # 4. Вместо плотной матрицы используем sparse coo format
+    rows, cols, values = [], [], []
 
-    # Нормализация построчно
-    row_sums = co_matrix.sum(dim=1, keepdim=True).clamp(min=1e-9)
-    norm_matrix = co_matrix / row_sums
+    for items in tqdm(baskets, desc="Обработка корзин"):
+        if len(items) < min_co_items:
+            continue
 
-    # Формируем финальный словарь топ-N для каждого item
+        # Получаем индексы товаров в корзине
+        idxs = [item2idx[it] for it in items if it in item2idx]
+        if len(idxs) < 2:
+            continue
+
+        weight = 1.0 / len(idxs)
+
+        # Добавляем все пары товаров в корзине
+        for i in range(len(idxs)):
+            for j in range(len(idxs)):
+                if i != j:  # исключаем диагональ
+                    rows.append(idxs[i])
+                    cols.append(idxs[j])
+                    values.append(weight)
+
+    # 5. Создаем sparse матрицу на GPU
+    if not rows:
+        print("Нет данных для построения матрицы")
+        return {}
+
+    print(f"Создаем sparse матрицу из {len(rows)} взаимодействий...")
+
+    rows_tensor = torch.tensor(rows, dtype=torch.long, device=device)
+    cols_tensor = torch.tensor(cols, dtype=torch.long, device=device)
+    values_tensor = torch.tensor(values, dtype=torch.float32, device=device)
+
+    co_matrix = torch.sparse_coo_tensor(
+        torch.stack([rows_tensor, cols_tensor]),
+        values_tensor,
+        size=(n_items, n_items),
+        device=device,
+    ).coalesce()  # объединяем дубликаты
+
+    print(
+        f"Sparse матрица построена: {co_matrix.shape}, ненулевых элементов: {co_matrix._nnz()}"
+    )
+
+    # 6. Нормализация построчно
+    row_sums = torch.sparse.sum(co_matrix, dim=1).to_dense().clamp(min=1e-9)
+
+    # 7. Формируем финальный словарь топ-N для каждого item
     final_copurchase = {}
-    for i in range(n_items):
-        row = norm_matrix[i]
-        if row.sum() > 0:
-            topk_vals, topk_idx = torch.topk(row, k=min(top_n, n_items))
-            final_copurchase[idx2item[i]] = [
-                (idx2item[j.item()], v.item())
-                for j, v in zip(topk_idx, topk_vals)
-                if v.item() > 0
-            ]
+    indices = co_matrix.indices()
+    values = co_matrix.values()
+
+    print("Формируем рекомендации...")
+    for i in tqdm(range(n_items), desc="Обработка товаров"):
+        # Находим все элементы в i-й строке
+        mask = indices[0] == i
+        if mask.any():
+            col_indices = indices[1][mask]
+            row_values = values[mask] / row_sums[i]  # нормализуем
+
+            # Берем топ-N
+            if len(row_values) > 0:
+                topk_vals, topk_idx = torch.topk(
+                    row_values, k=min(top_n, len(row_values))
+                )
+                final_copurchase[idx2item[i]] = [
+                    (idx2item[col_indices[j].item()], topk_vals[j].item())
+                    for j in range(len(topk_vals))
+                    if topk_vals[j].item() > 0
+                ]
 
     print(f"Co-purchase словарь построен для {len(final_copurchase)} товаров")
+
+    # 8. Статистика
+    avg_recommendations = sum(len(v) for v in final_copurchase.values()) / max(
+        1, len(final_copurchase)
+    )
+    print(f"В среднем {avg_recommendations:.1f} рекомендаций на товар")
+
     return final_copurchase
 
 
@@ -1005,7 +1074,7 @@ class TorchALS(nn.Module):
             total_loss.backward()
             optimizer.step()
 
-            if show_progress and (epoch % 10 == 0 or epoch == iterations - 1):
+            if show_progress and (epoch % 100 == 0 or epoch == iterations - 1):
                 print(f"Iteration {epoch}, Loss: {total_loss.item():.6f}")
 
     def recommend(self, user_ids, user_items=None, N=10, filter_already_liked=True):
@@ -1070,97 +1139,99 @@ class LightGBMRecommender:
         recent_items_map,
         test_orders_df,
         sample_fraction=0.1,
+        negatives_per_positive=3,  # 3 негативных на 1 позитивный
     ):
         """
-        Подготовка данных для LightGBM с ограничением негативных примеров (≤3 на пользователя)
+        Ускоренная подготовка данных для LightGBM
         """
         print("Подготовка данных для LightGBM...")
 
-        # Ограничиваем данные
+        # 1. Ограничиваем данные
         test_orders_df = test_orders_df.sample(frac=sample_fraction, random_state=42)
 
-        # Загружаем все взаимодействия
-        print("Загрузка всех взаимодействий для признаков...")
-        all_interactions = []
+        # 2. Быстрая загрузка взаимодействий
+        print("Быстрая загрузка взаимодействий...")
+        chunks = []
         for f in tqdm(interactions_files, desc="Загрузка взаимодействий"):
-            df = pd.read_parquet(f)
-            all_interactions.append(df)
-        interactions_df = pd.concat(all_interactions, ignore_index=True)
+            # Читаем только нужные колонки
+            df = pd.read_parquet(
+                f, columns=["user_id", "item_id", "timestamp", "weight"]
+            )
+            chunks.append(df)
 
-        # Временные метки
+        interactions_df = pd.concat(chunks, ignore_index=True)
         interactions_df["timestamp"] = pd.to_datetime(interactions_df["timestamp"])
         max_timestamp = interactions_df["timestamp"].max()
 
-        # Позитивные пары
-        positive_samples = [
-            {"user_id": row["user_id"], "item_id": row["item_id"], "target": 1}
-            for _, row in tqdm(test_orders_df.iterrows(), desc="Позитивные примеры")
-        ]
-        positive_df = pd.DataFrame(positive_samples)
+        # 3. Позитивные примеры
+        positive_df = test_orders_df[["user_id", "item_id"]].copy()
+        positive_df["target"] = 1
 
-        # Негативные примеры
-        print("Улучшенное негативное сэмплирование...")
+        # 4. Подготовка данных для негативного сэмплирования
+        print("Подготовка к негативному сэмплированию...")
+
+        # Все уникальные товары
+        all_items = list(item_map.keys())
+
+        # Взаимодействия по пользователям (быстрая версия)
+        user_interacted_items = (
+            interactions_df.groupby("user_id")["item_id"].apply(set).to_dict()
+        )
+
+        # 5. Векторизованное негативное сэмплирование
+        print("Векторизованное негативное сэмплирование...")
+
         negative_samples = []
 
-        user_items = interactions_df.groupby("user_id")["item_id"].apply(set).to_dict()
-        all_items_set = set(item_map.keys())
-        popularity_series = popularity_s.copy()
+        # Группируем позитивные примеры по пользователям
+        user_positive_items = (
+            positive_df.groupby("user_id")["item_id"].apply(set).to_dict()
+        )
 
-        for user_id in tqdm(positive_df["user_id"].unique(), desc="Негативные сэмплы"):
-            user_positives = set(
-                positive_df[positive_df["user_id"] == user_id]["item_id"]
-            )
-            user_interacted = user_items.get(user_id, set())
+        # Подготавливаем популярные товары для быстрого доступа
+        popular_items = popularity_s.nlargest(10000).index.tolist()
+        popular_set = set(popular_items)
 
-            # Доступные негативы
-            available_negatives = list(all_items_set - user_interacted - user_positives)
+        # Обрабатываем пользователей батчами
+        user_ids = list(user_positive_items.keys())
+        batch_size = 1000
 
-            if available_negatives:
-                n_negatives = min(5, len(available_negatives))
+        for i in tqdm(range(0, len(user_ids), batch_size), desc="Негативные сэмплы"):
+            batch_users = user_ids[i : i + batch_size]
+            batch_negatives = []
 
-                available_in_popularity = [
-                    item
-                    for item in available_negatives
-                    if item in popularity_series.index
-                ]
+            for user_id in batch_users:
+                # Товары, которые пользователь уже видел/покупал
+                interacted = user_interacted_items.get(user_id, set())
+                positives = user_positive_items.get(user_id, set())
+                excluded = interacted | positives
 
-                if available_in_popularity:
-                    popular_negatives = (
-                        popularity_series[available_in_popularity]
-                        .nlargest(min(n_negatives, len(available_in_popularity)))
-                        .index.tolist()
+                # Доступные для сэмплирования товары
+                available = [item for item in popular_items if item not in excluded]
+
+                if available:
+                    # Берем N случайных популярных товаров
+                    n_samples = min(negatives_per_positive, len(available))
+                    sampled_items = np.random.choice(
+                        available, n_samples, replace=False
                     )
-                else:
-                    popular_negatives = []
 
-                remaining_negatives = list(
-                    set(available_negatives) - set(popular_negatives)
-                )
-                if remaining_negatives:
-                    random_negatives = np.random.choice(
-                        remaining_negatives,
-                        min(
-                            n_negatives - len(popular_negatives),
-                            len(remaining_negatives),
-                        ),
-                        replace=False,
-                    ).tolist()
-                else:
-                    random_negatives = []
+                    for item_id in sampled_items:
+                        batch_negatives.append(
+                            {"user_id": user_id, "item_id": item_id, "target": 0}
+                        )
 
-                negative_items = popular_negatives + random_negatives
-
-                for item_id in negative_items:
-                    negative_samples.append(
-                        {"user_id": user_id, "item_id": item_id, "target": 0}
-                    )
+            negative_samples.extend(batch_negatives)
 
         negative_df = pd.DataFrame(negative_samples)
 
-        # Объединение
+        # 6. Объединение
         train_data = pd.concat([positive_df, negative_df], ignore_index=True)
 
-        # Богатые признаки
+        # 7. Перемешиваем данные
+        train_data = train_data.sample(frac=1, random_state=42).reset_index(drop=True)
+
+        # 8. Богатые признаки
         train_data = self._add_rich_features(
             train_data,
             interactions_df,
@@ -1171,6 +1242,7 @@ class LightGBMRecommender:
             max_timestamp,
         )
 
+        print(f"Данные подготовлены: {len(train_data)} примеров")
         return train_data
 
     def _add_rich_features(
