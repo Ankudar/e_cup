@@ -41,7 +41,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=1_000_000_000):
+def load_train_data(max_parts=0, max_rows=500_000_000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. При max_rows берём первые строки
@@ -186,31 +186,23 @@ def filter_data(orders_ddf, tracker_ddf, items_ddf):
 # -------------------- Train/Test split по времени --------------------
 def train_test_split_by_time(orders_df, test_size=0.2):
     """
-    Temporal split на train/test для каждого пользователя без Python loop.
+    Деление по глобальной дате: train = первые (1 - test_size) по времени,
+    test = последние test_size по времени.
     """
-    print("Делаем train/test split...")
     orders_df = orders_df.copy()
     orders_df["created_timestamp"] = pd.to_datetime(orders_df["created_timestamp"])
-    orders_df = orders_df.sort_values(["user_id", "created_timestamp"])
+    orders_df = orders_df.sort_values("created_timestamp")
 
-    user_counts = orders_df.groupby("user_id")["item_id"].transform("count")
-    test_counts = (user_counts * test_size).astype(int).clip(lower=1)
+    cutoff_idx = int(len(orders_df) * (1 - test_size))
+    cutoff_ts = orders_df.iloc[cutoff_idx]["created_timestamp"]
 
-    orders_df["cumcount"] = orders_df.groupby("user_id").cumcount()
-    max_cum = orders_df.groupby("user_id")["cumcount"].transform("max")
+    train_df = orders_df[orders_df["created_timestamp"] <= cutoff_ts]
+    test_df = orders_df[orders_df["created_timestamp"] > cutoff_ts]
 
-    mask_test = orders_df["cumcount"] >= (max_cum + 1 - test_counts)
-
-    train_df = orders_df.loc[~mask_test].drop(columns="cumcount")
-    test_df = orders_df.loc[mask_test].drop(columns="cumcount")
-
-    cutoff_ts_per_user = test_df.groupby("user_id")["created_timestamp"].min().to_dict()
-
-    print("Split завершён")
     return (
         train_df.reset_index(drop=True),
         test_df.reset_index(drop=True),
-        cutoff_ts_per_user,
+        cutoff_ts,
     )
 
 
@@ -256,15 +248,16 @@ def prepare_interactions(
     print("... для tracker")
     tracker_ddf = tracker_ddf[["user_id", "item_id", "timestamp", "action_type"]]
 
-    # ИСПРАВЛЕННЫЙ БЛОК: Итерируемся по партициям Dask DataFrame, а не по строкам.
+    # Итерируемся по партициям Dask DataFrame
     n_partitions = tracker_ddf.npartitions
     for partition_id in range(n_partitions):
         # Вычисляем одну партицию
         part = tracker_ddf.get_partition(partition_id).compute()
         part["timestamp"] = pd.to_datetime(part["timestamp"])
-        part["cutoff"] = part["user_id"].map(cutoff_ts_per_user)
 
-        mask = part["cutoff"].isna() | (part["timestamp"] < part["cutoff"])
+        # cutoff_ts_per_user здесь один глобальный timestamp
+        cutoff_ts = cutoff_ts_per_user
+        mask = part["timestamp"] < cutoff_ts
         part = part.loc[mask]
 
         if part.empty:
@@ -289,28 +282,44 @@ def prepare_interactions(
 
 
 # -------------------- Глобальная популярность --------------------
-def compute_global_popularity(orders_df, cutoff_ts_per_user):
+def compute_global_popularity(orders_df, cutoff_ts_info):
     """
     Считает популярность товаров на основе ТОЛЬКО тренировочных заказов.
 
     Args:
         orders_df: Все заказы (до split)
-        cutoff_ts_per_user: Словарь с cutoff-временем для каждого пользователя
+        cutoff_ts_info: либо словарь {user_id: cutoff_ts}, либо один глобальный pd.Timestamp
     """
     print("Считаем глобальную популярность на основе тренировочных данных...")
 
-    # Фильтруем заказы: оставляем только те, что ДО cutoff времени для каждого пользователя
-    train_orders = []
-    for user_id, cutoff_ts in cutoff_ts_per_user.items():
-        user_orders = orders_df[
-            (orders_df["user_id"] == user_id)
-            & (orders_df["created_timestamp"] < cutoff_ts)
-        ]
-        train_orders.append(user_orders)
+    orders_df = orders_df.copy()
+    orders_df["created_timestamp"] = pd.to_datetime(orders_df["created_timestamp"])
 
-    train_orders_df = pd.concat(train_orders, ignore_index=True)
+    if isinstance(cutoff_ts_info, dict):
+        # По каждому пользователю свой cutoff
+        train_orders = []
+        for user_id, cutoff_ts in cutoff_ts_info.items():
+            user_orders = orders_df[
+                (orders_df["user_id"] == user_id)
+                & (orders_df["created_timestamp"] < cutoff_ts)
+            ]
+            train_orders.append(user_orders)
+        train_orders_df = (
+            pd.concat(train_orders, ignore_index=True)
+            if train_orders
+            else pd.DataFrame(columns=orders_df.columns)
+        )
+
+    else:
+        # Глобальный cutoff (одна дата для всех)
+        cutoff_ts = cutoff_ts_info
+        train_orders_df = orders_df[orders_df["created_timestamp"] < cutoff_ts]
 
     # Считаем популярность только на тренировочных данных
+    if train_orders_df.empty:
+        print("Нет тренировочных заказов для расчёта популярности.")
+        return pd.Series(dtype=float)
+
     pop = (
         train_orders_df.groupby("item_id")["item_id"]
         .count()
@@ -2083,7 +2092,9 @@ if __name__ == "__main__":
             interactions_files, n_factors=64, reg=1e-3, device="cuda"
         )
         inv_item_map = {v: k for k, v in item_map.items()}
-        popularity_s = compute_global_popularity(orders_df_full, cutoff_ts_per_user)
+        popularity_s = compute_global_popularity(
+            orders_df_full, cutoff_ts_per_user
+        )  # теперь это pd.Timestamp
         popular_items = popularity_s.index.tolist()
         stage_time = time.time() - stage_start
         log_message(f"Обучение ALS завершено за {timedelta(seconds=stage_time)}")
