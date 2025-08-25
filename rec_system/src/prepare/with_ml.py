@@ -50,7 +50,7 @@ def safe_memory_cleanup():
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=0):
+def load_train_data(max_parts=0, max_rows=1000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. При max_rows берём первые строки
@@ -1640,108 +1640,138 @@ def build_user_item_features_dict(
     interactions_files,
     tmp_dir="/home/root6/python/e_cup/rec_system/data/processed/ui_stats",
     cleanup=True,
+    batch_size=100_000,  # используем как лимит размера словаря в памяти
 ):
     """
-    Потоковая агрегация (Polars Lazy) -> запись на диск -> построчное чтение row-group (PyArrow)
+    Полностью потоковая обработка без загрузки всего в память.
+    - агрегируем по каждому parquet в lazy и пишем чанки на диск
+    - объединяем чанки lazy'ем и пишем финальный parquet
+    - читаем финальный parquet по row-group'ам и собираем dict
+    - при достижении лимита batch_size сохраняем частичный dict в tmp_dir и прерываемся
     """
-    # отдельная временная папка под этот запуск
-    run_dir = os.path.join(tmp_dir, f"ui_{uuid.uuid4().hex}")
-    os.makedirs(run_dir, exist_ok=True)
-    chunks_dir = os.path.join(run_dir, "chunks")
-    os.makedirs(chunks_dir, exist_ok=True)
+    os.makedirs(tmp_dir, exist_ok=True)
 
-    print("Построение словаря пользователь-товарных признаков...")
+    # временная рабочая директория для промежуточных агрегатов
+    temp_dir = tempfile.mkdtemp(prefix="ui_features_")
+    print(f"Временная директория: {temp_dir}")
 
-    # 1) Агрегация по каждому файлу и сохранение на диск
-    for i, f in enumerate(tqdm(interactions_files, desc="Обработка взаимодействий")):
-        lf = pl.scan_parquet(f)
-        # агрегируем на лету
-        chunk_lf = lf.group_by(["user_id", "item_id"]).agg(
-            [
-                pl.col("weight").count().alias("ui_count"),
-                pl.col("weight").sum().alias("ui_sum"),
-                pl.col("weight").max().alias("ui_max"),
-                pl.col("weight").min().alias("ui_min"),
-                pl.col("timestamp").max().alias("ui_last_ts"),
-                pl.col("timestamp").min().alias("ui_first_ts"),
-            ]
-        )
-        chunk_path = os.path.join(chunks_dir, f"chunk_{i:05d}.parquet")
-        # ВАЖНО: sink_parquet — выполняет план без materialize в RAM
-        chunk_lf.sink_parquet(chunk_path)
+    # лимит словаря в памяти (при достижении — сохраняем и прерываемся)
+    MAX_DICT_SIZE = batch_size if batch_size and batch_size > 0 else 5_000_000
 
-    # 2) Финальная агрегация поверх всех чанков, снова на лету -> файл
-    chunks_glob = os.path.join(chunks_dir, "*.parquet")
-    all_lf = pl.scan_parquet(chunks_glob)
+    try:
+        print("Построение словаря пользователь-товарных признаков...")
 
-    final_lf = all_lf.group_by(["user_id", "item_id"]).agg(
-        [
-            pl.col("ui_count").sum().alias("ui_count"),
-            pl.col("ui_sum").sum().alias("ui_sum"),
-            pl.col("ui_max").max().alias("ui_max"),
-            pl.col("ui_min").min().alias("ui_min"),
-            pl.col("ui_last_ts").max().alias("ui_last_ts"),
-            pl.col("ui_first_ts").min().alias("ui_first_ts"),
-        ]
-    )
-
-    final_path = os.path.join(run_dir, "ui_agg.parquet")
-    final_lf.sink_parquet(final_path)
-
-    # 3) Читаем итоговый parquet по row-group, дозаполняем производные и собираем dict
-    user_item_stats_dict = {}
-    now = datetime.now()
-    pf = pq.ParquetFile(final_path)
-
-    for rg in range(pf.num_row_groups):
-        tbl = pf.read_row_group(rg)
-        df = pl.from_arrow(tbl)
-
-        # гарантируем типы времени
-        if df["ui_last_ts"].dtype != pl.Datetime:
-            df = df.with_columns(pl.col("ui_last_ts").cast(pl.Datetime))
-        if df["ui_first_ts"].dtype != pl.Datetime:
-            df = df.with_columns(pl.col("ui_first_ts").cast(pl.Datetime))
-
-        # производные — считаем в этом батче
-        df = (
-            df.with_columns(
+        # 1) Агрегация по каждому файлу (lazy → sink_parquet)
+        chunk_files = []
+        for i, f in enumerate(
+            tqdm(interactions_files, desc="Обработка взаимодействий")
+        ):
+            lf = pl.scan_parquet(f)
+            agg_lf = lf.group_by(["user_id", "item_id"]).agg(
                 [
-                    (pl.col("ui_sum") / pl.col("ui_count")).alias("ui_mean"),
-                    (pl.lit(now, dtype=pl.Datetime) - pl.col("ui_last_ts"))
-                    .dt.total_days()
-                    .alias("ui_days_since_last"),
-                    (pl.lit(now, dtype=pl.Datetime) - pl.col("ui_first_ts"))
-                    .dt.total_days()
-                    .alias("ui_days_since_first"),
+                    pl.col("weight").count().alias("ui_count"),
+                    pl.col("weight").sum().alias("ui_sum"),
+                    pl.col("weight").max().alias("ui_max"),
+                    pl.col("weight").min().alias("ui_min"),
+                    pl.col("timestamp").max().alias("ui_last_ts"),
+                    pl.col("timestamp").min().alias("ui_first_ts"),
                 ]
             )
-            .fill_nan(0)
-            .fill_null(0)
+            chunk_path = os.path.join(temp_dir, f"chunk_{i:04d}.parquet")
+            agg_lf.sink_parquet(chunk_path)
+            chunk_files.append(chunk_path)
+
+        if not chunk_files:
+            print("Нет входных данных для агрегации.")
+            return {}
+
+        # 2) Финальная агрегация всех чанков (lazy → sink_parquet)
+        all_lf = pl.scan_parquet(os.path.join(temp_dir, "chunk_*.parquet"))
+        final_lf = all_lf.group_by(["user_id", "item_id"]).agg(
+            [
+                pl.col("ui_count").sum().alias("ui_count"),
+                pl.col("ui_sum").sum().alias("ui_sum"),
+                pl.col("ui_max").max().alias("ui_max"),
+                pl.col("ui_min").min().alias("ui_min"),
+                pl.col("ui_last_ts").max().alias("ui_last_ts"),
+                pl.col("ui_first_ts").min().alias("ui_first_ts"),
+            ]
         )
+        final_path = os.path.join(temp_dir, "final_aggregated.parquet")
+        final_lf.sink_parquet(final_path)
 
-        for row in df.iter_rows(named=True):
-            key = (row["user_id"], row["item_id"])
-            user_item_stats_dict[key] = {
-                "ui_count": int(row["ui_count"]),
-                "ui_mean": float(row["ui_mean"]),
-                "ui_sum": float(row["ui_sum"]),
-                "ui_max": float(row["ui_max"]),
-                "ui_min": float(row["ui_min"]),
-                "ui_last_ts": row["ui_last_ts"],
-                "ui_first_ts": row["ui_first_ts"],
-                "ui_days_since_last": float(row["ui_days_since_last"]),
-                "ui_days_since_first": float(row["ui_days_since_first"]),
-            }
+        # 3) По-row-group'овое чтение и формирование словаря
+        user_item_stats_dict = {}
+        now = datetime.now()
+        pf = pq.ParquetFile(final_path)
 
-    print(
-        f"Словарь пользователь-товарных признаков построен. Записей: {len(user_item_stats_dict)}"
-    )
+        for rg_idx in tqdm(range(pf.num_row_groups), desc="Построение словаря"):
+            table = pf.read_row_group(rg_idx)
+            df = pl.from_arrow(table)
 
-    if cleanup:
-        shutil.rmtree(run_dir, ignore_errors=True)
+            df = df.with_columns(
+                [
+                    (pl.col("ui_sum") / pl.col("ui_count"))
+                    .fill_nan(0)
+                    .alias("ui_mean"),
+                    ((pl.lit(now) - pl.col("ui_last_ts")).dt.total_days()).alias(
+                        "ui_days_since_last"
+                    ),
+                    ((pl.lit(now) - pl.col("ui_first_ts")).dt.total_days()).alias(
+                        "ui_days_since_first"
+                    ),
+                ]
+            ).fill_null(0)
 
-    return user_item_stats_dict
+            for row in df.iter_rows(named=True):
+                key = (row["user_id"], row["item_id"])
+                user_item_stats_dict[key] = {
+                    "ui_count": int(row["ui_count"]),
+                    "ui_mean": float(row["ui_mean"]),
+                    "ui_sum": float(row["ui_sum"]),
+                    "ui_max": float(row["ui_max"]),
+                    "ui_min": float(row["ui_min"]),
+                    "ui_last_ts": row["ui_last_ts"],
+                    "ui_first_ts": row["ui_first_ts"],
+                    "ui_days_since_last": float(row["ui_days_since_last"]),
+                    "ui_days_since_first": float(row["ui_days_since_first"]),
+                }
+
+                if len(user_item_stats_dict) >= MAX_DICT_SIZE:
+                    # Автосохранение частичного результата и останов
+                    part_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    pkl_path = os.path.join(
+                        tmp_dir, f"user_item_stats_partial_{part_ts}.pkl"
+                    )
+                    with open(pkl_path, "wb") as f:
+                        import pickle
+
+                        pickle.dump(
+                            user_item_stats_dict, f, protocol=pickle.HIGHEST_PROTOCOL
+                        )
+                    print(
+                        f"⚠️ Достигнут лимит {MAX_DICT_SIZE}. Частичный словарь сохранён: {pkl_path}"
+                    )
+                    print(
+                        f"Вернём частичный словарь (завершено досрочно на row-group {rg_idx})."
+                    )
+                    return user_item_stats_dict
+
+            del df, table
+            gc.collect()
+
+        print(
+            f"Словарь пользователь-товарных признаков построен. Записей: {len(user_item_stats_dict)}"
+        )
+        return user_item_stats_dict
+
+    finally:
+        if cleanup:
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                print(f"Временная директория очищена: {temp_dir}")
+            except Exception:
+                pass
 
 
 def build_category_features_dict(category_df, items_df):
