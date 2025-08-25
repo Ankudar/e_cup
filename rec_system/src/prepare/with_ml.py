@@ -843,6 +843,47 @@ class LightGBMRecommender:
         self.user_map = user_map
         self.item_map = item_map
 
+    def _load_ui_features_for_pairs(self, pairs_df, ui_features_path):
+        """
+        Загружает UI-признаки только для указанных пар user-item
+        """
+        try:
+            if pairs_df.empty:
+                print("⚠️ Пары для фильтрации пустые")
+                return None
+
+            # Создаем временный файл с парами для фильтрации
+            temp_pairs_path = "/tmp/filter_pairs.parquet"
+            pairs_df[["user_id", "item_id"]].to_parquet(temp_pairs_path, index=False)
+
+            # Используем Polars для эффективной фильтрации
+            import polars as pl
+
+            # Загружаем только нужные пары
+            ui_lf = pl.scan_parquet(ui_features_path)
+            pairs_lf = pl.scan_parquet(temp_pairs_path)
+
+            result_lf = ui_lf.join(pairs_lf, on=["user_id", "item_id"], how="inner")
+
+            result_df = result_lf.collect().to_pandas()
+
+            print(
+                f"Загружено {len(result_df)} UI-признаков из {len(pairs_df)} запрошенных пар"
+            )
+
+            # Удаляем временный файл
+            if os.path.exists(temp_pairs_path):
+                os.remove(temp_pairs_path)
+
+            return result_df
+
+        except Exception as e:
+            print(f"Ошибка загрузки UI-признаков: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return None
+
     def prepare_training_data(
         self,
         interactions_files,
@@ -853,6 +894,7 @@ class LightGBMRecommender:
         test_orders_df,
         sample_fraction=0.1,
         negatives_per_positive=1,
+        ui_features_path=None,  # добавляем новый параметр
     ):
         """
         Векторизованная подготовка данных для LightGBM с быстрым негативным сэмплированием.
@@ -953,6 +995,49 @@ class LightGBMRecommender:
             item_map,
             max_timestamp,
         )
+
+        # 9. Добавляем UI-признаки если они есть (НОВОЕ)
+        if ui_features_path and os.path.exists(ui_features_path):
+            print("Добавление UI-признаков...")
+            # Загружаем UI-признаки только для нужных пар user-item
+            ui_features_df = self._load_ui_features_for_pairs(
+                train_data[["user_id", "item_id"]], ui_features_path
+            )
+
+            if ui_features_df is not None and not ui_features_df.empty:
+                print(f"Загружено UI-признаков: {len(ui_features_df)} записей")
+                print(f"Колонки UI-признаков: {ui_features_df.columns.tolist()}")
+
+                # Объединяем с основными данными
+                train_data = train_data.merge(
+                    ui_features_df, on=["user_id", "item_id"], how="left"
+                ).fillna(0)
+
+                # Добавляем UI-признаки в список фичей ТОЛЬКО если они есть в данных
+                ui_feature_columns = [
+                    "ui_count",
+                    "ui_sum",
+                    "ui_max",
+                    "ui_min",
+                    "ui_mean",
+                    "ui_days_since_last",
+                    "ui_days_since_first",
+                ]
+
+                # Проверяем, какие UI-признаки действительно есть в данных
+                available_ui_columns = [
+                    col for col in ui_feature_columns if col in train_data.columns
+                ]
+
+                if available_ui_columns:
+                    self.feature_columns.extend(available_ui_columns)
+                    print(f"Добавлены UI-признаки: {available_ui_columns}")
+                else:
+                    print("⚠️ UI-признаки не найдены в данных после объединения")
+            else:
+                print("⚠️ Не удалось загрузить UI-признаки или они пустые")
+        else:
+            print("⚠️ Путь к UI-признакам не указан или файл не существует")
 
         print(f"Данные подготовлены: {len(train_data)} примеров")
         return train_data
@@ -1518,6 +1603,24 @@ def build_user_features_dict(interactions_files, orders_df, device="cuda"):
     return user_stats_dict
 
 
+def load_ui_features_for_user_item(user_id, item_id, ui_features_path):
+    """
+    Загружает UI-признаки для конкретной пары user-item
+    """
+    if not ui_features_path or not os.path.exists(ui_features_path):
+        return None
+
+    query = pl.scan_parquet(ui_features_path).filter(
+        (pl.col("user_id") == user_id) & (pl.col("item_id") == item_id)
+    )
+    result = query.collect()
+
+    if len(result) == 0:
+        return None
+
+    return result[0].to_dict()
+
+
 def build_item_features_dict(
     interactions_files, items_df, orders_df, embeddings_dict, device="cuda"
 ):
@@ -1638,30 +1741,26 @@ def build_item_features_dict(
 
 def build_user_item_features_dict(
     interactions_files,
-    tmp_dir="/home/root6/python/e_cup/rec_system/data/processed/ui_stats",
+    output_path="/home/root6/python/e_cup/rec_system/data/processed/ui_features",
     cleanup=True,
-    batch_size=100_000,  # используем как лимит размера словаря в памяти
 ):
     """
     Полностью потоковая обработка без загрузки всего в память.
-    - агрегируем по каждому parquet в lazy и пишем чанки на диск
-    - объединяем чанки lazy'ем и пишем финальный parquet
-    - читаем финальный parquet по row-group'ам и собираем dict
-    - при достижении лимита batch_size сохраняем частичный dict в tmp_dir и прерываемся
+    - агрегируем каждый parquet → чанки
+    - объединяем чанки в финальный parquet
+    - добавляем вычисляемые признаки (mean, days_since_*)
     """
-    os.makedirs(tmp_dir, exist_ok=True)
 
-    # временная рабочая директория для промежуточных агрегатов
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    # временная рабочая директория
     temp_dir = tempfile.mkdtemp(prefix="ui_features_")
     print(f"Временная директория: {temp_dir}")
 
-    # лимит словаря в памяти (при достижении — сохраняем и прерываемся)
-    MAX_DICT_SIZE = batch_size if batch_size and batch_size > 0 else 5_000_000
-
     try:
-        print("Построение словаря пользователь-товарных признаков...")
+        print("Построение parquet с user-item признаками...")
 
-        # 1) Агрегация по каждому файлу (lazy → sink_parquet)
+        # 1) Агрегация по каждому входному файлу
         chunk_files = []
         for i, f in enumerate(
             tqdm(interactions_files, desc="Обработка взаимодействий")
@@ -1683,9 +1782,9 @@ def build_user_item_features_dict(
 
         if not chunk_files:
             print("Нет входных данных для агрегации.")
-            return {}
+            return None
 
-        # 2) Финальная агрегация всех чанков (lazy → sink_parquet)
+        # 2) Финальная агрегация всех чанков
         all_lf = pl.scan_parquet(os.path.join(temp_dir, "chunk_*.parquet"))
         final_lf = all_lf.group_by(["user_id", "item_id"]).agg(
             [
@@ -1697,73 +1796,26 @@ def build_user_item_features_dict(
                 pl.col("ui_first_ts").min().alias("ui_first_ts"),
             ]
         )
-        final_path = os.path.join(temp_dir, "final_aggregated.parquet")
-        final_lf.sink_parquet(final_path)
 
-        # 3) По-row-group'овое чтение и формирование словаря
-        user_item_stats_dict = {}
+        # 3) Добавляем новые признаки прямо в lazy
         now = datetime.now()
-        pf = pq.ParquetFile(final_path)
+        final_lf = final_lf.with_columns(
+            [
+                (pl.col("ui_sum") / pl.col("ui_count")).fill_nan(0).alias("ui_mean"),
+                ((pl.lit(now) - pl.col("ui_last_ts")).dt.total_days()).alias(
+                    "ui_days_since_last"
+                ),
+                ((pl.lit(now) - pl.col("ui_first_ts")).dt.total_days()).alias(
+                    "ui_days_since_first"
+                ),
+            ]
+        ).fill_null(0)
 
-        for rg_idx in tqdm(range(pf.num_row_groups), desc="Построение словаря"):
-            table = pf.read_row_group(rg_idx)
-            df = pl.from_arrow(table)
+        # 4) Сохраняем финальный parquet
+        final_lf.sink_parquet(output_path)
+        print(f"Финальный parquet сохранён: {output_path}")
 
-            df = df.with_columns(
-                [
-                    (pl.col("ui_sum") / pl.col("ui_count"))
-                    .fill_nan(0)
-                    .alias("ui_mean"),
-                    ((pl.lit(now) - pl.col("ui_last_ts")).dt.total_days()).alias(
-                        "ui_days_since_last"
-                    ),
-                    ((pl.lit(now) - pl.col("ui_first_ts")).dt.total_days()).alias(
-                        "ui_days_since_first"
-                    ),
-                ]
-            ).fill_null(0)
-
-            for row in df.iter_rows(named=True):
-                key = (row["user_id"], row["item_id"])
-                user_item_stats_dict[key] = {
-                    "ui_count": int(row["ui_count"]),
-                    "ui_mean": float(row["ui_mean"]),
-                    "ui_sum": float(row["ui_sum"]),
-                    "ui_max": float(row["ui_max"]),
-                    "ui_min": float(row["ui_min"]),
-                    "ui_last_ts": row["ui_last_ts"],
-                    "ui_first_ts": row["ui_first_ts"],
-                    "ui_days_since_last": float(row["ui_days_since_last"]),
-                    "ui_days_since_first": float(row["ui_days_since_first"]),
-                }
-
-                if len(user_item_stats_dict) >= MAX_DICT_SIZE:
-                    # Автосохранение частичного результата и останов
-                    part_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    pkl_path = os.path.join(
-                        tmp_dir, f"user_item_stats_partial_{part_ts}.pkl"
-                    )
-                    with open(pkl_path, "wb") as f:
-                        import pickle
-
-                        pickle.dump(
-                            user_item_stats_dict, f, protocol=pickle.HIGHEST_PROTOCOL
-                        )
-                    print(
-                        f"⚠️ Достигнут лимит {MAX_DICT_SIZE}. Частичный словарь сохранён: {pkl_path}"
-                    )
-                    print(
-                        f"Вернём частичный словарь (завершено досрочно на row-group {rg_idx})."
-                    )
-                    return user_item_stats_dict
-
-            del df, table
-            gc.collect()
-
-        print(
-            f"Словарь пользователь-товарных признаков построен. Записей: {len(user_item_stats_dict)}"
-        )
-        return user_item_stats_dict
+        return output_path
 
     finally:
         if cleanup:
@@ -1942,7 +1994,6 @@ def load_and_process_embeddings(
 
 
 # -------------------- Основной запуск --------------------
-# -------------------- Основной запуск --------------------
 if __name__ == "__main__":
     start_time = time.time()
 
@@ -2100,13 +2151,19 @@ if __name__ == "__main__":
             f"Item features построены за {timedelta(seconds=item_time)}: {len(item_features_dict)} товаров"
         )
 
-        # User-Item features
+        # User-Item features - теперь возвращает только путь к файлу
         ui_start = time.time()
-        user_item_features_dict = build_user_item_features_dict(interactions_files)
+        ui_features_path = build_user_item_features_dict(interactions_files)
+
+        if ui_features_path is None:
+            log_message("⚠️ User-Item features пустые, пропускаем этап.")
+            ui_features_df = None
+        else:
+            log_message(f"User-Item features сохранены в parquet: {ui_features_path}")
+            # НЕ загружаем в память, просто сохраняем путь
+
         ui_time = time.time() - ui_start
-        log_message(
-            f"User-Item features построены за {timedelta(seconds=ui_time)}: {len(user_item_features_dict)} пар"
-        )
+        log_message(f"User-Item features построены за {timedelta(seconds=ui_time)}")
 
         stage_time = time.time() - stage_start
         log_message(
@@ -2133,6 +2190,7 @@ if __name__ == "__main__":
         else:
             sample_test_orders = test_orders_df
 
+        # Используем обновленный метод с UI-признаками
         train_data = recommender.prepare_training_data(
             interactions_files,
             user_map,
@@ -2141,6 +2199,7 @@ if __name__ == "__main__":
             recent_items_map,
             sample_test_orders,
             sample_fraction=config["sample_fraction"],
+            ui_features_path=ui_features_path,  # передаем путь к UI-признакам
         )
 
         # Разделяем на train/validation
@@ -2209,7 +2268,7 @@ if __name__ == "__main__":
             "popular_items": popular_items,
             "user_features_dict": user_features_dict,
             "item_features_dict": item_features_dict,
-            "user_item_features_dict": user_item_features_dict,
+            "ui_features_path": ui_features_path,  # сохраняем путь к UI-признакам
             "recent_items_map": recent_items_map,
             "copurchase_map": copurchase_map,
             "item_to_cat": item_to_cat,
