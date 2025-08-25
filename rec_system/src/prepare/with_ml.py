@@ -1,4 +1,5 @@
 import gc
+import json
 import os
 import pickle
 import random
@@ -849,7 +850,6 @@ class LightGBMRecommender:
         """
         try:
             if pairs_df.empty:
-                print("⚠️ Пары для фильтрации пустые")
                 return None
 
             # Создаем временный файл с парами для фильтрации
@@ -857,31 +857,25 @@ class LightGBMRecommender:
             pairs_df[["user_id", "item_id"]].to_parquet(temp_pairs_path, index=False)
 
             # Используем Polars для эффективной фильтрации
-            import polars as pl
-
-            # Загружаем только нужные пары
-            ui_lf = pl.scan_parquet(ui_features_path)
-            pairs_lf = pl.scan_parquet(temp_pairs_path)
-
-            result_lf = ui_lf.join(pairs_lf, on=["user_id", "item_id"], how="inner")
-
-            result_df = result_lf.collect().to_pandas()
-
-            print(
-                f"Загружено {len(result_df)} UI-признаков из {len(pairs_df)} запрошенных пар"
+            result = (
+                pl.scan_parquet(ui_features_path)
+                .join(
+                    pl.scan_parquet(temp_pairs_path),
+                    on=["user_id", "item_id"],
+                    how="inner",
+                )
+                .collect()
+                .to_pandas()
             )
 
-            # Удаляем временный файл
+            # Чистим временный файл
             if os.path.exists(temp_pairs_path):
                 os.remove(temp_pairs_path)
 
-            return result_df
+            return result
 
         except Exception as e:
-            print(f"Ошибка загрузки UI-признаков: {e}")
-            import traceback
-
-            traceback.print_exc()
+            print(f"Ошибка загрузки UI-признаков для пар: {e}")
             return None
 
     def prepare_training_data(
@@ -894,10 +888,10 @@ class LightGBMRecommender:
         test_orders_df,
         sample_fraction=0.1,
         negatives_per_positive=1,
-        ui_features_path=None,  # добавляем новый параметр
+        ui_features_path=None,  # добавляем параметр пути к UI-признакам
     ):
         """
-        Векторизованная подготовка данных для LightGBM с быстрым негативным сэмплированием.
+        Векторизованная подготовка данных для LightGBM
         """
         print("Подготовка данных для LightGBM...")
 
@@ -996,48 +990,44 @@ class LightGBMRecommender:
             max_timestamp,
         )
 
-        # 9. Добавляем UI-признаки если они есть (НОВОЕ)
+        # 9. Добавляем UI-признаки из файла если они есть
         if ui_features_path and os.path.exists(ui_features_path):
-            print("Добавление UI-признаков...")
-            # Загружаем UI-признаки только для нужных пар user-item
-            ui_features_df = self._load_ui_features_for_pairs(
-                train_data[["user_id", "item_id"]], ui_features_path
-            )
+            print("Добавление UI-признаков из файла...")
+            try:
+                # Загружаем только нужные UI-признаки для наших пар
+                ui_features_df = self._load_ui_features_for_pairs(
+                    train_data[["user_id", "item_id"]], ui_features_path
+                )
 
-            if ui_features_df is not None and not ui_features_df.empty:
-                print(f"Загружено UI-признаков: {len(ui_features_df)} записей")
-                print(f"Колонки UI-признаков: {ui_features_df.columns.tolist()}")
+                if ui_features_df is not None and not ui_features_df.empty:
+                    print(f"Загружено {len(ui_features_df)} UI-признаков")
 
-                # Объединяем с основными данными
-                train_data = train_data.merge(
-                    ui_features_df, on=["user_id", "item_id"], how="left"
-                ).fillna(0)
+                    # Объединяем с основными данными
+                    train_data = train_data.merge(
+                        ui_features_df, on=["user_id", "item_id"], how="left"
+                    ).fillna(0)
 
-                # Добавляем UI-признаки в список фичей ТОЛЬКО если они есть в данных
-                ui_feature_columns = [
-                    "ui_count",
-                    "ui_sum",
-                    "ui_max",
-                    "ui_min",
-                    "ui_mean",
-                    "ui_days_since_last",
-                    "ui_days_since_first",
-                ]
+                    # Добавляем UI-признаки в список фичей
+                    ui_feature_columns = [
+                        col
+                        for col in ui_features_df.columns
+                        if col not in ["user_id", "item_id"]
+                        and col in train_data.columns
+                    ]
 
-                # Проверяем, какие UI-признаки действительно есть в данных
-                available_ui_columns = [
-                    col for col in ui_feature_columns if col in train_data.columns
-                ]
-
-                if available_ui_columns:
-                    self.feature_columns.extend(available_ui_columns)
-                    print(f"Добавлены UI-признаки: {available_ui_columns}")
+                    if ui_feature_columns:
+                        self.feature_columns.extend(ui_feature_columns)
+                        print(f"Добавлены UI-признаки: {ui_feature_columns}")
+                    else:
+                        print("⚠️ UI-признаки не добавились в данные")
                 else:
-                    print("⚠️ UI-признаки не найдены в данных после объединения")
-            else:
-                print("⚠️ Не удалось загрузить UI-признаки или они пустые")
-        else:
-            print("⚠️ Путь к UI-признакам не указан или файл не существует")
+                    print("⚠️ Не удалось загрузить UI-признаки")
+
+            except Exception as e:
+                print(f"Ошибка загрузки UI-признаков: {e}")
+                import traceback
+
+                traceback.print_exc()
 
         print(f"Данные подготовлены: {len(train_data)} примеров")
         return train_data
@@ -1739,91 +1729,224 @@ def build_item_features_dict(
     return item_stats_dict
 
 
+def get_ui_features_for_user_item(user_id, item_id, ui_features_path):
+    """
+    Получает UI-признаки для конкретной пары user-item без загрузки всего файла
+    """
+    try:
+        # Используем фильтрацию на уровне Parquet
+        result = (
+            pl.scan_parquet(ui_features_path)
+            .filter((pl.col("user_id") == user_id) & (pl.col("item_id") == item_id))
+            .collect()
+        )
+
+        if len(result) == 0:
+            return None
+
+        return result[0].to_dict()
+
+    except Exception as e:
+        print(f"Ошибка получения UI-признаков: {e}")
+        return None
+
+
+def get_ui_features_batch(user_item_pairs, ui_features_path, batch_size=1000):
+    """
+    Получает UI-признаки для батча пар user-item
+    """
+    try:
+        # Создаем временный файл с парами для фильтрации
+        temp_pairs_path = "/tmp/filter_pairs.parquet"
+        pairs_df = pl.DataFrame(user_item_pairs, schema=["user_id", "item_id"])
+        pairs_df.write_parquet(temp_pairs_path)
+
+        # Используем join на диске
+        result = (
+            pl.scan_parquet(ui_features_path)
+            .join(
+                pl.scan_parquet(temp_pairs_path), on=["user_id", "item_id"], how="inner"
+            )
+            .collect()
+        )
+
+        # Чистим временный файл
+        if os.path.exists(temp_pairs_path):
+            os.remove(temp_pairs_path)
+
+        return result.to_dicts()
+
+    except Exception as e:
+        print(f"Ошибка получения батча UI-признаков: {e}")
+        return []
+
+
 def build_user_item_features_dict(
     interactions_files,
     output_path="/home/root6/python/e_cup/rec_system/data/processed/ui_features",
-    cleanup=True,
+    temp_base_dir="/home/root6/python/e_cup/rec_system/data/temp/ui_features",
+    cleanup=False,  # НЕ чистим временные данные - они нам нужны!
 ):
     """
-    Полностью потоковая обработка без загрузки всего в память.
-    - агрегируем каждый parquet → чанки
-    - объединяем чанки в финальный parquet
-    - добавляем вычисляемые признаки (mean, days_since_*)
+    Полностью дисковый подход - данные никогда не загружаются в память целиком.
+    Все операции через внешнюю сортировку и слияние.
     """
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    os.makedirs(temp_base_dir, exist_ok=True)
 
-    # временная рабочая директория
-    temp_dir = tempfile.mkdtemp(prefix="ui_features_")
-    print(f"Временная директория: {temp_dir}")
+    # Создаем уникальную временную директорию для этого запуска
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    temp_dir = os.path.join(temp_base_dir, f"run_{run_id}")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    print(f"Рабочая директория: {temp_dir}")
+    print("Полностью дисковый подход - память не используется")
 
     try:
-        print("Построение parquet с user-item признаками...")
+        # 1) Этап: Предварительная агрегация каждого файла
+        print("=== ЭТАП 1: Предварительная агрегация файлов ===")
+        stage1_dir = os.path.join(temp_dir, "stage1_aggregated")
+        os.makedirs(stage1_dir, exist_ok=True)
 
-        # 1) Агрегация по каждому входному файлу
-        chunk_files = []
-        for i, f in enumerate(
-            tqdm(interactions_files, desc="Обработка взаимодействий")
+        aggregated_files = []
+        for i, input_file in enumerate(
+            tqdm(interactions_files, desc="Агрегация файлов")
         ):
-            lf = pl.scan_parquet(f)
-            agg_lf = lf.group_by(["user_id", "item_id"]).agg(
-                [
-                    pl.col("weight").count().alias("ui_count"),
-                    pl.col("weight").sum().alias("ui_sum"),
-                    pl.col("weight").max().alias("ui_max"),
-                    pl.col("weight").min().alias("ui_min"),
-                    pl.col("timestamp").max().alias("ui_last_ts"),
-                    pl.col("timestamp").min().alias("ui_first_ts"),
-                ]
-            )
-            chunk_path = os.path.join(temp_dir, f"chunk_{i:04d}.parquet")
-            agg_lf.sink_parquet(chunk_path)
-            chunk_files.append(chunk_path)
+            try:
+                # Агрегируем каждый файл отдельно и сохраняем на диск
+                output_file = os.path.join(stage1_dir, f"agg_{i:06d}.parquet")
 
-        if not chunk_files:
-            print("Нет входных данных для агрегации.")
+                # Используем Polars для агрегации с записью прямо на диск
+                (
+                    pl.scan_parquet(input_file)
+                    .group_by(["user_id", "item_id"])
+                    .agg(
+                        [
+                            pl.col("weight").count().alias("ui_count"),
+                            pl.col("weight").sum().alias("ui_sum"),
+                            pl.col("weight").max().alias("ui_max"),
+                            pl.col("weight").min().alias("ui_min"),
+                            pl.col("timestamp").max().alias("ui_last_ts"),
+                            pl.col("timestamp").min().alias("ui_first_ts"),
+                        ]
+                    )
+                    .sink_parquet(output_file)
+                )
+
+                aggregated_files.append(output_file)
+
+            except Exception as e:
+                print(f"Ошибка агрегации файла {input_file}: {e}")
+                continue
+
+        if not aggregated_files:
+            print("Нет данных для обработки")
             return None
 
-        # 2) Финальная агрегация всех чанков
-        all_lf = pl.scan_parquet(os.path.join(temp_dir, "chunk_*.parquet"))
-        final_lf = all_lf.group_by(["user_id", "item_id"]).agg(
-            [
-                pl.col("ui_count").sum().alias("ui_count"),
-                pl.col("ui_sum").sum().alias("ui_sum"),
-                pl.col("ui_max").max().alias("ui_max"),
-                pl.col("ui_min").min().alias("ui_min"),
-                pl.col("ui_last_ts").max().alias("ui_last_ts"),
-                pl.col("ui_first_ts").min().alias("ui_first_ts"),
-            ]
+        # 2) Этап: Внешняя сортировка и слияние
+        print("=== ЭТАП 2: Внешнее слияние ===")
+        stage2_dir = os.path.join(temp_dir, "stage2_merged")
+        os.makedirs(stage2_dir, exist_ok=True)
+
+        # Разбиваем на группы для постепенного слияния
+        merge_groups = []
+        group_size = 10  # сливаем по 10 файлов за раз
+
+        for i in range(0, len(aggregated_files), group_size):
+            group_files = aggregated_files[i : i + group_size]
+            group_output = os.path.join(
+                stage2_dir, f"merge_group_{i//group_size:04d}.parquet"
+            )
+
+            # Сливаем группу файлов
+            (
+                pl.scan_parquet(group_files)
+                .group_by(["user_id", "item_id"])
+                .agg(
+                    [
+                        pl.col("ui_count").sum().alias("ui_count"),
+                        pl.col("ui_sum").sum().alias("ui_sum"),
+                        pl.col("ui_max").max().alias("ui_max"),
+                        pl.col("ui_min").min().alias("ui_min"),
+                        pl.col("ui_last_ts").max().alias("ui_last_ts"),
+                        pl.col("ui_first_ts").min().alias("ui_first_ts"),
+                    ]
+                )
+                .sink_parquet(group_output)
+            )
+
+            merge_groups.append(group_output)
+
+        # 3) Этап: Финальное слияние
+        print("=== ЭТАП 3: Финальное слияние ===")
+        if len(merge_groups) > 1:
+            # Если есть несколько групп, сливаем их
+            final_merge_path = os.path.join(temp_dir, "final_merged.parquet")
+
+            (
+                pl.scan_parquet(merge_groups)
+                .group_by(["user_id", "item_id"])
+                .agg(
+                    [
+                        pl.col("ui_count").sum().alias("ui_count"),
+                        pl.col("ui_sum").sum().alias("ui_sum"),
+                        pl.col("ui_max").max().alias("ui_max"),
+                        pl.col("ui_min").min().alias("ui_min"),
+                        pl.col("ui_last_ts").max().alias("ui_last_ts"),
+                        pl.col("ui_first_ts").min().alias("ui_first_ts"),
+                    ]
+                )
+                .sink_parquet(final_merge_path)
+            )
+        else:
+            final_merge_path = merge_groups[0]
+
+        # 4) Этап: Добавление вычисляемых признаков
+        print("=== ЭТАП 4: Добавление признаков ===")
+        now = datetime.now()
+
+        (
+            pl.scan_parquet(final_merge_path)
+            .with_columns(
+                [
+                    (pl.col("ui_sum") / pl.col("ui_count"))
+                    .fill_nan(0)
+                    .alias("ui_mean"),
+                    ((pl.lit(now) - pl.col("ui_last_ts")).dt.total_days()).alias(
+                        "ui_days_since_last"
+                    ),
+                    ((pl.lit(now) - pl.col("ui_first_ts")).dt.total_days()).alias(
+                        "ui_days_since_first"
+                    ),
+                ]
+            )
+            .fill_null(0)
+            .sink_parquet(output_path)
         )
 
-        # 3) Добавляем новые признаки прямо в lazy
-        now = datetime.now()
-        final_lf = final_lf.with_columns(
-            [
-                (pl.col("ui_sum") / pl.col("ui_count")).fill_nan(0).alias("ui_mean"),
-                ((pl.lit(now) - pl.col("ui_last_ts")).dt.total_days()).alias(
-                    "ui_days_since_last"
-                ),
-                ((pl.lit(now) - pl.col("ui_first_ts")).dt.total_days()).alias(
-                    "ui_days_since_first"
-                ),
-            ]
-        ).fill_null(0)
+        print(f"✅ Финальный файл сохранен: {output_path}")
 
-        # 4) Сохраняем финальный parquet
-        final_lf.sink_parquet(output_path)
-        print(f"Финальный parquet сохранён: {output_path}")
+        # 5) Сохраняем метаданные для последующего использования
+        metadata = {
+            "created_date": datetime.now().isoformat(),
+            "source_files": len(interactions_files),
+            "temp_dir": temp_dir,
+            "output_path": output_path,
+        }
+
+        metadata_path = os.path.join(temp_dir, "metadata.json")
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
 
         return output_path
 
-    finally:
-        if cleanup:
-            try:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                print(f"Временная директория очищена: {temp_dir}")
-            except Exception:
-                pass
+    except Exception as e:
+        print(f"❌ Ошибка в build_user_item_features_dict: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return None
 
 
 def build_category_features_dict(category_df, items_df):
@@ -2151,16 +2274,41 @@ if __name__ == "__main__":
             f"Item features построены за {timedelta(seconds=item_time)}: {len(item_features_dict)} товаров"
         )
 
-        # User-Item features - теперь возвращает только путь к файлу
+        # User-Item features - дисковый подход
         ui_start = time.time()
-        ui_features_path = build_user_item_features_dict(interactions_files)
+        ui_features_path = build_user_item_features_dict(
+            interactions_files,
+            output_path="/home/root6/python/e_cup/rec_system/data/processed/ui_features.parquet",
+            temp_base_dir="/home/root6/python/e_cup/rec_system/data/temp/ui_features",
+            cleanup=False,  # НЕ удаляем временные данные - они остаются на диске
+        )
 
         if ui_features_path is None:
             log_message("⚠️ User-Item features пустые, пропускаем этап.")
-            ui_features_df = None
         else:
-            log_message(f"User-Item features сохранены в parquet: {ui_features_path}")
-            # НЕ загружаем в память, просто сохраняем путь
+            # Проверяем что файл действительно создан и не пустой
+            if (
+                os.path.exists(ui_features_path)
+                and os.path.getsize(ui_features_path) > 0
+            ):
+                file_size_mb = os.path.getsize(ui_features_path) / (1024 * 1024)
+                log_message(f"User-Item features сохранены: {ui_features_path}")
+                log_message(f"Размер файла: {file_size_mb:.2f} MB")
+
+                # Для отладки: посмотрим структуру файла
+                try:
+                    # Быстрая проверка без загрузки всего файла
+                    sample_check = pl.scan_parquet(ui_features_path).limit(1).collect()
+                    if not sample_check.is_empty():
+                        log_message(f"Структура UI-признаков: {sample_check.columns}")
+                        log_message(f"Пример записи: {dict(sample_check[0])}")
+                    else:
+                        log_message("⚠️ UI-признаки файл пустой")
+                except Exception as e:
+                    log_message(f"⚠️ Ошибка проверки UI-файла: {e}")
+            else:
+                log_message("⚠️ Файл UI-признаков не создан или пустой")
+                ui_features_path = None
 
         ui_time = time.time() - ui_start
         log_message(f"User-Item features построены за {timedelta(seconds=ui_time)}")
@@ -2286,12 +2434,63 @@ if __name__ == "__main__":
 
         # === ФИНАЛЬНАЯ СТАТИСТИКА ===
         total_time = time.time() - start_time
-        log_message("=== ОБУЧЕНИЕ ЗАВЕРШЕНО ===")
+        log_message("=== ОБУЧЕНИЕ ЗАВЕРШЕНО УСПЕШНО ===")
         log_message(f"Общее время выполнения: {timedelta(seconds=total_time)}")
         log_message(f"Пользователей: {len(user_map)}")
         log_message(f"Товаров: {len(item_map)}")
         log_message(f"Признаков: {len(recommender.feature_columns)}")
+        log_message(f"NDCG@100 train: {train_ndcg:.4f}")
         log_message(f"NDCG@100 val: {val_ndcg:.4f}")
+
+        # Информация о системе
+        log_message("=== СИСТЕМНАЯ ИНФОРМАЦИЯ ===")
+        try:
+            # Информация о GPU
+            import torch
+
+            if torch.cuda.is_available():
+                gpu_name = torch.cuda.get_device_name(0)
+                gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                log_message(f"Видеокарта: {gpu_name}")
+                log_message(f"Память GPU: {gpu_memory:.1f} GB")
+            else:
+                log_message("Видеокарта: CUDA не доступна")
+        except Exception:
+            log_message("Видеокарта: информация недоступна")
+
+        try:
+            # Информация о CPU
+            import multiprocessing
+
+            import psutil
+
+            cpu_freq = psutil.cpu_freq()
+            cpu_cores = multiprocessing.cpu_count()
+            log_message(f"Процессор: {psutil.cpu_percent()}% загрузки")
+            log_message(f"Ядра CPU: {cpu_cores}")
+            if cpu_freq:
+                log_message(f"Частота CPU: {cpu_freq.current:.1f} MHz")
+        except Exception:
+            log_message("Процессор: информация недоступна")
+
+        try:
+            # Информация о RAM
+            import psutil
+
+            ram = psutil.virtual_memory()
+            ram_total = ram.total / 1024**3
+            ram_used = ram.used / 1024**3
+            log_message(
+                f"Оперативная память: {ram_total:.1f} GB всего, {ram_used:.1f} GB использовано"
+            )
+            log_message(f"Частота RAM: информация требует дополнительных библиотек")
+        except Exception:
+            log_message("Оперативная память: информация недоступна")
+
+        # Финальное сообщение
+        log_message("==========================================")
+        log_message("ВСЕ ЭТАПЫ ВЫПОЛНЕНЫ УСПЕШНО!")
+        log_message("==========================================")
 
     except Exception as e:
         error_time = time.time() - start_time
@@ -2303,6 +2502,29 @@ if __name__ == "__main__":
 
         traceback_str = traceback.format_exc()
         log_message(traceback_str)
+
+        # Записываем информацию о системе даже при ошибке
+        try:
+            log_message("=== СИСТЕМНАЯ ИНФОРМАЦИЯ ПРИ ОШИБКЕ ===")
+            import multiprocessing
+
+            import psutil
+
+            # CPU
+            cpu_cores = multiprocessing.cpu_count()
+            log_message(f"Ядра CPU: {cpu_cores}")
+
+            # RAM
+            ram = psutil.virtual_memory()
+            ram_total = ram.total / 1024**3
+            ram_used = ram.used / 1024**3
+            log_message(
+                f"Оперативная память: {ram_total:.1f} GB всего, {ram_used:.1f} GB использовано"
+            )
+
+        except Exception as sys_error:
+            log_message(f"Ошибка получения системной информации: {sys_error}")
+
         raise e
 
     finally:
