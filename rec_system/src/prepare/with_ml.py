@@ -36,7 +36,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=0):
+def load_train_data(max_parts=0, max_rows=1000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. При max_rows берём первые строки
@@ -118,37 +118,29 @@ def load_train_data(max_parts=0, max_rows=0):
 
         # --- режим "все строки"
         if max_rows == 0:
-            used_parts = total_parts
             out_ddf = ddf
+            used_parts = total_parts
         else:
-            # --- режим "сэмпл фиксированного размера"
+            # --- читаем кусками пока не наберём нужное
             parts_to_read = (
                 total_parts if max_parts == 0 else min(max_parts, total_parts)
             )
             dfs = []
             rows_accum = 0
             for i in range(parts_to_read):
-                part = ddf.get_partition(i).compute()
+                part = ddf.get_partition(i).head(max_rows - rows_accum, compute=True)
                 if part.empty:
                     continue
-                needed = max_rows - rows_accum
-                if len(part) > needed:
-                    dfs.append(part.iloc[:needed])
-                    rows_accum += needed
-                    break
-                else:
-                    dfs.append(part)
-                    rows_accum += len(part)
+                dfs.append(part)
+                rows_accum += len(part)
                 if rows_accum >= max_rows:
                     break
             out_df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
             out_ddf = dd.from_pandas(out_df, npartitions=1)
             used_parts = i + 1
 
-        count = out_ddf.map_partitions(len).compute().sum()
-        mem_mb = out_ddf.map_partitions(
-            lambda df: df.memory_usage(deep=True).sum()
-        ).compute().sum() / (1024**2)
+        count = len(out_ddf)
+        mem_mb = out_ddf.memory_usage(deep=True).sum().compute() / (1024**2)
 
         print(
             f"{name}: {count:,} строк (использовано {used_parts} из {total_parts} партиций), ~{mem_mb:.1f} MB"
@@ -2261,7 +2253,7 @@ if __name__ == "__main__":
             recent_items_map,
             sample_test_orders,
             sample_fraction=config["sample_fraction"],
-            ui_features_path=ui_features_path,  # передаем путь к UI-признакам
+            ui_features_dir=ui_features_dir,  # передаем путь к UI-признакам
         )
 
         # Разделяем на train/validation
@@ -2330,7 +2322,7 @@ if __name__ == "__main__":
             "popular_items": popular_items,
             "user_features_dict": user_features_dict,
             "item_features_dict": item_features_dict,
-            "ui_features_path": ui_features_path,  # сохраняем путь к UI-признакам
+            "ui_features_dir": ui_features_dir,  # сохраняем путь к UI-признакам
             "recent_items_map": recent_items_map,
             "copurchase_map": copurchase_map,
             "item_to_cat": item_to_cat,
