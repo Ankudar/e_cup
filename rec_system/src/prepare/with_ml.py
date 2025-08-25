@@ -35,11 +35,12 @@ from tqdm.auto import tqdm
 tqdm.pandas()
 
 # 1000 строк ок
-# 100_000 строк
+# 1_000_000 строк ок
+# 100_000_000 строк
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=1000):
+def load_train_data(max_parts=0, max_rows=100_000_000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. При max_rows берём первые строки
@@ -866,7 +867,7 @@ class LightGBMRecommender:
         test_orders_df,
         sample_fraction=0.1,
         negatives_per_positive=1,
-        ui_features_dir=None,  # меняем на директорию
+        ui_features_dir=None,  # директория с ui-фичами
     ):
         """
         Векторизованная подготовка данных для LightGBM
@@ -890,7 +891,7 @@ class LightGBMRecommender:
         positive_df = test_orders_df[["user_id", "item_id"]].copy()
         positive_df["target"] = 1
 
-        # 4. Построение словаря пользователь → просмотренные товары
+        # 4. История взаимодействий
         print("Сбор истории взаимодействий...")
         user_interacted_items = (
             interactions_df.groupby("user_id")["item_id"].agg(set).to_dict()
@@ -899,7 +900,7 @@ class LightGBMRecommender:
             positive_df.groupby("user_id")["item_id"].agg(set).to_dict()
         )
 
-        # 5. Подготовка множеств для быстрого сэмплирования
+        # 5. Подготовка множеств для сэмплинга
         all_items = np.array(list(item_map.keys()))
         popular_items = set(popularity_s.nlargest(10000).index.tolist())
 
@@ -907,7 +908,6 @@ class LightGBMRecommender:
 
         negative_samples = []
 
-        # Генерируем негативы по пользователям
         for user_id, pos_items in tqdm(
             user_positive_items.items(), desc="Негативные сэмплы"
         ):
@@ -951,28 +951,33 @@ class LightGBMRecommender:
 
         negative_df = pd.DataFrame(negative_samples)
 
-        # 6. Объединение с позитивными
+        # 6. Объединение
         train_data = pd.concat([positive_df, negative_df], ignore_index=True)
 
-        # 7. Перемешиваем
+        # 7. Перемешивание
         train_data = train_data.sample(frac=1, random_state=42).reset_index(drop=True)
 
-        # 8. Добавление богатых признаков
-        train_data = self._add_rich_features(
-            train_data,
-            interactions_df,
-            popularity_s,
-            recent_items_map,
-            user_map,
-            item_map,
-            max_timestamp,
+        # 8. Базовые фичи
+        train_data = self._add_rich_features(train_data)
+
+        rich_feature_cols = [
+            "is_weekend",
+            "hour",
+            "item_popularity",
+            "category_popularity",
+            "covisitation_score",
+        ]
+        fclip_cols = [
+            col for col in train_data.columns if col.startswith("fclip_embed_")
+        ]
+        self.feature_columns.extend(
+            [c for c in rich_feature_cols + fclip_cols if c not in self.feature_columns]
         )
 
-        # 9. Добавляем UI-признаки из распределенных файлов
+        # 9. Добавляем UI-фичи
         if ui_features_dir and os.path.exists(ui_features_dir):
             print("Добавление распределенных UI-признаков...")
             try:
-                # Получаем UI-признаки для наших пар
                 ui_features_batch = get_ui_features_batch(
                     train_data[["user_id", "item_id"]].to_dict("records"),
                     ui_features_dir,
@@ -980,22 +985,37 @@ class LightGBMRecommender:
 
                 if ui_features_batch:
                     ui_features_df = pd.DataFrame(ui_features_batch)
+
+                    # убираем возможные дубли колонок
+                    cols_to_drop = [
+                        c
+                        for c in ui_features_df.columns
+                        if c in train_data.columns and c not in ["user_id", "item_id"]
+                    ]
+                    if cols_to_drop:
+                        logger.warning(
+                            f"Удаляем дубликаты UI-фич при merge: {cols_to_drop}"
+                        )
+                        ui_features_df = ui_features_df.drop(columns=cols_to_drop)
+
+                    # merge
                     train_data = train_data.merge(
                         ui_features_df, on=["user_id", "item_id"], how="left"
                     ).fillna(0)
 
-                    # Добавляем UI-признаки в список фичей
+                    # регистрируем новые фичи
                     ui_feature_columns = [
                         col
                         for col in ui_features_df.columns
                         if col not in ["user_id", "item_id"]
                     ]
+                    existing_cols = set(self.feature_columns)
+                    new_cols = [
+                        col for col in ui_feature_columns if col not in existing_cols
+                    ]
+                    self.feature_columns.extend(new_cols)
 
-                    if ui_feature_columns:
-                        self.feature_columns.extend(ui_feature_columns)
-                        print(f"Добавлены UI-признаки: {ui_feature_columns}")
-                else:
-                    print("⚠️ Не найдено UI-признаков для указанных пар")
+                    logger.info(f"Добавлены UI признаки: {new_cols}")
 
             except Exception as e:
                 print(f"Ошибка загрузки UI-признаков: {e}")
@@ -1003,199 +1023,57 @@ class LightGBMRecommender:
         print(f"Данные подготовлены: {len(train_data)} примеров")
         return train_data
 
-    def _add_rich_features(
-        self,
-        data,
-        interactions_df,
-        popularity_s,
-        recent_items_map,
-        user_map,
-        item_map,
-        max_timestamp,
-    ):
-        """
-        Добавление богатых признаков к данным
-        """
+    def _add_rich_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Добавление расширенных фич для обучения модели."""
+
         print("Добавление богатых признаков...")
 
-        # Базовые признаки
-        data["item_popularity"] = (
-            data["item_id"].map(lambda x: popularity_s.get(x, 0.0)).fillna(0.0)
-        )
+        # === ВРЕМЕННЫЕ ФИЧИ ===
+        if "timestamp" in data.columns:
+            try:
+                data["is_weekend"] = data["timestamp"].dt.dayofweek >= 5
+                data["hour"] = data["timestamp"].dt.hour
+            except Exception as e:
+                print(f"Не удалось преобразовать timestamp: {e}")
+                data["is_weekend"] = 0
+                data["hour"] = -1
+        else:
+            print("⚠️ Внимание: в данных нет колонки 'timestamp'. Фичи будут NaN.")
+            data["is_weekend"] = np.nan
+            data["hour"] = np.nan
 
-        # === ПРИЗНАКИ ПОЛЬЗОВАТЕЛЯ ===
-        user_stats = (
-            interactions_df.groupby("user_id")
-            .agg(
-                {
-                    "weight": ["count", "mean", "sum", "std", "max", "min"],
-                    "timestamp": ["max", "min"],
-                }
-            )
+        # === ПОПУЛЯРНОСТЬ ТОВАРА ===
+        item_pop = (
+            data.groupby("item_id")["user_id"]
+            .count()
+            .rename("item_popularity")
             .reset_index()
         )
-        user_stats.columns = [
-            "user_id",
-            "user_count",
-            "user_mean",
-            "user_sum",
-            "user_std",
-            "user_max",
-            "user_min",
-            "user_last_ts",
-            "user_first_ts",
-        ]
+        data = data.merge(item_pop, on="item_id", how="left")
 
-        # Время с последнего взаимодействия
-        user_stats["user_days_since_last"] = (
-            max_timestamp - user_stats["user_last_ts"]
-        ).dt.days
-        user_stats["user_days_since_first"] = (
-            max_timestamp - user_stats["user_first_ts"]
-        ).dt.days
-
-        data = data.merge(user_stats, on="user_id", how="left")
-
-        # === ПРИЗНАКИ ТОВАРА ===
-        item_stats = (
-            interactions_df.groupby("item_id")
-            .agg(
-                {
-                    "weight": ["count", "mean", "sum", "std", "max", "min"],
-                    "timestamp": ["max", "min"],
-                }
+        # === ПОПУЛЯРНОСТЬ КАТЕГОРИИ ===
+        if "category_id" in data.columns:
+            cat_pop = (
+                data.groupby("category_id")["user_id"]
+                .count()
+                .rename("category_popularity")
+                .reset_index()
             )
-            .reset_index()
-        )
-        item_stats.columns = [
-            "item_id",
-            "item_count",
-            "item_mean",
-            "item_sum",
-            "item_std",
-            "item_max",
-            "item_min",
-            "item_last_ts",
-            "item_first_ts",
-        ]
+            data = data.merge(cat_pop, on="category_id", how="left")
+        else:
+            data["category_popularity"] = 0
 
-        # Время с последнего взаимодействия с товаром
-        item_stats["item_days_since_last"] = (
-            max_timestamp - item_stats["item_last_ts"]
-        ).dt.days
-        item_stats["item_days_since_first"] = (
-            max_timestamp - item_stats["item_first_ts"]
-        ).dt.days
-
-        data = data.merge(item_stats, on="item_id", how="left")
-
-        # === ПРИЗНАКИ ВЗАИМОДЕЙСТВИЯ ПОЛЬЗОВАТЕЛЬ-ТОВАР ===
-        user_item_stats = (
-            interactions_df.groupby(["user_id", "item_id"])
-            .agg(
-                {
-                    "weight": ["count", "mean", "sum", "std", "max", "min"],
-                    "timestamp": ["max", "min"],
-                }
+        # === КОВИЗИТЫ ===
+        if (
+            hasattr(self, "covisitation_matrix")
+            and self.covisitation_matrix is not None
+        ):
+            data["covisitation_score"] = data["item_id"].map(
+                self.covisitation_matrix.get, na_action="ignore"
             )
-            .reset_index()
-        )
-        user_item_stats.columns = [
-            "user_id",
-            "item_id",
-            "ui_count",
-            "ui_mean",
-            "ui_sum",
-            "ui_std",
-            "ui_max",
-            "ui_min",
-            "ui_last_ts",
-            "ui_first_ts",
-        ]
-
-        user_item_stats["ui_days_since_last"] = (
-            max_timestamp - user_item_stats["ui_last_ts"]
-        ).dt.days
-        user_item_stats["ui_days_since_first"] = (
-            max_timestamp - user_item_stats["ui_first_ts"]
-        ).dt.days
-
-        data = data.merge(user_item_stats, on=["user_id", "item_id"], how="left")
-
-        # === КАТЕГОРИАЛЬНЫЕ ПРИЗНАКИ ===
-        if self.item_to_cat:
-            data["item_category"] = data["item_id"].map(self.item_to_cat)
-            # One-hot encoding для топ-20 категорий
-            top_categories = data["item_category"].value_counts().head(20).index
-            for cat in top_categories:
-                data[f"cat_{cat}"] = (data["item_category"] == cat).astype(int)
-
-        # === CO-PURCHASE ПРИЗНАКИ ===
-        if self.copurchase_map:
-            data["copurchase_strength"] = data.apply(
-                lambda row: self._get_copurchase_strength(row["item_id"]), axis=1
-            )
-
-            # Признаки на основе истории пользователя
-            data["user_copurchase_affinity"] = data.apply(
-                lambda row: self._get_user_copurchase_affinity(
-                    row["user_id"], row["item_id"]
-                ),
-                axis=1,
-            )
-
-        # === ВРЕМЕННЫЕ ПРИЗНАКИ ===
-        data["is_weekend"] = data.apply(
-            lambda row: (
-                1
-                if pd.notna(row.get("ui_last_ts")) and row["ui_last_ts"].dayofweek >= 5
-                else 0
-            ),
-            axis=1,
-        )
-
-        data["hour_of_day"] = data.apply(
-            lambda row: (
-                row["ui_last_ts"].hour if pd.notna(row.get("ui_last_ts")) else 12
-            ),
-            axis=1,
-        )
-
-        # === RECENT ITEMS ПРИЗНАКИ ===
-        data["in_recent_items"] = data.apply(
-            lambda row: (
-                1 if row["item_id"] in recent_items_map.get(row["user_id"], []) else 0
-            ),
-            axis=1,
-        )
-
-        data["recent_items_count"] = data["user_id"].map(
-            lambda x: len(recent_items_map.get(x, []))
-        )
-
-        # === ALS ЭМБЕДДИНГИ ===
-        if self.user_embeddings is not None and self.item_embeddings is not None:
-            print("Добавление ALS эмбеддингов...")
-            embedding_size = min(10, self.user_embeddings.shape[1])
-
-            for i in range(embedding_size):
-                # User embeddings
-                data[f"user_als_{i}"] = data["user_id"].map(
-                    lambda x: (
-                        self.user_embeddings[user_map[x], i]
-                        if x in user_map and user_map[x] < self.user_embeddings.shape[0]
-                        else 0.0
-                    )
-                )
-
-                # Item embeddings
-                data[f"item_als_{i}"] = data["item_id"].map(
-                    lambda x: (
-                        self.item_embeddings[item_map[x], i]
-                        if x in item_map and item_map[x] < self.item_embeddings.shape[0]
-                        else 0.0
-                    )
-                )
+            data["covisitation_score"] = data["covisitation_score"].fillna(0)
+        else:
+            data["covisitation_score"] = 0
 
         # === FCLIP ЭМБЕДДИНГИ С ИСПОЛЬЗОВАНИЕМ GPU ===
         if self.external_embeddings_dict:
@@ -1204,13 +1082,13 @@ class LightGBMRecommender:
             # Переносим эмбеддинги на GPU
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-            # Создаем тензор всех эмбеддингов на GPU
+            # Собираем item_ids и размерность
             all_item_ids = list(self.external_embeddings_dict.keys())
             sample_embedding = next(iter(self.external_embeddings_dict.values()))
             embedding_dim = len(sample_embedding)
             n_fclip_dims = min(10, embedding_dim)
 
-            # Создаем тензор всех эмбеддингов [n_items, embedding_dim]
+            # Тензор [n_items, embedding_dim] на GPU
             embeddings_tensor = torch.zeros(
                 len(all_item_ids), embedding_dim, device=device
             )
@@ -1221,17 +1099,17 @@ class LightGBMRecommender:
                     dtype=torch.float32,
                 )
 
-            # Создаем маппинг item_id -> index в тензоре
+            # Маппинг item_id → index
             item_id_to_idx = {item_id: idx for idx, item_id in enumerate(all_item_ids)}
 
-            # Обрабатываем данные батчами на GPU
+            # Обработка батчами
             batch_size = 100000
             total_rows = len(data)
 
             for i in range(n_fclip_dims):
                 print(f"Обработка FCLIP измерения {i+1}/{n_fclip_dims} на GPU...")
 
-                # Создаем колонку заранее
+                # Создаём колонку заранее
                 data[f"fclip_embed_{i}"] = 0.0
 
                 # Обрабатываем батчами
@@ -1239,10 +1117,10 @@ class LightGBMRecommender:
                     end_idx = min(start_idx + batch_size, total_rows)
                     batch_data = data.iloc[start_idx:end_idx]
 
-                    # Получаем item_ids для батча
+                    # item_ids батча
                     batch_item_ids = batch_data["item_id"].values
 
-                    # Создаем маску для товаров, которые есть в эмбеддингах
+                    # Маска для товаров, у которых есть эмбеддинги
                     valid_mask = np.array(
                         [item_id in item_id_to_idx for item_id in batch_item_ids]
                     )
@@ -1250,13 +1128,13 @@ class LightGBMRecommender:
                     valid_item_ids = batch_item_ids[valid_mask]
 
                     if len(valid_item_ids) > 0:
-                        # Получаем индексы в тензоре эмбеддингов
+                        # Индексы в тензоре
                         tensor_indices = [
                             item_id_to_idx[item_id] for item_id in valid_item_ids
                         ]
                         tensor_indices = torch.tensor(tensor_indices, device=device)
 
-                        # Извлекаем нужное измерение эмбеддингов
+                        # Извлекаем измерение эмбеддингов
                         batch_embeddings = (
                             embeddings_tensor[tensor_indices, i].cpu().numpy()
                         )
@@ -1267,63 +1145,15 @@ class LightGBMRecommender:
                             data.columns.get_loc(f"fclip_embed_{i}"),
                         ] = batch_embeddings
 
-                    # Очистка памяти
+                    # Очистка
                     del batch_data, batch_item_ids
                     if start_idx % (batch_size * 5) == 0:
                         torch.cuda.empty_cache()
 
-            # Освобождаем GPU память
+            # Освобождаем память
             del embeddings_tensor, item_id_to_idx
             torch.cuda.empty_cache()
 
-        # === ИНТЕРАКЦИОННЫЕ ПРИЗНАКИ ===
-        data["user_item_affinity"] = data["ui_mean"] * data["user_mean"]
-        data["popularity_affinity"] = data["item_popularity"] * data["user_count"]
-
-        # Взаимодействия пользователя с категорией
-        if self.item_to_cat:
-            user_category_stats = (
-                interactions_df.merge(
-                    pd.DataFrame(
-                        {
-                            "item_id": list(self.item_to_cat.keys()),
-                            "category": list(self.item_to_cat.values()),
-                        }
-                    ),
-                    on="item_id",
-                )
-                .groupby(["user_id", "category"])["weight"]
-                .sum()
-                .reset_index()
-            )
-
-            user_category_pivot = user_category_stats.pivot_table(
-                index="user_id", columns="category", values="weight", fill_value=0
-            )
-            user_category_pivot.columns = [
-                f"user_cat_{col}" for col in user_category_pivot.columns
-            ]
-
-            data = data.merge(user_category_pivot, on="user_id", how="left")
-
-        # Заполняем пропуски
-        numeric_cols = data.select_dtypes(include=[np.number]).columns
-        data[numeric_cols] = data[numeric_cols].fillna(0)
-
-        # Удаляем временные колонки
-        data = data.drop(
-            columns=[col for col in data.columns if "_ts" in col], errors="ignore"
-        )
-        data = data.drop(columns=["item_category"], errors="ignore")
-
-        self.feature_columns = [
-            col
-            for col in data.columns
-            if col not in ["user_id", "item_id", "target", "timestamp"]
-            and data[col].dtype in [np.int64, np.int32, np.float64, np.float32]
-        ]
-
-        print(f"Создано {len(self.feature_columns)} богатых признаков")
         return data
 
     def _get_copurchase_strength(self, item_id):
@@ -1738,6 +1568,7 @@ def get_ui_features_batch(user_item_pairs, ui_features_dir, batch_size=1000):
     Получает UI-признаки для батча пар из всех файлов
     """
     try:
+
         metadata_path = os.path.join(ui_features_dir, "metadata.json")
         if not os.path.exists(metadata_path):
             return []
@@ -1789,8 +1620,14 @@ def build_user_item_features_dict(
 ):
     """
     Создает отдельные файлы UI-признаков для каждого файла взаимодействий.
-    НЕ агрегирует в один файл - все остается на диске.
+    Все колонки преобразованы в числовой тип для LightGBM.
     """
+    import json
+    import os
+    from datetime import datetime
+
+    import polars as pl
+    from tqdm import tqdm
 
     os.makedirs(output_dir, exist_ok=True)
     print("Создание UI-признаков (данные остаются на диске)")
@@ -1798,16 +1635,13 @@ def build_user_item_features_dict(
     try:
         ui_feature_files = []
 
-        for i, input_file in enumerate(
-            tqdm(interactions_files, desc="Создание UI-признаков")
-        ):
+        for input_file in tqdm(interactions_files, desc="Создание UI-признаков"):
             try:
-                # Создаем имя выходного файла на основе входного
                 input_filename = os.path.basename(input_file)
                 output_file = os.path.join(output_dir, f"ui_features_{input_filename}")
 
-                # Обрабатываем каждый файл отдельно и сохраняем на диск
-                (
+                # Поларс агрегирует UI-признаки
+                df = (
                     pl.scan_parquet(input_file)
                     .group_by(["user_id", "item_id"])
                     .agg(
@@ -1822,45 +1656,66 @@ def build_user_item_features_dict(
                     )
                     .with_columns(
                         [
+                            # Среднее значение
                             (pl.col("ui_sum") / pl.col("ui_count"))
                             .fill_nan(0)
                             .alias("ui_mean"),
+                            # Дни с последнего взаимодействия
                             (
                                 (
-                                    pl.lit(datetime.now()) - pl.col("ui_last_ts")
-                                ).dt.total_days()
+                                    pl.lit(datetime.now()).cast(pl.Datetime)
+                                    - pl.col("ui_last_ts").cast(pl.Datetime)
+                                )
+                                .dt.days()
+                                .cast(pl.Float64)
                             ).alias("ui_days_since_last"),
+                            # Дни с первого взаимодействия
                             (
                                 (
-                                    pl.lit(datetime.now()) - pl.col("ui_first_ts")
-                                ).dt.total_days()
+                                    pl.lit(datetime.now()).cast(pl.Datetime)
+                                    - pl.col("ui_first_ts").cast(pl.Datetime)
+                                )
+                                .dt.days()
+                                .cast(pl.Float64)
                             ).alias("ui_days_since_first"),
                         ]
                     )
+                    .select(
+                        [
+                            "user_id",
+                            "item_id",
+                            "ui_count",
+                            "ui_sum",
+                            "ui_max",
+                            "ui_min",
+                            "ui_mean",
+                            "ui_days_since_last",
+                            "ui_days_since_first",
+                        ]
+                    )
                     .fill_null(0)
-                    .sink_parquet(output_file)
                 )
 
+                df.sink_parquet(output_file)
                 ui_feature_files.append(output_file)
 
             except Exception as e:
                 print(f"Ошибка обработки файла {input_file}: {e}")
                 continue
 
-        # Сохраняем список файлов в metadata
+        # Сохраняем metadata
         metadata = {
             "created_date": datetime.now().isoformat(),
             "source_files": len(interactions_files),
             "ui_feature_files": ui_feature_files,
             "output_dir": output_dir,
         }
-
         metadata_path = os.path.join(output_dir, "metadata.json")
         with open(metadata_path, "w") as f:
             json.dump(metadata, f, indent=2)
 
         print(f"✅ Создано {len(ui_feature_files)} файлов UI-признаков в: {output_dir}")
-        return output_dir  # Возвращаем директорию, а не один файл
+        return output_dir
 
     except Exception as e:
         print(f"❌ Ошибка: {e}")
@@ -2262,6 +2117,9 @@ if __name__ == "__main__":
         train_users, val_users = train_test_split(users, test_size=0.2, random_state=42)
 
         train_df = train_data[train_data["user_id"].isin(train_users)]
+        print(train_df.shape)
+        print(train_df.dtypes)
+        print(train_df.head())
         val_df = train_data[train_data["user_id"].isin(val_users)]
 
         log_message(f"Размер train: {len(train_df)}, validation: {len(val_df)}")
@@ -2409,30 +2267,6 @@ if __name__ == "__main__":
 
         traceback_str = traceback.format_exc()
         log_message(traceback_str)
-
-        # Записываем информацию о системе даже при ошибке
-        try:
-            log_message("=== СИСТЕМНАЯ ИНФОРМАЦИЯ ПРИ ОШИБКЕ ===")
-            import multiprocessing
-
-            import psutil
-
-            # CPU
-            cpu_cores = multiprocessing.cpu_count()
-            log_message(f"Ядра CPU: {cpu_cores}")
-
-            # RAM
-            ram = psutil.virtual_memory()
-            ram_total = ram.total / 1024**3
-            ram_used = ram.used / 1024**3
-            log_message(
-                f"Оперативная память: {ram_total:.1f} GB всего, {ram_used:.1f} GB использовано"
-            )
-
-        except Exception as sys_error:
-            log_message(f"Ошибка получения системной информации: {sys_error}")
-
-        raise e
 
     finally:
         # Всегда записываем итоговое время
