@@ -35,23 +35,8 @@ from tqdm.auto import tqdm
 tqdm.pandas()
 
 
-def check_memory(threshold_percent=85):
-    """Проверка использования памяти"""
-    memory = psutil.virtual_memory()
-    if memory.percent > threshold_percent:
-        print(f"⚠️  Внимание: память на {memory.percent}%!")
-        return False
-    return True
-
-
-def safe_memory_cleanup():
-    """Безопасная очистка памяти"""
-    gc.collect()
-    pl.clear_string_cache()
-
-
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=1000):
+def load_train_data(max_parts=0, max_rows=0):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. При max_rows берём первые строки
@@ -888,7 +873,7 @@ class LightGBMRecommender:
         test_orders_df,
         sample_fraction=0.1,
         negatives_per_positive=1,
-        ui_features_path=None,  # добавляем параметр пути к UI-признакам
+        ui_features_dir=None,  # меняем на директорию
     ):
         """
         Векторизованная подготовка данных для LightGBM
@@ -990,19 +975,18 @@ class LightGBMRecommender:
             max_timestamp,
         )
 
-        # 9. Добавляем UI-признаки из файла если они есть
-        if ui_features_path and os.path.exists(ui_features_path):
-            print("Добавление UI-признаков из файла...")
+        # 9. Добавляем UI-признаки из распределенных файлов
+        if ui_features_dir and os.path.exists(ui_features_dir):
+            print("Добавление распределенных UI-признаков...")
             try:
-                # Загружаем только нужные UI-признаки для наших пар
-                ui_features_df = self._load_ui_features_for_pairs(
-                    train_data[["user_id", "item_id"]], ui_features_path
+                # Получаем UI-признаки для наших пар
+                ui_features_batch = get_ui_features_batch(
+                    train_data[["user_id", "item_id"]].to_dict("records"),
+                    ui_features_dir,
                 )
 
-                if ui_features_df is not None and not ui_features_df.empty:
-                    print(f"Загружено {len(ui_features_df)} UI-признаков")
-
-                    # Объединяем с основными данными
+                if ui_features_batch:
+                    ui_features_df = pd.DataFrame(ui_features_batch)
                     train_data = train_data.merge(
                         ui_features_df, on=["user_id", "item_id"], how="left"
                     ).fillna(0)
@@ -1012,22 +996,16 @@ class LightGBMRecommender:
                         col
                         for col in ui_features_df.columns
                         if col not in ["user_id", "item_id"]
-                        and col in train_data.columns
                     ]
 
                     if ui_feature_columns:
                         self.feature_columns.extend(ui_feature_columns)
                         print(f"Добавлены UI-признаки: {ui_feature_columns}")
-                    else:
-                        print("⚠️ UI-признаки не добавились в данные")
                 else:
-                    print("⚠️ Не удалось загрузить UI-признаки")
+                    print("⚠️ Не найдено UI-признаков для указанных пар")
 
             except Exception as e:
                 print(f"Ошибка загрузки UI-признаков: {e}")
-                import traceback
-
-                traceback.print_exc()
 
         print(f"Данные подготовлены: {len(train_data)} примеров")
         return train_data
@@ -1729,52 +1707,82 @@ def build_item_features_dict(
     return item_stats_dict
 
 
-def get_ui_features_for_user_item(user_id, item_id, ui_features_path):
+def get_ui_features_for_user_item(user_id, item_id, ui_features_dir):
     """
-    Получает UI-признаки для конкретной пары user-item без загрузки всего файла
+    Ищет UI-признаки для пары user-item по всем файлам
     """
     try:
-        # Используем фильтрацию на уровне Parquet
-        result = (
-            pl.scan_parquet(ui_features_path)
-            .filter((pl.col("user_id") == user_id) & (pl.col("item_id") == item_id))
-            .collect()
-        )
-
-        if len(result) == 0:
+        metadata_path = os.path.join(ui_features_dir, "metadata.json")
+        if not os.path.exists(metadata_path):
             return None
 
-        return result[0].to_dict()
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+
+        # Ищем в каждом файле
+        for ui_file in metadata["ui_feature_files"]:
+            if not os.path.exists(ui_file):
+                continue
+
+            result = (
+                pl.scan_parquet(ui_file)
+                .filter((pl.col("user_id") == user_id) & (pl.col("item_id") == item_id))
+                .collect()
+            )
+
+            if not result.is_empty():
+                return result[0].to_dict()
+
+        return None
 
     except Exception as e:
-        print(f"Ошибка получения UI-признаков: {e}")
+        print(f"Ошибка поиска UI-признаков: {e}")
         return None
 
 
-def get_ui_features_batch(user_item_pairs, ui_features_path, batch_size=1000):
+def get_ui_features_batch(user_item_pairs, ui_features_dir, batch_size=1000):
     """
-    Получает UI-признаки для батча пар user-item
+    Получает UI-признаки для батча пар из всех файлов
     """
     try:
-        # Создаем временный файл с парами для фильтрации
-        temp_pairs_path = "/tmp/filter_pairs.parquet"
-        pairs_df = pl.DataFrame(user_item_pairs, schema=["user_id", "item_id"])
-        pairs_df.write_parquet(temp_pairs_path)
+        metadata_path = os.path.join(ui_features_dir, "metadata.json")
+        if not os.path.exists(metadata_path):
+            return []
 
-        # Используем join на диске
-        result = (
-            pl.scan_parquet(ui_features_path)
-            .join(
-                pl.scan_parquet(temp_pairs_path), on=["user_id", "item_id"], how="inner"
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+
+        all_results = []
+
+        # Обрабатываем каждый файл UI-признаков
+        for ui_file in metadata["ui_feature_files"]:
+            if not os.path.exists(ui_file):
+                continue
+
+            # Создаем временный файл с парами для фильтрации
+            temp_pairs_path = "/tmp/filter_pairs.parquet"
+            pairs_df = pl.DataFrame(user_item_pairs, schema=["user_id", "item_id"])
+            pairs_df.write_parquet(temp_pairs_path)
+
+            # Ищем совпадения в текущем файле
+            results = (
+                pl.scan_parquet(ui_file)
+                .join(
+                    pl.scan_parquet(temp_pairs_path),
+                    on=["user_id", "item_id"],
+                    how="inner",
+                )
+                .collect()
+                .to_dicts()
             )
-            .collect()
-        )
 
-        # Чистим временный файл
-        if os.path.exists(temp_pairs_path):
-            os.remove(temp_pairs_path)
+            all_results.extend(results)
 
-        return result.to_dicts()
+            # Удаляем временный файл
+            if os.path.exists(temp_pairs_path):
+                os.remove(temp_pairs_path)
+
+        return all_results
 
     except Exception as e:
         print(f"Ошибка получения батча UI-признаков: {e}")
@@ -1783,41 +1791,29 @@ def get_ui_features_batch(user_item_pairs, ui_features_path, batch_size=1000):
 
 def build_user_item_features_dict(
     interactions_files,
-    output_path="/home/root6/python/e_cup/rec_system/data/processed/ui_features",
-    temp_base_dir="/home/root6/python/e_cup/rec_system/data/temp/ui_features",
-    cleanup=False,  # НЕ чистим временные данные - они нам нужны!
+    output_dir="/home/root6/python/e_cup/rec_system/data/processed/ui_features",
+    cleanup=False,
 ):
     """
-    Полностью дисковый подход - данные никогда не загружаются в память целиком.
-    Все операции через внешнюю сортировку и слияние.
+    Создает отдельные файлы UI-признаков для каждого файла взаимодействий.
+    НЕ агрегирует в один файл - все остается на диске.
     """
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    os.makedirs(temp_base_dir, exist_ok=True)
-
-    # Создаем уникальную временную директорию для этого запуска
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    temp_dir = os.path.join(temp_base_dir, f"run_{run_id}")
-    os.makedirs(temp_dir, exist_ok=True)
-
-    print(f"Рабочая директория: {temp_dir}")
-    print("Полностью дисковый подход - память не используется")
+    os.makedirs(output_dir, exist_ok=True)
+    print("Создание UI-признаков (данные остаются на диске)")
 
     try:
-        # 1) Этап: Предварительная агрегация каждого файла
-        print("=== ЭТАП 1: Предварительная агрегация файлов ===")
-        stage1_dir = os.path.join(temp_dir, "stage1_aggregated")
-        os.makedirs(stage1_dir, exist_ok=True)
+        ui_feature_files = []
 
-        aggregated_files = []
         for i, input_file in enumerate(
-            tqdm(interactions_files, desc="Агрегация файлов")
+            tqdm(interactions_files, desc="Создание UI-признаков")
         ):
             try:
-                # Агрегируем каждый файл отдельно и сохраняем на диск
-                output_file = os.path.join(stage1_dir, f"agg_{i:06d}.parquet")
+                # Создаем имя выходного файла на основе входного
+                input_filename = os.path.basename(input_file)
+                output_file = os.path.join(output_dir, f"ui_features_{input_filename}")
 
-                # Используем Polars для агрегации с записью прямо на диск
+                # Обрабатываем каждый файл отдельно и сохраняем на диск
                 (
                     pl.scan_parquet(input_file)
                     .group_by(["user_id", "item_id"])
@@ -1831,118 +1827,50 @@ def build_user_item_features_dict(
                             pl.col("timestamp").min().alias("ui_first_ts"),
                         ]
                     )
+                    .with_columns(
+                        [
+                            (pl.col("ui_sum") / pl.col("ui_count"))
+                            .fill_nan(0)
+                            .alias("ui_mean"),
+                            (
+                                (
+                                    pl.lit(datetime.now()) - pl.col("ui_last_ts")
+                                ).dt.total_days()
+                            ).alias("ui_days_since_last"),
+                            (
+                                (
+                                    pl.lit(datetime.now()) - pl.col("ui_first_ts")
+                                ).dt.total_days()
+                            ).alias("ui_days_since_first"),
+                        ]
+                    )
+                    .fill_null(0)
                     .sink_parquet(output_file)
                 )
 
-                aggregated_files.append(output_file)
+                ui_feature_files.append(output_file)
 
             except Exception as e:
-                print(f"Ошибка агрегации файла {input_file}: {e}")
+                print(f"Ошибка обработки файла {input_file}: {e}")
                 continue
 
-        if not aggregated_files:
-            print("Нет данных для обработки")
-            return None
-
-        # 2) Этап: Внешняя сортировка и слияние
-        print("=== ЭТАП 2: Внешнее слияние ===")
-        stage2_dir = os.path.join(temp_dir, "stage2_merged")
-        os.makedirs(stage2_dir, exist_ok=True)
-
-        # Разбиваем на группы для постепенного слияния
-        merge_groups = []
-        group_size = 10  # сливаем по 10 файлов за раз
-
-        for i in range(0, len(aggregated_files), group_size):
-            group_files = aggregated_files[i : i + group_size]
-            group_output = os.path.join(
-                stage2_dir, f"merge_group_{i//group_size:04d}.parquet"
-            )
-
-            # Сливаем группу файлов
-            (
-                pl.scan_parquet(group_files)
-                .group_by(["user_id", "item_id"])
-                .agg(
-                    [
-                        pl.col("ui_count").sum().alias("ui_count"),
-                        pl.col("ui_sum").sum().alias("ui_sum"),
-                        pl.col("ui_max").max().alias("ui_max"),
-                        pl.col("ui_min").min().alias("ui_min"),
-                        pl.col("ui_last_ts").max().alias("ui_last_ts"),
-                        pl.col("ui_first_ts").min().alias("ui_first_ts"),
-                    ]
-                )
-                .sink_parquet(group_output)
-            )
-
-            merge_groups.append(group_output)
-
-        # 3) Этап: Финальное слияние
-        print("=== ЭТАП 3: Финальное слияние ===")
-        if len(merge_groups) > 1:
-            # Если есть несколько групп, сливаем их
-            final_merge_path = os.path.join(temp_dir, "final_merged.parquet")
-
-            (
-                pl.scan_parquet(merge_groups)
-                .group_by(["user_id", "item_id"])
-                .agg(
-                    [
-                        pl.col("ui_count").sum().alias("ui_count"),
-                        pl.col("ui_sum").sum().alias("ui_sum"),
-                        pl.col("ui_max").max().alias("ui_max"),
-                        pl.col("ui_min").min().alias("ui_min"),
-                        pl.col("ui_last_ts").max().alias("ui_last_ts"),
-                        pl.col("ui_first_ts").min().alias("ui_first_ts"),
-                    ]
-                )
-                .sink_parquet(final_merge_path)
-            )
-        else:
-            final_merge_path = merge_groups[0]
-
-        # 4) Этап: Добавление вычисляемых признаков
-        print("=== ЭТАП 4: Добавление признаков ===")
-        now = datetime.now()
-
-        (
-            pl.scan_parquet(final_merge_path)
-            .with_columns(
-                [
-                    (pl.col("ui_sum") / pl.col("ui_count"))
-                    .fill_nan(0)
-                    .alias("ui_mean"),
-                    ((pl.lit(now) - pl.col("ui_last_ts")).dt.total_days()).alias(
-                        "ui_days_since_last"
-                    ),
-                    ((pl.lit(now) - pl.col("ui_first_ts")).dt.total_days()).alias(
-                        "ui_days_since_first"
-                    ),
-                ]
-            )
-            .fill_null(0)
-            .sink_parquet(output_path)
-        )
-
-        print(f"✅ Финальный файл сохранен: {output_path}")
-
-        # 5) Сохраняем метаданные для последующего использования
+        # Сохраняем список файлов в metadata
         metadata = {
             "created_date": datetime.now().isoformat(),
             "source_files": len(interactions_files),
-            "temp_dir": temp_dir,
-            "output_path": output_path,
+            "ui_feature_files": ui_feature_files,
+            "output_dir": output_dir,
         }
 
-        metadata_path = os.path.join(temp_dir, "metadata.json")
+        metadata_path = os.path.join(output_dir, "metadata.json")
         with open(metadata_path, "w") as f:
             json.dump(metadata, f, indent=2)
 
-        return output_path
+        print(f"✅ Создано {len(ui_feature_files)} файлов UI-признаков в: {output_dir}")
+        return output_dir  # Возвращаем директорию, а не один файл
 
     except Exception as e:
-        print(f"❌ Ошибка в build_user_item_features_dict: {e}")
+        print(f"❌ Ошибка: {e}")
         import traceback
 
         traceback.print_exc()
@@ -2274,41 +2202,27 @@ if __name__ == "__main__":
             f"Item features построены за {timedelta(seconds=item_time)}: {len(item_features_dict)} товаров"
         )
 
-        # User-Item features - дисковый подход
+        # User-Item features - распределенный подход
         ui_start = time.time()
-        ui_features_path = build_user_item_features_dict(
+        ui_features_dir = build_user_item_features_dict(
             interactions_files,
-            output_path="/home/root6/python/e_cup/rec_system/data/processed/ui_features.parquet",
-            temp_base_dir="/home/root6/python/e_cup/rec_system/data/temp/ui_features",
-            cleanup=False,  # НЕ удаляем временные данные - они остаются на диске
+            output_dir="/home/root6/python/e_cup/rec_system/data/processed/ui_features_distributed",
         )
 
-        if ui_features_path is None:
-            log_message("⚠️ User-Item features пустые, пропускаем этап.")
+        if ui_features_dir is None:
+            log_message("⚠️ User-Item features не созданы, пропускаем этап.")
         else:
-            # Проверяем что файл действительно создан и не пустой
-            if (
-                os.path.exists(ui_features_path)
-                and os.path.getsize(ui_features_path) > 0
-            ):
-                file_size_mb = os.path.getsize(ui_features_path) / (1024 * 1024)
-                log_message(f"User-Item features сохранены: {ui_features_path}")
-                log_message(f"Размер файла: {file_size_mb:.2f} MB")
-
-                # Для отладки: посмотрим структуру файла
-                try:
-                    # Быстрая проверка без загрузки всего файла
-                    sample_check = pl.scan_parquet(ui_features_path).limit(1).collect()
-                    if not sample_check.is_empty():
-                        log_message(f"Структура UI-признаков: {sample_check.columns}")
-                        log_message(f"Пример записи: {dict(sample_check[0])}")
-                    else:
-                        log_message("⚠️ UI-признаки файл пустой")
-                except Exception as e:
-                    log_message(f"⚠️ Ошибка проверки UI-файла: {e}")
+            # Проверяем что директория создана и есть файлы
+            metadata_path = os.path.join(ui_features_dir, "metadata.json")
+            if os.path.exists(metadata_path):
+                with open(metadata_path, "r") as f:
+                    metadata = json.load(f)
+                file_count = len(metadata.get("ui_feature_files", []))
+                log_message(f"User-Item features созданы в: {ui_features_dir}")
+                log_message(f"Количество файлов: {file_count}")
             else:
-                log_message("⚠️ Файл UI-признаков не создан или пустой")
-                ui_features_path = None
+                log_message("⚠️ Метаданные UI-признаков не найдены")
+                ui_features_dir = None
 
         ui_time = time.time() - ui_start
         log_message(f"User-Item features построены за {timedelta(seconds=ui_time)}")
