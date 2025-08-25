@@ -34,6 +34,9 @@ from tqdm.auto import tqdm
 # tqdm интеграция с pandas
 tqdm.pandas()
 
+# 1000 строк ок
+# 100_000 строк
+
 
 # -------------------- Загрузка данных --------------------
 def load_train_data(max_parts=0, max_rows=1000):
@@ -116,34 +119,32 @@ def load_train_data(max_parts=0, max_rows=1000):
 
         total_parts = ddf.npartitions
 
-        # --- режим "все строки"
+        # --- режим "все строки" - оставляем как есть
         if max_rows == 0:
             out_ddf = ddf
             used_parts = total_parts
+            count = out_ddf.shape[0].compute()  # вычисляем количество строк
         else:
-            # --- читаем кусками пока не наберём нужное
-            parts_to_read = (
-                total_parts if max_parts == 0 else min(max_parts, total_parts)
-            )
-            dfs = []
-            rows_accum = 0
-            for i in range(parts_to_read):
-                part = ddf.get_partition(i).head(max_rows - rows_accum, compute=True)
-                if part.empty:
-                    continue
-                dfs.append(part)
-                rows_accum += len(part)
-                if rows_accum >= max_rows:
-                    break
-            out_df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-            out_ddf = dd.from_pandas(out_df, npartitions=1)
-            used_parts = i + 1
+            # --- НОВЫЙ ПОДХОД: используем Dask для выборки без загрузки в память ---
+            if max_parts == 0:
+                # Берем все партиции, но ограничиваем строки
+                out_ddf = ddf.head(max_rows, compute=False)  # НЕ вычисляем сразу!
+                used_parts = total_parts
+            else:
+                # Ограничиваем и партиции и строки
+                parts_to_read = min(max_parts, total_parts)
+                # Создаем новый Dask DataFrame из первых N партиций
+                out_ddf = ddf.partitions[:parts_to_read].head(max_rows, compute=False)
+                used_parts = parts_to_read
 
-        count = len(out_ddf)
-        mem_mb = out_ddf.memory_usage(deep=True).sum().compute() / (1024**2)
+            # Вычисляем приблизительное количество строк (без загрузки в память)
+            count = out_ddf.shape[0].compute()
+
+        # Вычисляем использование памяти приблизительно
+        mem_estimate = out_ddf.memory_usage(deep=True).sum().compute() / (1024**2)
 
         print(
-            f"{name}: {count:,} строк (использовано {used_parts} из {total_parts} партиций), ~{mem_mb:.1f} MB"
+            f"{name}: {count:,} строк (использовано {used_parts} из {total_parts} партиций), ~{mem_estimate:.1f} MB"
         )
         return out_ddf
 
