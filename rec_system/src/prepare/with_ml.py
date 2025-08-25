@@ -99,7 +99,7 @@ def load_train_data(max_parts=0, max_rows=10_000_000):
     ):
         files = find_parquet_files(folder)
         if not files:
-            print(f"{name}: parquet файлы не найдены в {folder}")
+            log_message(f"{name}: parquet файлы не найдены в {folder}")
             return dd.from_pandas(pd.DataFrame(), npartitions=1)
 
         current_dtypes = dtype_profiles.get(name, {})
@@ -114,13 +114,15 @@ def load_train_data(max_parts=0, max_rows=10_000_000):
                 split_row_groups=True,
             )
         except Exception as e:
-            print(f"{name}: ошибка при чтении parquet ({e}), пропускаем")
+            log_message(f"{name}: ошибка при чтении parquet ({e}), пропускаем")
             return dd.from_pandas(pd.DataFrame(), npartitions=1)
 
         if columns is not None:
             available_cols = [c for c in columns if c in ddf.columns]
             if not available_cols:
-                print(f"{name}: ни одна из колонок {columns} не найдена, пропускаем")
+                log_message(
+                    f"{name}: ни одна из колонок {columns} не найдена, пропускаем"
+                )
                 return dd.from_pandas(pd.DataFrame(), npartitions=1)
             ddf = ddf[available_cols]
 
@@ -137,7 +139,7 @@ def load_train_data(max_parts=0, max_rows=10_000_000):
         if max_rows == 0:
             count = ddf.shape[0].compute()
             mem_estimate = ddf.memory_usage(deep=True).sum().compute() / (1024**2)
-            print(
+            log_message(
                 f"{name}: {count:,} строк (использовано {used_parts} из {total_parts} партиций), ~{mem_estimate:.1f} MB"
             )
             return ddf
@@ -150,7 +152,7 @@ def load_train_data(max_parts=0, max_rows=10_000_000):
             # Если строк меньше лимита - возвращаем всё
             count = total_rows
             mem_estimate = ddf.memory_usage(deep=True).sum().compute() / (1024**2)
-            print(
+            log_message(
                 f"{name}: {count:,} строк (использовано {used_parts} из {total_parts} партиций), ~{mem_estimate:.1f} MB"
             )
             return ddf
@@ -162,12 +164,12 @@ def load_train_data(max_parts=0, max_rows=10_000_000):
             mem_estimate = limited_ddf.memory_usage(deep=True).sum().compute() / (
                 1024**2
             )
-            print(
+            log_message(
                 f"{name}: {count:,} строк (использовано {used_parts} из {total_parts} партиций), ~{mem_estimate:.1f} MB"
             )
             return limited_ddf
 
-    print("Загружаем данные...")
+    log_message("Загружаем данные...")
     orders_ddf = read_sample(
         paths["orders"], columns=columns_map["orders"], name="orders"
     )
@@ -181,7 +183,7 @@ def load_train_data(max_parts=0, max_rows=10_000_000):
     test_users_ddf = read_sample(
         paths["test_users"], columns=columns_map["test_users"], name="test_users"
     )
-    print("Данные загружены")
+    log_message("Данные загружены")
 
     return orders_ddf, tracker_ddf, items_ddf, categories_ddf, test_users_ddf
 
@@ -191,12 +193,12 @@ def filter_data(orders_ddf, tracker_ddf, items_ddf):
     """
     Фильтруем: берём только доставленные заказы и действия page_view, favorite, to_cart.
     """
-    print("Фильтрация данных...")
+    log_message("Фильтрация данных...")
     orders_ddf = orders_ddf[orders_ddf["last_status"] == "delivered_orders"]
     tracker_ddf = tracker_ddf[
         tracker_ddf["action_type"].isin(["page_view", "favorite", "to_cart"])
     ]
-    print("Фильтрация завершена")
+    log_message("Фильтрация завершена")
     return orders_ddf, tracker_ddf, items_ddf
 
 
@@ -230,20 +232,20 @@ def prepare_interactions(
     cutoff_ts_per_user,
     batch_size=300_000_000,
     action_weights=None,
-    scale_days=60,
+    scale_days=5,
     output_dir="/home/root6/python/e_cup/rec_system/data/processed/prepare_interactions_batches",
 ):
-    print("Формируем матрицу взаимодействий по батчам...")
+    log_message("Формируем матрицу взаимодействий по батчам...")
 
     if action_weights is None:
-        action_weights = {"page_view": 2, "favorite": 4, "to_cart": 6}
+        action_weights = {"page_view": 2, "favorite": 5, "to_cart": 10}
 
     os.makedirs(output_dir, exist_ok=True)
     batch_files = []
     ref_time = train_orders_df["created_timestamp"].max()
 
     # ====== Orders ======
-    print("... для orders")
+    log_message("... для orders")
     n_rows = len(train_orders_df)
     for start in range(0, n_rows, batch_size):
         batch = train_orders_df.iloc[start : start + batch_size].copy()
@@ -259,10 +261,10 @@ def prepare_interactions(
         batch_files.append(path)
         del batch
         gc.collect()
-        print(f"Сохранен orders-батч {start}-{min(start+batch_size, n_rows)}")
+        log_message(f"Сохранен orders-батч {start}-{min(start+batch_size, n_rows)}")
 
     # ====== Tracker ====== # ИСПРАВЛЕНИЕ ЗДЕСЬ
-    print("... для tracker")
+    log_message("... для tracker")
     tracker_ddf = tracker_ddf[["user_id", "item_id", "timestamp", "action_type"]]
 
     # Итерируемся по партициям Dask DataFrame
@@ -292,9 +294,9 @@ def prepare_interactions(
         batch_files.append(path)
         del part
         gc.collect()
-        print(f"Сохранен tracker-партиция {partition_id}")
+        log_message(f"Сохранен tracker-партиция {partition_id}")
 
-    print("Все батчи сохранены на диск.")
+    log_message("Все батчи сохранены на диск.")
     return batch_files
 
 
@@ -307,7 +309,7 @@ def compute_global_popularity(orders_df, cutoff_ts_info):
         orders_df: Все заказы (до split)
         cutoff_ts_info: либо словарь {user_id: cutoff_ts}, либо один глобальный pd.Timestamp
     """
-    print("Считаем глобальную популярность на основе тренировочных данных...")
+    log_message("Считаем глобальную популярность на основе тренировочных данных...")
 
     orders_df = orders_df.copy()
     orders_df["created_timestamp"] = pd.to_datetime(orders_df["created_timestamp"])
@@ -334,7 +336,7 @@ def compute_global_popularity(orders_df, cutoff_ts_info):
 
     # Считаем популярность только на тренировочных данных
     if train_orders_df.empty:
-        print("Нет тренировочных заказов для расчёта популярности.")
+        log_message("Нет тренировочных заказов для расчёта популярности.")
         return pd.Series(dtype=float)
 
     pop = (
@@ -343,7 +345,7 @@ def compute_global_popularity(orders_df, cutoff_ts_info):
         .sort_values(ascending=False)
     )
     popularity = pop / pop.max()
-    print(
+    log_message(
         f"Глобальная популярность рассчитана на {len(train_orders_df)} тренировочных заказах"
     )
     return popularity
@@ -357,7 +359,7 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
     # 1. ПРОХОД: Построение маппингов
     user_set = set()
     item_set = set()
-    print("Первый проход: построение маппингов...")
+    log_message("Первый проход: построение маппингов...")
 
     for f in tqdm(interactions_files):
         df = pl.read_parquet(f, columns=["user_id", "item_id"])
@@ -366,10 +368,12 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
 
     user_map = {u: i for i, u in enumerate(sorted(user_set))}
     item_map = {i: j for j, i in enumerate(sorted(item_set))}
-    print(f"Маппинги построены. Уников: users={len(user_map)}, items={len(item_map)}")
+    log_message(
+        f"Маппинги построены. Уников: users={len(user_map)}, items={len(item_map)}"
+    )
 
     # 2. ПРОХОД: Сохранение батчей на указанный диск
-    print("Сохранение батчей на диск...")
+    log_message("Сохранение батчей на диск...")
 
     # Используем указанный адрес вместо временной директории
     batch_dir = "/home/root6/python/e_cup/rec_system/data/processed/als_batches/"
@@ -401,7 +405,7 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
             batch_files.append(batch_path)
 
     # 3. Постепенная загрузка и обучение
-    print("Постепенное обучение...")
+    log_message("Постепенное обучение...")
 
     als_model = TorchALS(len(user_map), len(item_map), n_factors=64, device="cuda")
 
@@ -432,28 +436,28 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
                 torch.cuda.empty_cache()
 
         except Exception as e:
-            print(f"Ошибка обработки батча {batch_path}: {e}")
+            log_message(f"Ошибка обработки батча {batch_path}: {e}")
             continue
 
     # Опционально: удаляем временные файлы после обучения
-    print("Очистка временных файлов...")
+    log_message("Очистка временных файлов...")
     for batch_path in batch_files:
         try:
             os.remove(batch_path)
         except Exception as e:
-            print(f"Ошибка удаления файла {batch_path}: {e}")
+            log_message(f"Ошибка удаления файла {batch_path}: {e}")
 
     # Проверяем, пуста ли директория и удаляем ее
     try:
         if not os.listdir(batch_dir):
             os.rmdir(batch_dir)
-            print("Директория батчей удалена")
+            log_message("Директория батчей удалена")
         else:
-            print("В директории остались файлы, не удаляем")
+            log_message("В директории остались файлы, не удаляем")
     except Exception as e:
-        print(f"Ошибка удаления директории: {e}")
+        log_message(f"Ошибка удаления директории: {e}")
 
-    print("Обучение завершено!")
+    log_message("Обучение завершено!")
     return als_model, user_map, item_map
 
 
@@ -463,14 +467,14 @@ def build_copurchase_map(
     """
     строим словарь совместных покупок для топ-N товаров
     """
-    print("Строим co-purchase матрицу для топ-N товаров...")
+    log_message("Строим co-purchase матрицу для топ-N товаров...")
 
     # 1. Находим топ-10000 популярных товаров
     item_popularity = train_orders_df["item_id"].value_counts()
     top_items = item_popularity.head(max_items).index.tolist()
     popular_items_set = set(top_items)
 
-    print(f"Топ-{len(top_items)} популярных товаров определены")
+    log_message(f"Топ-{len(top_items)} популярных товаров определены")
 
     # 2. Группируем корзины и фильтруем только популярные товары
     baskets = []
@@ -483,17 +487,17 @@ def build_copurchase_map(
             baskets.append(filtered_items)
 
     if not baskets:
-        print("Нет корзин с популярными товарами")
+        log_message("Нет корзин с популярными товарами")
         return {}
 
-    print(f"Обрабатываем {len(baskets)} корзин с популярными товарами")
+    log_message(f"Обрабатываем {len(baskets)} корзин с популярными товарами")
 
     # 3. Словарь {item_id -> index} только для популярных товаров
     item2idx = {it: i for i, it in enumerate(top_items)}
     idx2item = {i: it for it, i in item2idx.items()}
     n_items = len(top_items)
 
-    print(f"Уникальных популярных товаров: {n_items}")
+    log_message(f"Уникальных популярных товаров: {n_items}")
 
     # 4. Вместо плотной матрицы используем sparse coo format
     rows, cols, values = [], [], []
@@ -519,10 +523,10 @@ def build_copurchase_map(
 
     # 5. Создаем sparse матрицу на GPU
     if not rows:
-        print("Нет данных для построения матрицы")
+        log_message("Нет данных для построения матрицы")
         return {}
 
-    print(f"Создаем sparse матрицу из {len(rows)} взаимодействий...")
+    log_message(f"Создаем sparse матрицу из {len(rows)} взаимодействий...")
 
     rows_tensor = torch.tensor(rows, dtype=torch.long, device=device)
     cols_tensor = torch.tensor(cols, dtype=torch.long, device=device)
@@ -535,7 +539,7 @@ def build_copurchase_map(
         device=device,
     ).coalesce()  # объединяем дубликаты
 
-    print(
+    log_message(
         f"Sparse матрица построена: {co_matrix.shape}, ненулевых элементов: {co_matrix._nnz()}"
     )
 
@@ -547,7 +551,7 @@ def build_copurchase_map(
     indices = co_matrix.indices()
     values = co_matrix.values()
 
-    print("Формируем рекомендации...")
+    log_message("Формируем рекомендации...")
     for i in tqdm(range(n_items), desc="Обработка товаров"):
         # Находим все элементы в i-й строке
         mask = indices[0] == i
@@ -566,13 +570,13 @@ def build_copurchase_map(
                     if topk_vals[j].item() > 0
                 ]
 
-    print(f"Co-purchase словарь построен для {len(final_copurchase)} товаров")
+    log_message(f"Co-purchase словарь построен для {len(final_copurchase)} товаров")
 
     # 8. Статистика
     avg_recommendations = sum(len(v) for v in final_copurchase.values()) / max(
         1, len(final_copurchase)
     )
-    print(f"В среднем {avg_recommendations:.1f} рекомендаций на товар")
+    log_message(f"В среднем {avg_recommendations:.1f} рекомендаций на товар")
 
     return final_copurchase
 
@@ -581,7 +585,7 @@ def build_category_maps(items_df, categories_df):
     """
     Ускоренная версия: строим маппинги товаров и категорий.
     """
-    print("Построение категорийных маппингов...")
+    log_message("Построение категорийных маппингов...")
 
     # Товар -> категория
     item_to_cat = dict(zip(items_df["item_id"], items_df["catalogid"]))
@@ -695,7 +699,7 @@ def build_recent_items_map_from_batches(batch_dir, recent_n=5):
                     recent_items_map[user_id] = combined
 
         except Exception as e:
-            print(f"Ошибка обработки файла {f}: {e}")
+            log_message(f"Ошибка обработки файла {f}: {e}")
             continue
 
     return recent_items_map
@@ -717,7 +721,7 @@ def save_model(model, user_map, item_map, path="src/models/model_als.pkl"):
     with open(path, "wb") as f:
         pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    print(f"✅ Модель сохранена: {path}")
+    log_message(f"✅ Модель сохранена: {path}")
 
 
 # -------------------- Метрики --------------------
@@ -837,7 +841,7 @@ class TorchALS(nn.Module):
             self.partial_optimizer.step()
 
             if show_progress and (epoch % 10 == 0 or epoch == iterations - 1):
-                print(f"Partial fit epoch {epoch}, Loss: {total_loss.item():.6f}")
+                log_message(f"Partial fit epoch {epoch}, Loss: {total_loss.item():.6f}")
 
 
 class LightGBMRecommender:
@@ -903,7 +907,7 @@ class LightGBMRecommender:
             return result
 
         except Exception as e:
-            print(f"Ошибка загрузки UI-признаков для пар: {e}")
+            log_message(f"Ошибка загрузки UI-признаков для пар: {e}")
             return None
 
     def _add_rich_features(
@@ -911,7 +915,7 @@ class LightGBMRecommender:
     ) -> pd.DataFrame:
         """Добавление расширенных фич с предотвращением утечки данных."""
 
-        print("Добавление богатых признаков...")
+        log_message("Добавление богатых признаков...")
 
         # Временные фичи
         if "timestamp" in data.columns:
@@ -919,11 +923,11 @@ class LightGBMRecommender:
                 data["is_weekend"] = data["timestamp"].dt.dayofweek >= 5
                 data["hour"] = data["timestamp"].dt.hour
             except Exception as e:
-                print(f"Не удалось преобразовать timestamp: {e}")
+                log_message(f"Не удалось преобразовать timestamp: {e}")
                 data["is_weekend"] = 0
                 data["hour"] = -1
         else:
-            print("⚠️ Внимание: в данных нет колонки 'timestamp'.")
+            log_message("⚠️ Внимание: в данных нет колонки 'timestamp'.")
             data["is_weekend"] = np.nan
             data["hour"] = np.nan
 
@@ -969,7 +973,7 @@ class LightGBMRecommender:
 
         # FCLIP эмбеддинги
         if self.external_embeddings_dict:
-            print("Ускоренная обработка FCLIP эмбеддингов на GPU...")
+            log_message("Ускоренная обработка FCLIP эмбеддингов на GPU...")
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             all_item_ids = list(self.external_embeddings_dict.keys())
             embedding_dim = len(next(iter(self.external_embeddings_dict.values())))
@@ -990,7 +994,7 @@ class LightGBMRecommender:
             total_rows = len(data)
 
             for i in range(n_fclip_dims):
-                print(f"Обработка FCLIP измерения {i+1}/{n_fclip_dims} на GPU...")
+                log_message(f"Обработка FCLIP измерения {i+1}/{n_fclip_dims} на GPU...")
                 data[f"fclip_embed_{i}"] = 0.0
 
                 for start_idx in range(0, total_rows, batch_size):
@@ -1038,8 +1042,8 @@ class LightGBMRecommender:
                 self.feature_columns.append(feature)
                 existing_features.add(feature)
 
-        print(f"Добавлены фичи: {[f for f in new_features if f in data.columns]}")
-        print(f"Всего фич после добавления: {len(self.feature_columns)}")
+        log_message(f"Добавлены фичи: {[f for f in new_features if f in data.columns]}")
+        log_message(f"Всего фич после добавления: {len(self.feature_columns)}")
 
         return data
 
@@ -1056,134 +1060,141 @@ class LightGBMRecommender:
         ui_features_dir=None,
         val_days: int = 7,
     ):
-        print("Подготовка данных для LightGBM...")
+        log_message("Подготовка данных для LightGBM...")
         test_orders_df = test_orders_df.sample(frac=sample_fraction, random_state=42)
 
-        # 1. Загрузка взаимодействий
-        interactions_chunks = [
-            pd.read_parquet(f, columns=["user_id", "item_id", "timestamp", "weight"])
-            for f in tqdm(interactions_files, desc="Загрузка взаимодействий")
-        ]
+        # 1. Загрузка взаимодействий с оптимизацией
+        interactions_chunks = []
+        for f in tqdm(interactions_files, desc="Загрузка взаимодействий"):
+            df = pd.read_parquet(
+                f, columns=["user_id", "item_id", "timestamp", "weight"]
+            )
+            df["user_id"] = df["user_id"].astype("int64")
+            df["item_id"] = df["item_id"].astype("int64")
+            interactions_chunks.append(df)
+
         interactions_df = pd.concat(interactions_chunks, ignore_index=True)
         interactions_df["timestamp"] = pd.to_datetime(interactions_df["timestamp"])
         max_timestamp = interactions_df["timestamp"].max()
 
-        # 2. Рассчитываем split_time ДО сэмплинга негативов
+        # 2. Рассчитываем split_time
         split_time = max_timestamp - pd.Timedelta(days=val_days)
-        train_timestamp_fill = split_time - pd.Timedelta(
-            seconds=1
-        )  # метка для "train" по умолчанию
-
-        # Приведение типов к int64 для стабильного merge
-        for df in [interactions_df, test_orders_df]:
-            if "user_id" in df.columns:
-                df["user_id"] = df["user_id"].astype("int64")
-            if "item_id" in df.columns:
-                df["item_id"] = df["item_id"].astype("int64")
+        train_timestamp_fill = split_time - pd.Timedelta(seconds=1)
 
         # 3. Позитивные примеры
+        test_orders_df["user_id"] = test_orders_df["user_id"].astype("int64")
+        test_orders_df["item_id"] = test_orders_df["item_id"].astype("int64")
+
         positive_df = test_orders_df[["user_id", "item_id"]].copy()
         positive_df["target"] = 1
 
-        # если в test_orders_df есть timestamp — используем его, иначе берём из interactions (или ставим train_timestamp_fill)
-        if "timestamp" in test_orders_df.columns:
-            positive_with_time = positive_df.merge(
-                test_orders_df[["user_id", "item_id", "timestamp"]].drop_duplicates(
-                    subset=["user_id", "item_id"]
-                ),
-                on=["user_id", "item_id"],
-                how="left",
-            )
-        else:
-            positive_with_time = positive_df.merge(
-                interactions_df[["user_id", "item_id", "timestamp"]].drop_duplicates(
-                    subset=["user_id", "item_id"]
-                ),
-                on=["user_id", "item_id"],
-                how="left",
-            )
+        # 4. История взаимодействий с оптимизацией
+        user_interacted_items = {}
+        user_positive_items = {}
 
-        positive_with_time["timestamp"] = pd.to_datetime(
-            positive_with_time["timestamp"]
-        )
-        # Заполняем пропуски так, чтобы они относились к train (не вваливались во все валидации)
-        positive_with_time["timestamp"] = positive_with_time["timestamp"].fillna(
-            train_timestamp_fill
-        )
+        # Быстрое создание словарей через groupby
+        for user_id, group in interactions_df.groupby("user_id"):
+            user_interacted_items[user_id] = set(group["item_id"].unique())
 
-        # 4. История взаимодействий
-        user_interacted_items = (
-            interactions_df.groupby("user_id")["item_id"].agg(set).to_dict()
-        )
-        user_positive_items = (
-            positive_df.groupby("user_id")["item_id"].agg(set).to_dict()
-        )
+        for user_id, group in positive_df.groupby("user_id"):
+            user_positive_items[user_id] = set(group["item_id"].unique())
 
-        # 5. Сэмплинг негативных — даём им timestamp в тренировочной зоне (split_time - 1s)
+        # 5. ОПТИМИЗИРОВАННЫЙ сэмплинг негативов
         all_items = np.array(list(item_map.keys()), dtype=np.int64)
-        popular_items = set(popularity_s.nlargest(10000).index.tolist())
+        popular_items_set = set(popularity_s.nlargest(10000).index.astype(np.int64))
+
         negative_samples = []
 
+        # Предварительно вычисляем доступные items для каждого пользователя
+        user_available_items = {}
+
         for user_id, pos_items in tqdm(
-            user_positive_items.items(), desc="Негативные сэмплы"
+            user_positive_items.items(), desc="Подготовка негативных сэмплов"
         ):
             interacted = user_interacted_items.get(user_id, set())
             excluded = pos_items | interacted
-            available_items = all_items[~np.isin(all_items, list(excluded))]
-            if len(available_items) == 0:
-                continue
+
+            # Используем numpy для быстрой фильтрации
+            available_mask = ~np.isin(all_items, list(excluded))
+            available_items = all_items[available_mask]
+
+            if len(available_items) > 0:
+                user_available_items[user_id] = available_items
+
+        # Параллельная обработка пользователей
+        def process_user(user_id):
+            available_items = user_available_items.get(user_id)
+            if available_items is None or len(available_items) == 0:
+                return []
 
             n_neg = negatives_per_positive
-            popular_candidates = available_items[
-                np.isin(available_items, list(popular_items))
-            ]
-            random_candidates = available_items[
-                ~np.isin(available_items, list(popular_items))
-            ]
+
+            # Быстрая проверка популярности через множества
+            popular_mask = np.isin(available_items, list(popular_items_set))
+            popular_candidates = available_items[popular_mask]
+            random_candidates = available_items[~popular_mask]
 
             sampled_items = []
+
             if len(popular_candidates) > 0:
+                n_popular = min(n_neg // 2, len(popular_candidates))
                 sampled_items.extend(
-                    np.random.choice(
-                        popular_candidates,
-                        min(n_neg // 2, len(popular_candidates)),
-                        replace=False,
-                    )
-                )
-            if len(random_candidates) > 0:
-                sampled_items.extend(
-                    np.random.choice(
-                        random_candidates,
-                        min(n_neg - len(sampled_items), len(random_candidates)),
-                        replace=False,
-                    )
+                    np.random.choice(popular_candidates, n_popular, replace=False)
                 )
 
-            negative_samples.extend(
-                [
-                    {
-                        "user_id": int(user_id),
-                        "item_id": int(item_id),
-                        "timestamp": train_timestamp_fill,  # ключ: негативы в тренировочной зоне
-                        "target": 0,
-                    }
-                    for item_id in sampled_items
-                ]
-            )
+            if len(random_candidates) > 0 and len(sampled_items) < n_neg:
+                n_random = min(n_neg - len(sampled_items), len(random_candidates))
+                sampled_items.extend(
+                    np.random.choice(random_candidates, n_random, replace=False)
+                )
+
+            return [
+                {
+                    "user_id": int(user_id),
+                    "item_id": int(item_id),
+                    "timestamp": train_timestamp_fill,
+                    "target": 0,
+                }
+                for item_id in sampled_items
+            ]
+
+        # Используем многопоточность для ускорения
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        user_ids = list(user_available_items.keys())
+        negative_samples = []
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            future_to_user = {
+                executor.submit(process_user, user_id): user_id for user_id in user_ids
+            }
+
+            for future in tqdm(
+                as_completed(future_to_user),
+                total=len(user_ids),
+                desc="Генерация негативов",
+            ):
+                result = future.result()
+                negative_samples.extend(result)
 
         negative_df = pd.DataFrame(negative_samples)
 
         # 6. Объединяем и перемешиваем
+        positive_with_time = positive_df.copy()
+        positive_with_time["timestamp"] = (
+            train_timestamp_fill  # Все позитивы в train зоне
+        )
+
         full_data = pd.concat([positive_with_time, negative_df], ignore_index=True)
         full_data = full_data.sample(frac=1, random_state=42).reset_index(drop=True)
 
-        # 7. Разделяем train/val по split_time
+        # 7. Разделяем train/val
         train_data = full_data[full_data["timestamp"] <= split_time].copy()
         val_data = full_data[full_data["timestamp"] > split_time].copy()
 
-        # fallback: если val пустой — берем последние 10%
+        # Остальной код без изменений...
         if len(val_data) == 0:
-            print(
+            log_message(
                 "⚠️ Валидация пуста — используем последние 10% примеров как val (fallback)."
             )
             cutoff = int(len(full_data) * 0.9)
@@ -1192,75 +1203,76 @@ class LightGBMRecommender:
                 full_data.iloc[cutoff:].copy(),
             )
 
-        # 8. Добавляем фичи (train_only_data предотвращает утечку)
+        # 8. Добавляем фичи
         train_data = self._add_rich_features(train_data, train_only_data=train_data)
         val_data = self._add_rich_features(val_data, train_only_data=train_data)
 
-        # 9. Добавляем UI-фичи (приводим типы join keys)
-        for dataset_name, dataset in [("train", train_data), ("val", val_data)]:
-            if ui_features_dir and os.path.exists(ui_features_dir):
-                try:
-                    ui_features_batch = get_ui_features_batch(
-                        dataset[["user_id", "item_id"]].to_dict("records"),
-                        ui_features_dir,
-                    )
-                    if ui_features_batch:
-                        ui_features_df = pd.DataFrame(ui_features_batch)
-                        # привести ключи к int64
-                        if "user_id" in ui_features_df.columns:
-                            ui_features_df["user_id"] = ui_features_df[
-                                "user_id"
-                            ].astype("int64")
-                        if "item_id" in ui_features_df.columns:
-                            ui_features_df["item_id"] = ui_features_df[
-                                "item_id"
-                            ].astype("int64")
-
-                        cols_to_drop = [
-                            c
-                            for c in ui_features_df.columns
-                            if c in dataset.columns and c not in ["user_id", "item_id"]
-                        ]
-                        ui_features_df = ui_features_df.drop(columns=cols_to_drop)
-
-                        dataset = dataset.merge(
-                            ui_features_df, on=["user_id", "item_id"], how="left"
-                        ).fillna(0)
-
-                        ui_feature_columns = [
-                            col
-                            for col in ui_features_df.columns
-                            if col not in ["user_id", "item_id"]
-                        ]
-                        self.feature_columns.extend(
-                            [
-                                col
-                                for col in ui_feature_columns
-                                if col not in self.feature_columns
-                            ]
-                        )
-
-                        if dataset_name == "train":
-                            train_data = dataset
-                        else:
-                            val_data = dataset
-
-                        print(
-                            f"Добавлены UI признаки ({dataset_name}): {ui_feature_columns}"
-                        )
-                except Exception as e:
-                    print(f"Ошибка загрузки UI-признаков для {dataset_name}: {e}")
-
-        # 10. Диагностика: размеры и баланс
-        def print_dist(df, name):
-            print(
-                f"{name}: rows={len(df)}; target_counts=\n{df['target'].value_counts(dropna=False).to_dict()}"
+        # 9. UI фичи (оптимизированная версия)
+        if ui_features_dir and os.path.exists(ui_features_dir):
+            train_data, val_data = self._add_ui_features_optimized(
+                train_data, val_data, ui_features_dir
             )
 
-        print_dist(train_data, "TRAIN")
-        print_dist(val_data, "VAL")
-        print(f"split_time = {split_time} (val_days={val_days})")
-        print(f"✅ Данные подготовлены: train={len(train_data)}, val={len(val_data)}")
+        # 10. Диагностика
+        def log_message_dist(df, name):
+            counts = df["target"].value_counts(dropna=False).to_dict()
+            log_message(f"{name}: rows={len(df)}; target_counts={counts}")
+
+        log_message_dist(train_data, "TRAIN")
+        log_message_dist(val_data, "VAL")
+        log_message(f"split_time = {split_time} (val_days={val_days})")
+        log_message(
+            f"✅ Данные подготовлены: train={len(train_data)}, val={len(val_data)}"
+        )
+
+        return train_data, val_data
+
+    # Добавляем оптимизированный метод для UI фич
+    def _add_ui_features_optimized(self, train_data, val_data, ui_features_dir):
+        """Оптимизированное добавление UI фич"""
+        try:
+            # Объединяем данные для batch processing
+            all_data = pd.concat(
+                [train_data[["user_id", "item_id"]], val_data[["user_id", "item_id"]]],
+                ignore_index=True,
+            )
+
+            ui_features_batch = get_ui_features_batch(
+                all_data.to_dict("records"), ui_features_dir
+            )
+
+            if ui_features_batch:
+                ui_features_df = pd.DataFrame(ui_features_batch)
+                ui_features_df["user_id"] = ui_features_df["user_id"].astype("int64")
+                ui_features_df["item_id"] = ui_features_df["item_id"].astype("int64")
+
+                # Убираем дубликаты
+                ui_features_df = ui_features_df.drop_duplicates(
+                    subset=["user_id", "item_id"]
+                )
+
+                # Объединяем с train и val
+                train_data = train_data.merge(
+                    ui_features_df, on=["user_id", "item_id"], how="left"
+                ).fillna(0)
+                val_data = val_data.merge(
+                    ui_features_df, on=["user_id", "item_id"], how="left"
+                ).fillna(0)
+
+                # Обновляем feature_columns
+                new_features = [
+                    col
+                    for col in ui_features_df.columns
+                    if col not in ["user_id", "item_id"]
+                    and col not in self.feature_columns
+                ]
+                self.feature_columns.extend(new_features)
+
+                log_message(f"Добавлены UI признаки: {new_features}")
+
+        except Exception as e:
+            log_message(f"Ошибка загрузки UI-признаков: {e}")
+
         return train_data, val_data
 
     def _get_copurchase_strength(self, item_id):
@@ -1307,8 +1319,8 @@ class LightGBMRecommender:
         X_train = train_data[self.feature_columns]
         y_train = train_data["target"]
 
-        print(f"Размер тренировочных данных: {len(X_train)}")
-        print(f"Количество групп: {len(train_groups)}")
+        log_message(f"Размер тренировочных данных: {len(X_train)}")
+        log_message(f"Количество групп: {len(train_groups)}")
 
         train_dataset = lgb.Dataset(
             X_train,
@@ -1331,7 +1343,7 @@ class LightGBMRecommender:
             valid_sets = [train_dataset]
             valid_names = ["train"]
 
-        print("Начинаем обучение LightGBM...")
+        log_message("Начинаем обучение LightGBM...")
         self.model = lgb.train(
             params,
             train_dataset,
@@ -1349,11 +1361,11 @@ class LightGBMRecommender:
     def evaluate(self, data):
         """Оценка модели"""
         if self.model is None:
-            print("Модель не обучена")
+            log_message("Модель не обучена")
             return 0.0
 
         if len(data) == 0:
-            print("Нет данных для оценки")
+            log_message("Нет данных для оценки")
             return 0.0
 
         predictions = self.predict_rank(data)
@@ -1385,7 +1397,7 @@ def build_user_features_dict(interactions_files, orders_df, device="cuda"):
     """
     import polars as pl
 
-    print("Построение словаря пользовательских признаков...")
+    log_message("Построение словаря пользовательских признаков...")
 
     # 1. АГРЕГАЦИЯ ПО ТРЕКЕРУ (взаимодействия)
     user_stats_list = []
@@ -1423,7 +1435,7 @@ def build_user_features_dict(interactions_files, orders_df, device="cuda"):
         final_stats = pl.DataFrame()
 
     # 2. АГРЕГАЦИЯ ПО ЗАКАЗАМ
-    print("Агрегация по заказам...")
+    log_message("Агрегация по заказам...")
     if isinstance(orders_df, pl.DataFrame):
         orders_pl = orders_df
     else:
@@ -1496,7 +1508,7 @@ def build_user_features_dict(interactions_files, orders_df, device="cuda"):
             "user_days_since_last_order": row["user_days_since_last_order"],
         }
 
-    print(
+    log_message(
         f"Словарь пользовательских признаков построен. Записей: {len(user_stats_dict)}"
     )
     return user_stats_dict
@@ -1528,7 +1540,7 @@ def build_item_features_dict(
     """
     import polars as pl
 
-    print("Построение словаря товарных признаков...")
+    log_message("Построение словаря товарных признаков...")
 
     # 1. АГРЕГАЦИЯ ПО ТРЕКЕРУ И ЗАКАЗАМ
     item_stats_list = []
@@ -1578,7 +1590,7 @@ def build_item_features_dict(
     )
 
     # 3. ДОБАВЛЕНИЕ ДАННЫХ ИЗ items_df
-    print("Добавление данных из items_df...")
+    log_message("Добавление данных из items_df...")
     if isinstance(items_df, pl.DataFrame):
         items_pl = items_df
     else:
@@ -1628,13 +1640,13 @@ def build_item_features_dict(
         }
 
     # 7. ДОБАВЛЕНИЕ ЭМБЕДДИНГОВ
-    print("Добавление эмбеддингов...")
+    log_message("Добавление эмбеддингов...")
     for item_id, embedding in embeddings_dict.items():
         if item_id in item_stats_dict:
             for i in range(min(5, len(embedding))):
                 item_stats_dict[item_id][f"fclip_embed_{i}"] = float(embedding[i])
 
-    print(f"Словарь товарных признаков построен. Записей: {len(item_stats_dict)}")
+    log_message(f"Словарь товарных признаков построен. Записей: {len(item_stats_dict)}")
     return item_stats_dict
 
 
@@ -1667,7 +1679,7 @@ def get_ui_features_for_user_item(user_id, item_id, ui_features_dir):
         return None
 
     except Exception as e:
-        print(f"Ошибка поиска UI-признаков: {e}")
+        log_message(f"Ошибка поиска UI-признаков: {e}")
         return None
 
 
@@ -1717,7 +1729,7 @@ def get_ui_features_batch(user_item_pairs, ui_features_dir, batch_size=1000):
         return all_results
 
     except Exception as e:
-        print(f"Ошибка получения батча UI-признаков: {e}")
+        log_message(f"Ошибка получения батча UI-признаков: {e}")
         return []
 
 
@@ -1738,7 +1750,7 @@ def build_user_item_features_dict(
     from tqdm import tqdm
 
     os.makedirs(output_dir, exist_ok=True)
-    print("Создание UI-признаков (данные остаются на диске)")
+    log_message("Создание UI-признаков (данные остаются на диске)")
 
     try:
         ui_feature_files = []
@@ -1808,7 +1820,7 @@ def build_user_item_features_dict(
                 ui_feature_files.append(output_file)
 
             except Exception as e:
-                print(f"Ошибка обработки файла {input_file}: {e}")
+                log_message(f"Ошибка обработки файла {input_file}: {e}")
                 continue
 
         # Сохраняем metadata
@@ -1822,14 +1834,16 @@ def build_user_item_features_dict(
         with open(metadata_path, "w") as f:
             json.dump(metadata, f, indent=2)
 
-        print(f"Создано {len(ui_feature_files)} файлов UI-признаков в: {output_dir}")
+        log_message(
+            f"Создано {len(ui_feature_files)} файлов UI-признаков в: {output_dir}"
+        )
         return output_dir
 
     except Exception as e:
-        print(f"❌ Ошибка: {e}")
+        log_message(f"❌ Ошибка: {e}")
         import traceback
 
-        traceback.print_exc()
+        traceback.log_message_exc()
         return None
 
 
@@ -1839,7 +1853,7 @@ def build_category_features_dict(category_df, items_df):
     """
     import polars as pl
 
-    print("Построение категорийных признаков...")
+    log_message("Построение категорийных признаков...")
 
     if not isinstance(category_df, pl.DataFrame):
         category_pl = pl.from_pandas(
@@ -1877,7 +1891,9 @@ def build_category_features_dict(category_df, items_df):
             "category_level": row["category_level"],
         }
 
-    print(f"Категорийные признаки построены. Записей: {len(category_features_dict)}")
+    log_message(
+        f"Категорийные признаки построены. Записей: {len(category_features_dict)}"
+    )
     return category_features_dict
 
 
@@ -1894,7 +1910,7 @@ def prepare_lgbm_training_data(
     Подготавливает данные для обучения LightGBM:
     1 положительный пример -> 1 негативный пример.
     """
-    print("Подготовка данных для обучения LightGBM...")
+    log_message("Подготовка данных для обучения LightGBM...")
 
     # Берем sample от тестовых заказов
     test_sample = test_orders_df.sample(frac=sample_fraction, random_state=42)
@@ -1948,7 +1964,7 @@ def prepare_lgbm_training_data(
     numeric_cols = train_df.select_dtypes(include=[np.number]).columns
     train_df[numeric_cols] = train_df[numeric_cols].fillna(0)
 
-    print(
+    log_message(
         f"Данные подготовлены. Размер: {len(train_df)} (положительных: {len(test_sample)}, негативных: {len(test_sample)})"
     )
     return train_df
@@ -1961,7 +1977,7 @@ def load_and_process_embeddings(
     Потоковая обработка эмбеддингов для больших таблиц.
     Возвращает словарь item_id -> np.array
     """
-    print("Оптимизированная потоковая загрузка эмбеддингов...")
+    log_message("Оптимизированная потоковая загрузка эмбеддингов...")
 
     if max_items > 0:
         items_sample = items_ddf[["item_id", embedding_column]].head(
@@ -1996,7 +2012,7 @@ def load_and_process_embeddings(
         except Exception:
             continue
 
-    print(f"Загружено эмбеддингов для {len(embeddings_dict)} товаров")
+    log_message(f"Загружено эмбеддингов для {len(embeddings_dict)} товаров")
     return embeddings_dict
 
 
@@ -2011,7 +2027,7 @@ if __name__ == "__main__":
         """Функция для логирования сообщений в файл и вывод в консоль"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         full_message = f"[{timestamp}] {message}"
-        print(full_message)
+        log_message(full_message)
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(full_message + "\n")
 

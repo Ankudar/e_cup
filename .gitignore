@@ -29,3 +29,4 @@ submission.csv
 model_als.pkl
 rec_system/src/models/lgbm_model.pkl
 rec_system/src/models/lgbm_model_full.pkl
+rec_system/result/submission_temp.csv
