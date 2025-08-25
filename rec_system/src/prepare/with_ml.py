@@ -5,7 +5,7 @@ import random
 import tempfile
 import time
 from collections import defaultdict
-from datetime import timedelta
+from datetime import datetime, timedelta
 from glob import glob
 from pathlib import Path
 
@@ -1367,125 +1367,120 @@ class LightGBMRecommender:
 
 def build_user_features_dict(interactions_files, orders_df, device="cuda"):
     """
-    Создает словарь {user_id: {feature_name: value}} с признаками пользователей.
-    Использует interactions_files (трекер) и orders_df (заказы).
+    Оптимизированная версия с использованием Polars
     """
+    import polars as pl
+
     print("Построение словаря пользовательских признаков...")
-    user_stats_dict = {}
 
     # 1. АГРЕГАЦИЯ ПО ТРЕКЕРУ (взаимодействия)
-    for f in tqdm(interactions_files, desc="Обработка трекера"):
-        df_chunk = pd.read_parquet(f)
+    user_stats_list = []
 
-        # Группируем по пользователю
-        chunk_stats = df_chunk.groupby("user_id").agg(
-            {
-                "weight": ["count", "mean", "sum", "std", "max", "min"],
-                "timestamp": ["max", "min"],
-            }
+    for f in tqdm(interactions_files, desc="Обработка трекера"):
+        df = pl.read_parquet(f)
+
+        chunk_stats = df.group_by("user_id").agg(
+            [
+                pl.col("weight").count().alias("count"),
+                pl.col("weight").sum().alias("sum"),
+                pl.col("weight").max().alias("max"),
+                pl.col("weight").min().alias("min"),
+                pl.col("timestamp").max().alias("last_ts"),
+                pl.col("timestamp").min().alias("first_ts"),
+            ]
         )
 
-        # Обновляем общий словарь
-        for user_id, stats in chunk_stats.iterrows():
-            if user_id not in user_stats_dict:
-                user_stats_dict[user_id] = {
-                    "user_count": 0,
-                    "user_mean": 0,
-                    "user_sum": 0,
-                    "user_std": 0,
-                    "user_max": 0,
-                    "user_min": 0,
-                    "user_last_ts": pd.Timestamp.min,
-                    "user_first_ts": pd.Timestamp.max,
-                    "user_orders_count": 0,
-                    "user_avg_order_value": 0,
-                }
+        user_stats_list.append(chunk_stats)
 
-            # Обновляем статистику по взаимодействиям
-            user_stats_dict[user_id]["user_count"] += stats[("weight", "count")]
-            user_stats_dict[user_id]["user_sum"] += stats[("weight", "sum")]
-            user_stats_dict[user_id]["user_max"] = max(
-                user_stats_dict[user_id]["user_max"], stats[("weight", "max")]
-            )
-            user_stats_dict[user_id]["user_min"] = min(
-                user_stats_dict[user_id]["user_min"], stats[("weight", "min")]
-            )
-            user_stats_dict[user_id]["user_last_ts"] = max(
-                user_stats_dict[user_id]["user_last_ts"], stats[("timestamp", "max")]
-            )
-            user_stats_dict[user_id]["user_first_ts"] = min(
-                user_stats_dict[user_id]["user_first_ts"], stats[("timestamp", "min")]
-            )
+    # Объединяем все статистики
+    if user_stats_list:
+        all_stats = pl.concat(user_stats_list)
+        final_stats = all_stats.group_by("user_id").agg(
+            [
+                pl.col("count").sum().alias("user_count"),
+                pl.col("sum").sum().alias("user_sum"),
+                pl.col("max").max().alias("user_max"),
+                pl.col("min").min().alias("user_min"),
+                pl.col("last_ts").max().alias("user_last_ts"),
+                pl.col("first_ts").min().alias("user_first_ts"),
+            ]
+        )
+    else:
+        final_stats = pl.DataFrame()
 
     # 2. АГРЕГАЦИЯ ПО ЗАКАЗАМ
     print("Агрегация по заказам...")
-    order_stats = (
-        orders_df.groupby("user_id")
-        .agg({"item_id": "count", "created_timestamp": ["min", "max"]})
-        .reset_index()
+    if isinstance(orders_df, pl.DataFrame):
+        orders_pl = orders_df
+    else:
+        orders_pl = pl.from_pandas(
+            orders_df.compute() if hasattr(orders_df, "compute") else orders_df
+        )
+
+    order_stats = orders_pl.group_by("user_id").agg(
+        [
+            pl.col("item_id").count().alias("user_orders_count"),
+            pl.col("created_timestamp").max().alias("user_last_order_ts"),
+            pl.col("created_timestamp").min().alias("user_first_order_ts"),
+        ]
     )
 
-    order_stats.columns = [
-        "user_id",
-        "user_orders_count",
-        "user_first_order_ts",
-        "user_last_order_ts",
-    ]
+    # 3. ОБЪЕДИНЕНИЕ ДАННЫХ
+    if len(final_stats) > 0 and len(order_stats) > 0:
+        user_stats = final_stats.join(
+            order_stats, on="user_id", how="full"
+        )  # Исправлено: outer -> full
+    elif len(final_stats) > 0:
+        user_stats = final_stats
+    else:
+        user_stats = order_stats
 
-    for _, row in order_stats.iterrows():
-        user_id = row["user_id"]
-        if user_id not in user_stats_dict:
-            user_stats_dict[user_id] = {
-                "user_count": 0,
-                "user_mean": 0,
-                "user_sum": 0,
-                "user_std": 0,
-                "user_max": 0,
-                "user_min": 0,
-                "user_last_ts": pd.Timestamp.min,
-                "user_first_ts": pd.Timestamp.max,
-                "user_orders_count": 0,
-                "user_avg_order_value": 0,
-            }
+    # 4. ВЫЧИСЛЕНИЕ ПРОИЗВОДНЫХ ПРИЗНАКОВ
+    current_time = pl.now()  # Исправлено: pl.datetime.now() -> pl.now()
 
-        user_stats_dict[user_id]["user_orders_count"] = row["user_orders_count"]
-        user_stats_dict[user_id]["user_last_order_ts"] = row["user_last_order_ts"]
-        user_stats_dict[user_id]["user_first_order_ts"] = row["user_first_order_ts"]
+    user_stats = user_stats.with_columns(
+        [
+            # Заполняем пропущенные значения
+            pl.col("user_count").fill_null(0),
+            pl.col("user_sum").fill_null(0),
+            pl.col("user_orders_count").fill_null(0),
+            # Вычисляем среднее
+            (pl.col("user_sum") / pl.col("user_count")).alias("user_mean"),
+            # Время с последнего взаимодействия
+            ((current_time - pl.col("user_last_ts")).dt.total_days()).alias(
+                "user_days_since_last"
+            ),
+            # Время с первого взаимодействия
+            ((current_time - pl.col("user_first_ts")).dt.total_days()).alias(
+                "user_days_since_first"
+            ),
+            # Время с последнего заказа
+            ((current_time - pl.col("user_last_order_ts")).dt.total_days()).alias(
+                "user_days_since_last_order"
+            ),
+        ]
+    ).fill_nan(
+        0
+    )  # Заполняем NaN от деления на 0
 
-    # 3. ВЫЧИСЛЕНИЕ ПРОИЗВОДНЫХ ПРИЗНАКОВ
-    print("Вычисление производных признаков...")
-    current_time = pd.Timestamp.now()
-
-    for user_id in user_stats_dict:
-        stats = user_stats_dict[user_id]
-
-        # Время с последнего взаимодействия
-        if stats["user_last_ts"] > pd.Timestamp.min:
-            stats["user_days_since_last"] = (current_time - stats["user_last_ts"]).days
-        else:
-            stats["user_days_since_last"] = 365  # большое значение если нет данных
-
-        # Время с первого взаимодействия
-        if stats["user_first_ts"] < pd.Timestamp.max:
-            stats["user_days_since_first"] = (
-                current_time - stats["user_first_ts"]
-            ).days
-        else:
-            stats["user_days_since_first"] = 365
-
-        # Время с последнего заказа
-        if "user_last_order_ts" in stats and pd.notna(stats["user_last_order_ts"]):
-            stats["user_days_since_last_order"] = (
-                current_time - stats["user_last_order_ts"]
-            ).days
-        else:
-            stats["user_days_since_last_order"] = 365
-
-        # Средний вес взаимодействия
-        if stats["user_count"] > 0:
-            stats["user_mean"] = stats["user_sum"] / stats["user_count"]
-        else:
-            stats["user_mean"] = 0
+    # 5. КОНВЕРТАЦИЯ В СЛОВАРЬ
+    user_stats_dict = {}
+    for row in user_stats.iter_rows(named=True):
+        user_stats_dict[row["user_id"]] = {
+            "user_count": row["user_count"],
+            "user_mean": row["user_mean"],
+            "user_sum": row["user_sum"],
+            "user_max": row["user_max"],
+            "user_min": row["user_min"],
+            "user_last_ts": row["user_last_ts"],
+            "user_first_ts": row["user_first_ts"],
+            "user_orders_count": row["user_orders_count"],
+            "user_last_order_ts": row["user_last_order_ts"],
+            "user_first_order_ts": row["user_first_order_ts"],
+            "user_days_since_last": row["user_days_since_last"],
+            "user_days_since_first": row["user_days_since_first"],
+            "user_days_since_last_order": row["user_days_since_last_order"],
+        }
 
     print(
         f"Словарь пользовательских признаков построен. Записей: {len(user_stats_dict)}"
@@ -1497,132 +1492,115 @@ def build_item_features_dict(
     interactions_files, items_df, orders_df, embeddings_dict, device="cuda"
 ):
     """
-    Создает словарь {item_id: {feature_name: value}} с признаками товаров.
+    Оптимизированная версия с использованием Polars
     """
+    import polars as pl
+
     print("Построение словаря товарных признаков...")
-    item_stats_dict = {}
 
-    # 1. АГРЕГАЦИЯ ПО ТРЕКЕРУ И ЗАКАЗАМ (популярность)
+    # 1. АГРЕГАЦИЯ ПО ТРЕКЕРУ И ЗАКАЗАМ
+    item_stats_list = []
+
     for f in tqdm(interactions_files, desc="Обработка взаимодействий"):
-        df_chunk = pd.read_parquet(f)
+        df = pl.read_parquet(f)
 
-        chunk_stats = df_chunk.groupby("item_id").agg(
-            {
-                "weight": ["count", "mean", "sum", "std", "max", "min"],
-                "timestamp": ["max", "min"],
-            }
+        chunk_stats = df.group_by("item_id").agg(
+            [
+                pl.col("weight").count().alias("count"),
+                pl.col("weight").sum().alias("sum"),
+                pl.col("weight").max().alias("max"),
+                pl.col("weight").min().alias("min"),
+                pl.col("timestamp").max().alias("last_ts"),
+                pl.col("timestamp").min().alias("first_ts"),
+            ]
         )
 
-        for item_id, stats in chunk_stats.iterrows():
-            if item_id not in item_stats_dict:
-                item_stats_dict[item_id] = {
-                    "item_count": 0,
-                    "item_mean": 0,
-                    "item_sum": 0,
-                    "item_std": 0,
-                    "item_max": 0,
-                    "item_min": 0,
-                    "item_last_ts": pd.Timestamp.min,
-                    "item_first_ts": pd.Timestamp.max,
-                    "item_orders_count": 0,
-                }
+        item_stats_list.append(chunk_stats)
 
-            item_stats_dict[item_id]["item_count"] += stats[("weight", "count")]
-            item_stats_dict[item_id]["item_sum"] += stats[("weight", "sum")]
-            item_stats_dict[item_id]["item_max"] = max(
-                item_stats_dict[item_id]["item_max"], stats[("weight", "max")]
-            )
-            item_stats_dict[item_id]["item_min"] = min(
-                item_stats_dict[item_id]["item_min"], stats[("weight", "min")]
-            )
-            item_stats_dict[item_id]["item_last_ts"] = max(
-                item_stats_dict[item_id]["item_last_ts"], stats[("timestamp", "max")]
-            )
-            item_stats_dict[item_id]["item_first_ts"] = min(
-                item_stats_dict[item_id]["item_first_ts"], stats[("timestamp", "min")]
-            )
+    # Объединяем статистики
+    if item_stats_list:
+        all_stats = pl.concat(item_stats_list)
+        final_stats = all_stats.group_by("item_id").agg(
+            [
+                pl.col("count").sum().alias("item_count"),
+                pl.col("sum").sum().alias("item_sum"),
+                pl.col("max").max().alias("item_max"),
+                pl.col("min").min().alias("item_min"),
+                pl.col("last_ts").max().alias("item_last_ts"),
+                pl.col("first_ts").min().alias("item_first_ts"),
+            ]
+        )
+    else:
+        final_stats = pl.DataFrame()
 
     # 2. ДОБАВЛЕНИЕ ДАННЫХ ИЗ ЗАКАЗОВ
-    order_item_stats = (
-        orders_df.groupby("item_id").agg({"user_id": "count"}).reset_index()
-    )
-    order_item_stats.columns = ["item_id", "item_orders_count"]
+    if isinstance(orders_df, pl.DataFrame):
+        orders_pl = orders_df
+    else:
+        orders_pl = pl.from_pandas(
+            orders_df.compute() if hasattr(orders_df, "compute") else orders_df
+        )
 
-    for _, row in order_item_stats.iterrows():
-        item_id = row["item_id"]
-        if item_id not in item_stats_dict:
-            item_stats_dict[item_id] = {
-                "item_count": 0,
-                "item_mean": 0,
-                "item_sum": 0,
-                "item_std": 0,
-                "item_max": 0,
-                "item_min": 0,
-                "item_last_ts": pd.Timestamp.min,
-                "item_first_ts": pd.Timestamp.max,
-                "item_orders_count": 0,
-            }
-        item_stats_dict[item_id]["item_orders_count"] = row["item_orders_count"]
+    order_stats = orders_pl.group_by("item_id").agg(
+        [pl.col("user_id").count().alias("item_orders_count")]
+    )
 
     # 3. ДОБАВЛЕНИЕ ДАННЫХ ИЗ items_df
     print("Добавление данных из items_df...")
-    items_features = (
-        items_df.drop_duplicates(subset=["item_id"])
-        .set_index("item_id")[["catalogid"]]
-        .to_dict("index")
-    )
+    if isinstance(items_df, pl.DataFrame):
+        items_pl = items_df
+    else:
+        items_pl = pl.from_pandas(
+            items_df.compute() if hasattr(items_df, "compute") else items_df
+        )
 
-    for item_id, features in items_features.items():
-        if item_id not in item_stats_dict:
-            item_stats_dict[item_id] = {
-                "item_count": 0,
-                "item_mean": 0,
-                "item_sum": 0,
-                "item_std": 0,
-                "item_max": 0,
-                "item_min": 0,
-                "item_last_ts": pd.Timestamp.min,
-                "item_first_ts": pd.Timestamp.max,
-                "item_orders_count": 0,
-                "item_category": 0,
-            }
-        item_stats_dict[item_id]["item_category"] = features["catalogid"]
+    items_catalog = items_pl.select(["item_id", "catalogid"]).unique()
 
-    # 4. ДОБАВЛЕНИЕ ЭМБЕДДИНГОВ (первые N компонент)
-    print("Добавление эмбеддингов...")
-    for item_id, embedding in embeddings_dict.items():
-        if item_id not in item_stats_dict:
-            continue
-
-        for i in range(min(5, len(embedding))):
-            item_stats_dict[item_id][f"fclip_embed_{i}"] = embedding[i]
+    # 4. ОБЪЕДИНЕНИЕ ВСЕХ ДАННЫХ
+    item_stats = final_stats.join(order_stats, on="item_id", how="full")  # Исправлено
+    item_stats = item_stats.join(items_catalog, on="item_id", how="left")
 
     # 5. ВЫЧИСЛЕНИЕ ПРОИЗВОДНЫХ ПРИЗНАКОВ
-    print("Вычисление производных признаков...")
-    current_time = pd.Timestamp.now()
+    current_time = pl.now()  # Исправлено
 
-    for item_id in item_stats_dict:
-        stats = item_stats_dict[item_id]
+    item_stats = item_stats.with_columns(
+        [
+            pl.col("item_count").fill_null(0),
+            pl.col("item_sum").fill_null(0),
+            pl.col("item_orders_count").fill_null(0),
+            (pl.col("item_sum") / pl.col("item_count")).alias("item_mean"),
+            ((current_time - pl.col("item_last_ts")).dt.total_days()).alias(
+                "item_days_since_last"
+            ),
+            ((current_time - pl.col("item_first_ts")).dt.total_days()).alias(
+                "item_days_since_first"
+            ),
+        ]
+    ).fill_nan(0)
 
-        # Время с последнего взаимодействия
-        if stats["item_last_ts"] > pd.Timestamp.min:
-            stats["item_days_since_last"] = (current_time - stats["item_last_ts"]).days
-        else:
-            stats["item_days_since_last"] = 365
+    # 6. КОНВЕРТАЦИЯ В СЛОВАРЬ
+    item_stats_dict = {}
+    for row in item_stats.iter_rows(named=True):
+        item_stats_dict[row["item_id"]] = {
+            "item_count": row["item_count"],
+            "item_mean": row["item_mean"],
+            "item_sum": row["item_sum"],
+            "item_max": row["item_max"],
+            "item_min": row["item_min"],
+            "item_last_ts": row["item_last_ts"],
+            "item_first_ts": row["item_first_ts"],
+            "item_orders_count": row["item_orders_count"],
+            "item_category": row["catalogid"],
+            "item_days_since_last": row["item_days_since_last"],
+            "item_days_since_first": row["item_days_since_first"],
+        }
 
-        # Время с первого взаимодействия
-        if stats["item_first_ts"] < pd.Timestamp.max:
-            stats["item_days_since_first"] = (
-                current_time - stats["item_first_ts"]
-            ).days
-        else:
-            stats["item_days_since_first"] = 365
-
-        # Средний вес взаимодействия
-        if stats["item_count"] > 0:
-            stats["item_mean"] = stats["item_sum"] / stats["item_count"]
-        else:
-            stats["item_mean"] = 0
+    # 7. ДОБАВЛЕНИЕ ЭМБЕДДИНГОВ
+    print("Добавление эмбеддингов...")
+    for item_id, embedding in embeddings_dict.items():
+        if item_id in item_stats_dict:
+            for i in range(min(5, len(embedding))):
+                item_stats_dict[item_id][f"fclip_embed_{i}"] = float(embedding[i])
 
     print(f"Словарь товарных признаков построен. Записей: {len(item_stats_dict)}")
     return item_stats_dict
@@ -1630,74 +1608,72 @@ def build_item_features_dict(
 
 def build_user_item_features_dict(interactions_files, device="cuda"):
     """
-    Создает словарь {(user_id, item_id): {feature_name: value}}.
+    Оптимизированная версия с использованием Polars
     """
+    import polars as pl
+
     print("Построение словаря пользователь-товарных признаков...")
-    user_item_stats_dict = {}
+
+    user_item_stats_list = []
 
     for f in tqdm(interactions_files, desc="Обработка взаимодействий"):
-        df_chunk = pd.read_parquet(f)
+        df = pl.read_parquet(f)
 
-        chunk_stats = df_chunk.groupby(["user_id", "item_id"]).agg(
-            {
-                "weight": ["count", "mean", "sum", "std", "max", "min"],
-                "timestamp": ["max", "min"],
-            }
+        chunk_stats = df.group_by(["user_id", "item_id"]).agg(
+            [
+                pl.col("weight").count().alias("ui_count"),
+                pl.col("weight").sum().alias("ui_sum"),
+                pl.col("weight").max().alias("ui_max"),
+                pl.col("weight").min().alias("ui_min"),
+                pl.col("timestamp").max().alias("ui_last_ts"),
+                pl.col("timestamp").min().alias("ui_first_ts"),
+            ]
         )
 
-        for (user_id, item_id), stats in chunk_stats.iterrows():
-            key = (user_id, item_id)
-            if key not in user_item_stats_dict:
-                user_item_stats_dict[key] = {
-                    "ui_count": 0,
-                    "ui_mean": 0,
-                    "ui_sum": 0,
-                    "ui_std": 0,
-                    "ui_max": 0,
-                    "ui_min": 0,
-                    "ui_last_ts": pd.Timestamp.min,
-                    "ui_first_ts": pd.Timestamp.max,
-                }
+        user_item_stats_list.append(chunk_stats)
 
-            user_item_stats_dict[key]["ui_count"] += stats[("weight", "count")]
-            user_item_stats_dict[key]["ui_sum"] += stats[("weight", "sum")]
-            user_item_stats_dict[key]["ui_max"] = max(
-                user_item_stats_dict[key]["ui_max"], stats[("weight", "max")]
-            )
-            user_item_stats_dict[key]["ui_min"] = min(
-                user_item_stats_dict[key]["ui_min"], stats[("weight", "min")]
-            )
-            user_item_stats_dict[key]["ui_last_ts"] = max(
-                user_item_stats_dict[key]["ui_last_ts"], stats[("timestamp", "max")]
-            )
-            user_item_stats_dict[key]["ui_first_ts"] = min(
-                user_item_stats_dict[key]["ui_first_ts"], stats[("timestamp", "min")]
-            )
+    # Объединяем все статистики
+    if user_item_stats_list:
+        all_stats = pl.concat(user_item_stats_list)
+        final_stats = all_stats
+    else:
+        final_stats = pl.DataFrame()
 
     # ВЫЧИСЛЕНИЕ ПРОИЗВОДНЫХ ПРИЗНАКОВ
     print("Вычисление производных признаков...")
-    current_time = pd.Timestamp.now()
+    current_time = pl.now()  # Исправлено
 
-    for key in user_item_stats_dict:
-        stats = user_item_stats_dict[key]
+    final_stats = (
+        final_stats.with_columns(
+            [
+                (pl.col("ui_sum") / pl.col("ui_count")).alias("ui_mean"),
+                ((current_time - pl.col("ui_last_ts")).dt.total_days()).alias(
+                    "ui_days_since_last"
+                ),
+                ((current_time - pl.col("ui_first_ts")).dt.total_days()).alias(
+                    "ui_days_since_first"
+                ),
+            ]
+        )
+        .fill_nan(0)
+        .fill_null(0)
+    )
 
-        # Время с последнего взаимодействия
-        if stats["ui_last_ts"] > pd.Timestamp.min:
-            stats["ui_days_since_last"] = (current_time - stats["ui_last_ts"]).days
-        else:
-            stats["ui_days_since_last"] = 365
-
-        # Время с первого взаимодействия
-        if stats["ui_first_ts"] < pd.Timestamp.max:
-            stats["ui_days_since_first"] = (current_time - stats["ui_first_ts"]).days
-        else:
-            stats["ui_days_since_first"] = 365
-
-        # Средний вес взаимодействия
-        if stats["ui_count"] > 0:
-            stats["ui_mean"] = stats["ui_sum"] / stats["ui_count"]
-        else:
-            stats["ui_mean"] = 0
+    # КОНВЕРТАЦИЯ В СЛОВАРЬ
+    user_item_stats_dict = {}
+    for row in final_stats.iter_rows(named=True):
+        key = (row["user_id"], row["item_id"])
+        user_item_stats_dict[key] = {
+            "ui_count": row["ui_count"],
+            "ui_mean": row["ui_mean"],
+            "ui_sum": row["ui_sum"],
+            "ui_max": row["ui_max"],
+            "ui_min": row["ui_min"],
+            "ui_last_ts": row["ui_last_ts"],
+            "ui_first_ts": row["ui_first_ts"],
+            "ui_days_since_last": row["ui_days_since_last"],
+            "ui_days_since_first": row["ui_days_since_first"],
+        }
 
     print(
         f"Словарь пользователь-товарных признаков построен. Записей: {len(user_item_stats_dict)}"
@@ -1707,29 +1683,46 @@ def build_user_item_features_dict(interactions_files, device="cuda"):
 
 def build_category_features_dict(category_df, items_df):
     """
-    Создает дополнительные признаки на основе категорий.
+    Оптимизированная версия с использованием Polars
     """
+    import polars as pl
+
     print("Построение категорийных признаков...")
 
-    # Создаем маппинг товар -> категория
-    item_to_cat = items_df.set_index("item_id")["catalogid"].to_dict()
+    if not isinstance(category_df, pl.DataFrame):
+        category_pl = pl.from_pandas(
+            category_df.compute() if hasattr(category_df, "compute") else category_df
+        )
+    else:
+        category_pl = category_df
+
+    if not isinstance(items_df, pl.DataFrame):
+        items_pl = pl.from_pandas(
+            items_df.compute() if hasattr(items_df, "compute") else items_df
+        )
+    else:
+        items_pl = items_df
 
     # Создаем маппинг категория -> уровень в иерархии
-    cat_to_level = {}
-    for _, row in category_df.iterrows():
-        catalogid = row["catalogid"]
-        # Уровень = количество родителей в иерархии
-        level = (
-            len(row["ids"]) - 1
-        )  # -1 потому что ids включает сам catalogid и всех родителей
-        cat_to_level[catalogid] = max(0, level)
+    cat_levels = category_pl.with_columns(
+        [(pl.col("ids").list.lengths() - 1).alias("category_level")]
+    ).select(["catalogid", "category_level"])
 
-    # Создаем словарь с категорийными признаками
+    # Создаем маппинг товар -> категория
+    item_categories = items_pl.select(["item_id", "catalogid"]).unique()
+
+    # Объединяем
+    category_features = item_categories.join(cat_levels, on="catalogid", how="left")
+    category_features = category_features.with_columns(
+        [pl.col("category_level").fill_null(0)]
+    )
+
+    # КОНВЕРТАЦИЯ В СЛОВАРЬ
     category_features_dict = {}
-    for item_id, catalogid in item_to_cat.items():
-        category_features_dict[item_id] = {
-            "item_category": catalogid,
-            "category_level": cat_to_level.get(catalogid, 0),
+    for row in category_features.iter_rows(named=True):
+        category_features_dict[row["item_id"]] = {
+            "item_category": row["catalogid"],
+            "category_level": row["category_level"],
         }
 
     print(f"Категорийные признаки построены. Записей: {len(category_features_dict)}")
@@ -1856,161 +1849,314 @@ def load_and_process_embeddings(
 
 
 # -------------------- Основной запуск --------------------
+# -------------------- Основной запуск --------------------
 if __name__ == "__main__":
     start_time = time.time()
-    K = 100
-    RECENT_N = 5
-    TEST_SIZE = 0.2
 
-    # Параметры масштабирования
-    SCALING_STAGE = "full"  # small, medium, large, full
+    # Создаем файл для логирования
+    log_file = "/home/root6/python/e_cup/rec_system/training_log.txt"
 
-    scaling_config = {
-        "small": {"sample_users": 500, "sample_fraction": 0.1},
-        "medium": {"sample_users": 5000, "sample_fraction": 0.3},
-        "large": {"sample_users": 20000, "sample_fraction": 0.7},
-        "full": {"sample_users": None, "sample_fraction": 1.0},
-    }
+    def log_message(message):
+        """Функция для логирования сообщений в файл и вывод в консоль"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        full_message = f"[{timestamp}] {message}"
+        print(full_message)
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(full_message + "\n")
 
-    config = scaling_config[SCALING_STAGE]
-
-    print(f"=== РЕЖИМ МАСШТАБИРОВАНИЯ: {SCALING_STAGE.upper()} ===")
-    print(f"Пользователей: {config['sample_users'] or 'все'}")
-    print(f"Данных: {config['sample_fraction']*100}%")
-
-    print("=== ЗАГРУЗКА ДАННЫХ ===")
-    orders_ddf, tracker_ddf, items_ddf, categories_ddf, test_users_ddf = (
-        load_train_data()
-    )
-    orders_ddf, tracker_ddf, items_ddf = filter_data(orders_ddf, tracker_ddf, items_ddf)
-
-    print("=== ЗАГРУЗКА ЭМБЕДДИНГОВ ===")
-    # Загружаем эмбеддинги товаров - теперь возвращается только словарь
-    embeddings_dict = load_and_process_embeddings(items_ddf)
-
-    print("=== SPLIT ДАННЫХ ===")
-    orders_df_full = orders_ddf.compute()
-    train_orders_df, test_orders_df, cutoff_ts_per_user = train_test_split_by_time(
-        orders_df_full, TEST_SIZE
-    )
-
-    print("=== ПОДГОТОВКА ВЗАИМОДЕЙСТВИЙ ===")
-    interactions_files = prepare_interactions(
-        train_orders_df, tracker_ddf, cutoff_ts_per_user, scale_days=30
-    )
-
-    print("=== ПОСЛЕДНИЕ ТОВАРЫ ===")
-    batch_dir = "/home/root6/python/e_cup/rec_system/data/processed/prepare_interactions_batches"
-    recent_items_map = build_recent_items_map_from_batches(batch_dir, recent_n=RECENT_N)
-
-    print("=== ОБУЧЕНИЕ ALS ДЛЯ ПРИЗНАКОВ ===")
-    model, user_map, item_map = train_als(
-        interactions_files, n_factors=64, reg=1e-3, device="cuda"
-    )
-    inv_item_map = {v: k for k, v in item_map.items()}  # Создаем обратный маппинг
-    popularity_s = compute_global_popularity(train_orders_df)
-    popular_items = popularity_s.index.tolist()
-
-    print("=== ПОСТРОЕНИЕ ДОПОЛНИТЕЛЬНЫХ ДАННЫХ ===")
-    # Строим co-purchase map
-    copurchase_map = build_copurchase_map(train_orders_df)
-
-    # Строим категорийные маппинги
-    items_df = items_ddf.compute()
-    categories_df = categories_ddf.compute()
-    item_to_cat, cat_to_items = build_category_maps(items_df, categories_df)
-
-    # ЗАГРУЗКА/ПОДГОТОВКА ЭМБЕДДИНГОВ
-    embeddings_dict = load_and_process_embeddings(items_ddf)
-
-    print("=== ПРЕДВАРИТЕЛЬНЫЙ РАСЧЕТ ПРИЗНАКОВ ДЛЯ LGBM ===")
-    user_features_dict = build_user_features_dict(interactions_files, orders_ddf)
-    item_features_dict = build_item_features_dict(
-        interactions_files, items_df, orders_ddf, embeddings_dict
-    )
-    user_item_features_dict = build_user_item_features_dict(interactions_files)
-
-    print("=== ПОДГОТОВКА ДАННЫХ ДЛЯ LightGBM ===")
-    recommender = LightGBMRecommender()
-    recommender.set_als_embeddings(model)
-    recommender.set_additional_data(
-        copurchase_map, item_to_cat, cat_to_items, user_map, item_map
-    )
-
-    if embeddings_dict:
-        recommender.set_external_embeddings(embeddings_dict)
-
-    # МАСШТАБИРУЕМ данные
-    if config["sample_users"]:
-        sample_test_orders = test_orders_df.sample(
-            min(config["sample_users"], len(test_orders_df)), random_state=42
+    # Очищаем файл лога при каждом запуске
+    with open(log_file, "w", encoding="utf-8") as f:
+        f.write(
+            f"=== НАЧАЛО ОБУЧЕНИЯ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n\n"
         )
-    else:
-        sample_test_orders = test_orders_df  # все данные
 
-    train_data = recommender.prepare_training_data(
-        interactions_files,
-        user_map,
-        item_map,
-        popularity_s,
-        recent_items_map,
-        sample_test_orders,
-        sample_fraction=config["sample_fraction"],
-    )
+    try:
+        K = 100
+        RECENT_N = 5
+        TEST_SIZE = 0.2
 
-    # Разделяем на train/validation
-    users = train_data["user_id"].unique()
-    train_users, val_users = train_test_split(users, test_size=0.2, random_state=42)
+        # Параметры масштабирования
+        SCALING_STAGE = "full"  # small, medium, large, full
 
-    train_df = train_data[train_data["user_id"].isin(train_users)]
-    val_df = train_data[train_data["user_id"].isin(val_users)]
-
-    print(f"Размер train: {len(train_df)}, validation: {len(val_df)}")
-    print(f"Признаки: {recommender.feature_columns[:20]}...")
-
-    print("=== ОБУЧЕНИЕ LightGBM ===")
-    model = recommender.train(train_df, val_df)
-
-    print("=== ОЦЕНКА МОДЕЛИ ===")
-    train_ndcg = recommender.evaluate(train_df)
-    val_ndcg = recommender.evaluate(val_df)
-
-    print(f"NDCG@100 train: {train_ndcg:.4f}")
-    print(f"NDCG@100 val: {val_ndcg:.4f}")
-
-    # Анализ важности признаков
-    print("=== ВАЖНОСТЬ ПРИЗНАКОВ ===")
-    feature_importance = pd.DataFrame(
-        {
-            "feature": recommender.feature_columns,
-            "importance": recommender.model.feature_importance(),
+        scaling_config = {
+            "small": {"sample_users": 500, "sample_fraction": 0.1},
+            "medium": {"sample_users": 5000, "sample_fraction": 0.3},
+            "large": {"sample_users": 20000, "sample_fraction": 0.7},
+            "full": {"sample_users": None, "sample_fraction": 1.0},
         }
-    )
-    feature_importance = feature_importance.sort_values("importance", ascending=False)
-    print(feature_importance.head(20))
 
-    # СОХРАНЕНИЕ МОДЕЛИ И ВАЖНЫХ ДАННЫХ
-    print("=== СОХРАНЕНИЕ МОДЕЛИ И ПРИЗНАКОВ ===")
-    save_data = {
-        "lgbm_model": recommender.model,
-        "feature_columns": recommender.feature_columns,
-        "als_model": model,
-        "user_map": user_map,
-        "item_map": item_map,
-        "inv_item_map": inv_item_map,
-        "popular_items": popular_items,
-        "user_features_dict": user_features_dict,
-        "item_features_dict": item_features_dict,
-        "user_item_features_dict": user_item_features_dict,
-        "recent_items_map": recent_items_map,
-        "copurchase_map": copurchase_map,
-        "item_to_cat": item_to_cat,
-    }
-    with open(
-        "/home/root6/python/e_cup/rec_system/src/models/lgbm_model_full.pkl", "wb"
-    ) as f:
-        pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        config = scaling_config[SCALING_STAGE]
 
-    print("Обучение и подготовка данных завершены! Модель и признаки сохранены.")
-    elapsed_time = timedelta(seconds=time.time() - start_time)
-    print(f"Общее время выполнения: {elapsed_time}")
+        log_message(f"=== РЕЖИМ МАСШТАБИРОВАНИЯ: {SCALING_STAGE.upper()} ===")
+        log_message(f"Пользователей: {config['sample_users'] or 'все'}")
+        log_message(f"Данных: {config['sample_fraction']*100}%")
+
+        # === ЗАГРУЗКА ДАННЫХ ===
+        stage_start = time.time()
+        log_message("=== ЗАГРУЗКА ДАННЫХ ===")
+        orders_ddf, tracker_ddf, items_ddf, categories_ddf, test_users_ddf = (
+            load_train_data()
+        )
+        orders_ddf, tracker_ddf, items_ddf = filter_data(
+            orders_ddf, tracker_ddf, items_ddf
+        )
+        stage_time = time.time() - stage_start
+        log_message(f"Загрузка данных завершена за {timedelta(seconds=stage_time)}")
+
+        # === ЗАГРУЗКА ЭМБЕДДИНГОВ ===
+        stage_start = time.time()
+        log_message("=== ЗАГРУЗКА ЭМБЕДДИНГОВ ===")
+        embeddings_dict = load_and_process_embeddings(items_ddf)
+        stage_time = time.time() - stage_start
+        log_message(
+            f"Загрузка эмбеддингов завершена за {timedelta(seconds=stage_time)}"
+        )
+        log_message(f"Загружено эмбеддингов: {len(embeddings_dict)}")
+
+        # === SPLIT ДАННЫХ ===
+        stage_start = time.time()
+        log_message("=== SPLIT ДАННЫХ ===")
+        orders_df_full = orders_ddf.compute()
+        train_orders_df, test_orders_df, cutoff_ts_per_user = train_test_split_by_time(
+            orders_df_full, TEST_SIZE
+        )
+        stage_time = time.time() - stage_start
+        log_message(f"Split данных завершен за {timedelta(seconds=stage_time)}")
+        log_message(
+            f"Train orders: {len(train_orders_df)}, Test orders: {len(test_orders_df)}"
+        )
+
+        # === ПОДГОТОВКА ВЗАИМОДЕЙСТВИЙ ===
+        stage_start = time.time()
+        log_message("=== ПОДГОТОВКА ВЗАИМОДЕЙСТВИЙ ===")
+        interactions_files = prepare_interactions(
+            train_orders_df, tracker_ddf, cutoff_ts_per_user, scale_days=30
+        )
+        stage_time = time.time() - stage_start
+        log_message(
+            f"Подготовка взаимодействий завершена за {timedelta(seconds=stage_time)}"
+        )
+        log_message(f"Создано файлов взаимодействий: {len(interactions_files)}")
+
+        # === ПОСЛЕДНИЕ ТОВАРЫ ===
+        stage_start = time.time()
+        log_message("=== ПОСЛЕДНИЕ ТОВАРЫ ===")
+        batch_dir = "/home/root6/python/e_cup/rec_system/data/processed/prepare_interactions_batches"
+        recent_items_map = build_recent_items_map_from_batches(
+            batch_dir, recent_n=RECENT_N
+        )
+        stage_time = time.time() - stage_start
+        log_message(
+            f"Построение recent items map завершено за {timedelta(seconds=stage_time)}"
+        )
+        log_message(f"Пользователей с recent items: {len(recent_items_map)}")
+
+        # === ОБУЧЕНИЕ ALS ДЛЯ ПРИЗНАКОВ ===
+        stage_start = time.time()
+        log_message("=== ОБУЧЕНИЕ ALS ДЛЯ ПРИЗНАКОВ ===")
+        model, user_map, item_map = train_als(
+            interactions_files, n_factors=64, reg=1e-3, device="cuda"
+        )
+        inv_item_map = {v: k for k, v in item_map.items()}
+        popularity_s = compute_global_popularity(train_orders_df)
+        popular_items = popularity_s.index.tolist()
+        stage_time = time.time() - stage_start
+        log_message(f"Обучение ALS завершено за {timedelta(seconds=stage_time)}")
+        log_message(f"Пользователей: {len(user_map)}, Товаров: {len(item_map)}")
+
+        # === ПОСТРОЕНИЕ ДОПОЛНИТЕЛЬНЫХ ДАННЫХ ===
+        stage_start = time.time()
+        log_message("=== ПОСТРОЕНИЕ ДОПОЛНИТЕЛЬНЫХ ДАННЫХ ===")
+
+        # Строим co-purchase map
+        copurchase_map = build_copurchase_map(train_orders_df)
+        log_message(f"Co-purchase map построен: {len(copurchase_map)} товаров")
+
+        # Строим категорийные маппинги
+        items_df = items_ddf.compute()
+        categories_df = categories_ddf.compute()
+        item_to_cat, cat_to_items = build_category_maps(items_df, categories_df)
+        log_message(
+            f"Категорийные маппинги построены: {len(item_to_cat)} товаров, {len(cat_to_items)} категорий"
+        )
+
+        stage_time = time.time() - stage_start
+        log_message(
+            f"Построение дополнительных данных завершено за {timedelta(seconds=stage_time)}"
+        )
+
+        # === ПРЕДВАРИТЕЛЬНЫЙ РАСЧЕТ ПРИЗНАКОВ ДЛЯ LGBM ===
+        stage_start = time.time()
+        log_message("=== ПРЕДВАРИТЕЛЬНЫЙ РАСЧЕТ ПРИЗНАКОВ ДЛЯ LGBM ===")
+
+        # User features
+        user_start = time.time()
+        user_features_dict = build_user_features_dict(interactions_files, orders_ddf)
+        user_time = time.time() - user_start
+        log_message(
+            f"User features построены за {timedelta(seconds=user_time)}: {len(user_features_dict)} пользователей"
+        )
+
+        # Item features
+        item_start = time.time()
+        item_features_dict = build_item_features_dict(
+            interactions_files, items_df, orders_ddf, embeddings_dict
+        )
+        item_time = time.time() - item_start
+        log_message(
+            f"Item features построены за {timedelta(seconds=item_time)}: {len(item_features_dict)} товаров"
+        )
+
+        # User-Item features
+        ui_start = time.time()
+        user_item_features_dict = build_user_item_features_dict(interactions_files)
+        ui_time = time.time() - ui_start
+        log_message(
+            f"User-Item features построены за {timedelta(seconds=ui_time)}: {len(user_item_features_dict)} пар"
+        )
+
+        stage_time = time.time() - stage_start
+        log_message(
+            f"Предварительный расчет признаков завершен за {timedelta(seconds=stage_time)}"
+        )
+
+        # === ПОДГОТОВКА ДАННЫХ ДЛЯ LightGBM ===
+        stage_start = time.time()
+        log_message("=== ПОДГОТОВКА ДАННЫХ ДЛЯ LightGBM ===")
+        recommender = LightGBMRecommender()
+        recommender.set_als_embeddings(model)
+        recommender.set_additional_data(
+            copurchase_map, item_to_cat, cat_to_items, user_map, item_map
+        )
+
+        if embeddings_dict:
+            recommender.set_external_embeddings(embeddings_dict)
+
+        # МАСШТАБИРУЕМ данные
+        if config["sample_users"]:
+            sample_test_orders = test_orders_df.sample(
+                min(config["sample_users"], len(test_orders_df)), random_state=42
+            )
+        else:
+            sample_test_orders = test_orders_df
+
+        train_data = recommender.prepare_training_data(
+            interactions_files,
+            user_map,
+            item_map,
+            popularity_s,
+            recent_items_map,
+            sample_test_orders,
+            sample_fraction=config["sample_fraction"],
+        )
+
+        # Разделяем на train/validation
+        users = train_data["user_id"].unique()
+        train_users, val_users = train_test_split(users, test_size=0.2, random_state=42)
+
+        train_df = train_data[train_data["user_id"].isin(train_users)]
+        val_df = train_data[train_data["user_id"].isin(val_users)]
+
+        log_message(f"Размер train: {len(train_df)}, validation: {len(val_df)}")
+        log_message(f"Признаки: {len(recommender.feature_columns)}")
+        stage_time = time.time() - stage_start
+        log_message(
+            f"Подготовка данных для LightGBM завершена за {timedelta(seconds=stage_time)}"
+        )
+
+        # === ОБУЧЕНИЕ LightGBM ===
+        stage_start = time.time()
+        log_message("=== ОБУЧЕНИЕ LightGBM ===")
+        model = recommender.train(train_df, val_df)
+        stage_time = time.time() - stage_start
+        log_message(f"Обучение LightGBM завершено за {timedelta(seconds=stage_time)}")
+
+        # === ОЦЕНКА МОДЕЛИ ===
+        stage_start = time.time()
+        log_message("=== ОЦЕНКА МОДЕЛИ ===")
+        train_ndcg = recommender.evaluate(train_df)
+        val_ndcg = recommender.evaluate(val_df)
+
+        log_message(f"NDCG@100 train: {train_ndcg:.4f}")
+        log_message(f"NDCG@100 val: {val_ndcg:.4f}")
+        stage_time = time.time() - stage_start
+        log_message(f"Оценка модели завершена за {timedelta(seconds=stage_time)}")
+
+        # Анализ важности признаков
+        stage_start = time.time()
+        log_message("=== ВАЖНОСТЬ ПРИЗНАКОВ ===")
+        feature_importance = pd.DataFrame(
+            {
+                "feature": recommender.feature_columns,
+                "importance": recommender.model.feature_importance(),
+            }
+        )
+        feature_importance = feature_importance.sort_values(
+            "importance", ascending=False
+        )
+        top_features = feature_importance.head(20)
+        log_message("Топ-20 важных признаков:")
+        for i, row in top_features.iterrows():
+            log_message(f"  {row['feature']}: {row['importance']}")
+        stage_time = time.time() - stage_start
+        log_message(
+            f"Анализ важности признаков завершен за {timedelta(seconds=stage_time)}"
+        )
+
+        # === СОХРАНЕНИЕ МОДЕЛИ И ВАЖНЫХ ДАННЫХ ===
+        stage_start = time.time()
+        log_message("=== СОХРАНЕНИЕ МОДЕЛИ И ПРИЗНАКОВ ===")
+        save_data = {
+            "lgbm_model": recommender.model,
+            "feature_columns": recommender.feature_columns,
+            "als_model": model,
+            "user_map": user_map,
+            "item_map": item_map,
+            "inv_item_map": inv_item_map,
+            "popular_items": popular_items,
+            "user_features_dict": user_features_dict,
+            "item_features_dict": item_features_dict,
+            "user_item_features_dict": user_item_features_dict,
+            "recent_items_map": recent_items_map,
+            "copurchase_map": copurchase_map,
+            "item_to_cat": item_to_cat,
+        }
+
+        model_path = (
+            "/home/root6/python/e_cup/rec_system/src/models/lgbm_model_full.pkl"
+        )
+        with open(model_path, "wb") as f:
+            pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        stage_time = time.time() - stage_start
+        log_message(f"Сохранение модели завершено за {timedelta(seconds=stage_time)}")
+        log_message(f"Модель сохранена в: {model_path}")
+
+        # === ФИНАЛЬНАЯ СТАТИСТИКА ===
+        total_time = time.time() - start_time
+        log_message("=== ОБУЧЕНИЕ ЗАВЕРШЕНО ===")
+        log_message(f"Общее время выполнения: {timedelta(seconds=total_time)}")
+        log_message(f"Пользователей: {len(user_map)}")
+        log_message(f"Товаров: {len(item_map)}")
+        log_message(f"Признаков: {len(recommender.feature_columns)}")
+        log_message(f"NDCG@100 val: {val_ndcg:.4f}")
+
+    except Exception as e:
+        error_time = time.time() - start_time
+        log_message(f"!!! ОШИБКА ВЫПОЛНЕНИЯ !!!")
+        log_message(f"Ошибка: {str(e)}")
+        log_message(f"Время до ошибки: {timedelta(seconds=error_time)}")
+        log_message("Трассировка ошибки:")
+        import traceback
+
+        traceback_str = traceback.format_exc()
+        log_message(traceback_str)
+        raise e
+
+    finally:
+        # Всегда записываем итоговое время
+        total_time = time.time() - start_time
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(
+                f"\n=== ОБЩЕЕ ВРЕМЯ ВЫПОЛНЕНИЯ: {timedelta(seconds=total_time)} ===\n"
+            )
