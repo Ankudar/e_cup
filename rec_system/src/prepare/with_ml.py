@@ -2,8 +2,10 @@ import gc
 import os
 import pickle
 import random
+import shutil
 import tempfile
 import time
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
 from glob import glob
@@ -15,6 +17,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import psutil
+import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
 import torch.sparse
@@ -47,7 +50,7 @@ def safe_memory_cleanup():
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=10_000):
+def load_train_data(max_parts=0, max_rows=0):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. При max_rows берём первые строки
@@ -1633,20 +1636,27 @@ def build_item_features_dict(
     return item_stats_dict
 
 
-def build_user_item_features_dict(interactions_files, device="cuda"):
+def build_user_item_features_dict(
+    interactions_files,
+    tmp_dir="/home/root6/python/e_cup/rec_system/data/processed/ui_stats",
+    cleanup=True,
+):
     """
-    Оптимизированная версия с использованием Polars
+    Потоковая агрегация (Polars Lazy) -> запись на диск -> построчное чтение row-group (PyArrow)
     """
-    import polars as pl
+    # отдельная временная папка под этот запуск
+    run_dir = os.path.join(tmp_dir, f"ui_{uuid.uuid4().hex}")
+    os.makedirs(run_dir, exist_ok=True)
+    chunks_dir = os.path.join(run_dir, "chunks")
+    os.makedirs(chunks_dir, exist_ok=True)
 
     print("Построение словаря пользователь-товарных признаков...")
 
-    user_item_stats_list = []
-
-    for f in tqdm(interactions_files, desc="Обработка взаимодействий"):
-        df = pl.read_parquet(f)
-
-        chunk_stats = df.group_by(["user_id", "item_id"]).agg(
+    # 1) Агрегация по каждому файлу и сохранение на диск
+    for i, f in enumerate(tqdm(interactions_files, desc="Обработка взаимодействий")):
+        lf = pl.scan_parquet(f)
+        # агрегируем на лету
+        chunk_lf = lf.group_by(["user_id", "item_id"]).agg(
             [
                 pl.col("weight").count().alias("ui_count"),
                 pl.col("weight").sum().alias("ui_sum"),
@@ -1656,55 +1666,81 @@ def build_user_item_features_dict(interactions_files, device="cuda"):
                 pl.col("timestamp").min().alias("ui_first_ts"),
             ]
         )
+        chunk_path = os.path.join(chunks_dir, f"chunk_{i:05d}.parquet")
+        # ВАЖНО: sink_parquet — выполняет план без materialize в RAM
+        chunk_lf.sink_parquet(chunk_path)
 
-        user_item_stats_list.append(chunk_stats)
+    # 2) Финальная агрегация поверх всех чанков, снова на лету -> файл
+    chunks_glob = os.path.join(chunks_dir, "*.parquet")
+    all_lf = pl.scan_parquet(chunks_glob)
 
-    # Объединяем все статистики
-    if user_item_stats_list:
-        all_stats = pl.concat(user_item_stats_list)
-        final_stats = all_stats
-    else:
-        final_stats = pl.DataFrame()
-
-    # ВЫЧИСЛЕНИЕ ПРОИЗВОДНЫХ ПРИЗНАКОВ
-    print("Вычисление производных признаков...")
-    current_time = pl.lit(datetime.now())  # Исправлено
-
-    final_stats = (
-        final_stats.with_columns(
-            [
-                (pl.col("ui_sum") / pl.col("ui_count")).alias("ui_mean"),
-                ((current_time - pl.col("ui_last_ts")).dt.total_days()).alias(
-                    "ui_days_since_last"
-                ),
-                ((current_time - pl.col("ui_first_ts")).dt.total_days()).alias(
-                    "ui_days_since_first"
-                ),
-            ]
-        )
-        .fill_nan(0)
-        .fill_null(0)
+    final_lf = all_lf.group_by(["user_id", "item_id"]).agg(
+        [
+            pl.col("ui_count").sum().alias("ui_count"),
+            pl.col("ui_sum").sum().alias("ui_sum"),
+            pl.col("ui_max").max().alias("ui_max"),
+            pl.col("ui_min").min().alias("ui_min"),
+            pl.col("ui_last_ts").max().alias("ui_last_ts"),
+            pl.col("ui_first_ts").min().alias("ui_first_ts"),
+        ]
     )
 
-    # КОНВЕРТАЦИЯ В СЛОВАРЬ
+    final_path = os.path.join(run_dir, "ui_agg.parquet")
+    final_lf.sink_parquet(final_path)
+
+    # 3) Читаем итоговый parquet по row-group, дозаполняем производные и собираем dict
     user_item_stats_dict = {}
-    for row in final_stats.iter_rows(named=True):
-        key = (row["user_id"], row["item_id"])
-        user_item_stats_dict[key] = {
-            "ui_count": row["ui_count"],
-            "ui_mean": row["ui_mean"],
-            "ui_sum": row["ui_sum"],
-            "ui_max": row["ui_max"],
-            "ui_min": row["ui_min"],
-            "ui_last_ts": row["ui_last_ts"],
-            "ui_first_ts": row["ui_first_ts"],
-            "ui_days_since_last": row["ui_days_since_last"],
-            "ui_days_since_first": row["ui_days_since_first"],
-        }
+    now = datetime.now()
+    pf = pq.ParquetFile(final_path)
+
+    for rg in range(pf.num_row_groups):
+        tbl = pf.read_row_group(rg)
+        df = pl.from_arrow(tbl)
+
+        # гарантируем типы времени
+        if df["ui_last_ts"].dtype != pl.Datetime:
+            df = df.with_columns(pl.col("ui_last_ts").cast(pl.Datetime))
+        if df["ui_first_ts"].dtype != pl.Datetime:
+            df = df.with_columns(pl.col("ui_first_ts").cast(pl.Datetime))
+
+        # производные — считаем в этом батче
+        df = (
+            df.with_columns(
+                [
+                    (pl.col("ui_sum") / pl.col("ui_count")).alias("ui_mean"),
+                    (pl.lit(now, dtype=pl.Datetime) - pl.col("ui_last_ts"))
+                    .dt.total_days()
+                    .alias("ui_days_since_last"),
+                    (pl.lit(now, dtype=pl.Datetime) - pl.col("ui_first_ts"))
+                    .dt.total_days()
+                    .alias("ui_days_since_first"),
+                ]
+            )
+            .fill_nan(0)
+            .fill_null(0)
+        )
+
+        for row in df.iter_rows(named=True):
+            key = (row["user_id"], row["item_id"])
+            user_item_stats_dict[key] = {
+                "ui_count": int(row["ui_count"]),
+                "ui_mean": float(row["ui_mean"]),
+                "ui_sum": float(row["ui_sum"]),
+                "ui_max": float(row["ui_max"]),
+                "ui_min": float(row["ui_min"]),
+                "ui_last_ts": row["ui_last_ts"],
+                "ui_first_ts": row["ui_first_ts"],
+                "ui_days_since_last": float(row["ui_days_since_last"]),
+                "ui_days_since_first": float(row["ui_days_since_first"]),
+            }
 
     print(
         f"Словарь пользователь-товарных признаков построен. Записей: {len(user_item_stats_dict)}"
     )
+
+    if cleanup:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
     return user_item_stats_dict
 
 
