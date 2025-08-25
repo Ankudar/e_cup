@@ -41,11 +41,10 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=500_000_000):
+def load_train_data(max_parts=0, max_rows=10_000_000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
-    Ищем рекурсивно по папкам все .parquet файлы. При max_rows берём первые строки
-    из нескольких партиций, а не только из первой.
+    Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
     """
     paths = {
         "orders": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_orders_data/",
@@ -63,9 +62,36 @@ def load_train_data(max_parts=0, max_rows=500_000_000):
         "test_users": ["user_id"],
     }
 
+    dtype_profiles = {
+        "orders": {
+            "user_id": "int32",
+            "item_id": "int32",
+            "created_timestamp": "datetime64[ns]",
+            "last_status": "category",
+        },
+        "tracker": {
+            "user_id": "int32",
+            "item_id": "int32",
+            "timestamp": "datetime64[ns]",
+            "action_type": "category",
+        },
+        "items": {
+            "item_id": "int32",
+            "catalogid": "int32",
+            "itemname": "string",
+            "fclip_embed": "object",
+        },
+        "categories": {
+            "catalogid": "int32",
+            "catalogpath": "string",
+            "ids": "string",
+        },
+        "test_users": {"user_id": "int32"},
+    }
+
     def find_parquet_files(folder):
         files = glob(os.path.join(folder, "**", "*.parquet"), recursive=True)
-        files.sort()  # стабильный порядок "с начала"
+        files.sort()
         return files
 
     def read_sample(
@@ -76,41 +102,20 @@ def load_train_data(max_parts=0, max_rows=500_000_000):
             print(f"{name}: parquet файлы не найдены в {folder}")
             return dd.from_pandas(pd.DataFrame(), npartitions=1)
 
-        dtype_profiles = {
-            "orders": {
-                "user_id": "int32",
-                "item_id": "int32",
-                "created_timestamp": "datetime64[ns]",
-                "last_status": "category",
-            },
-            "tracker": {
-                "user_id": "int32",
-                "item_id": "int32",
-                "timestamp": "datetime64[ns]",
-                "action_type": "category",
-            },
-            "items": {
-                "item_id": "int32",
-                "catalogid": "int32",
-                "itemname": "string",
-                "fclip_embed": "object",
-            },
-            "categories": {
-                "catalogid": "int32",
-                "catalogpath": "string",
-                "ids": "string",
-            },
-            "test_users": {"user_id": "int32"},
-        }
         current_dtypes = dtype_profiles.get(name, {})
 
-        ddf = dd.read_parquet(
-            files,
-            engine="pyarrow",
-            dtype=current_dtypes if current_dtypes else None,
-            gather_statistics=False,
-            split_row_groups=True,
-        )
+        try:
+            # Читаем все файлы
+            ddf = dd.read_parquet(
+                files,
+                engine="pyarrow",
+                dtype=current_dtypes,
+                gather_statistics=False,
+                split_row_groups=True,
+            )
+        except Exception as e:
+            print(f"{name}: ошибка при чтении parquet ({e}), пропускаем")
+            return dd.from_pandas(pd.DataFrame(), npartitions=1)
 
         if columns is not None:
             available_cols = [c for c in columns if c in ddf.columns]
@@ -121,34 +126,46 @@ def load_train_data(max_parts=0, max_rows=500_000_000):
 
         total_parts = ddf.npartitions
 
-        # --- режим "все строки" - оставляем как есть
-        if max_rows == 0:
-            out_ddf = ddf
-            used_parts = total_parts
-            count = out_ddf.shape[0].compute()  # вычисляем количество строк
+        # Ограничиваем количество партиций если нужно
+        if max_parts > 0 and max_parts < total_parts:
+            ddf = ddf.partitions[:max_parts]
+            used_parts = max_parts
         else:
-            # --- НОВЫЙ ПОДХОД: используем Dask для выборки без загрузки в память ---
-            if max_parts == 0:
-                # Берем все партиции, но ограничиваем строки
-                out_ddf = ddf.head(max_rows, compute=False)  # НЕ вычисляем сразу!
-                used_parts = total_parts
-            else:
-                # Ограничиваем и партиции и строки
-                parts_to_read = min(max_parts, total_parts)
-                # Создаем новый Dask DataFrame из первых N партиций
-                out_ddf = ddf.partitions[:parts_to_read].head(max_rows, compute=False)
-                used_parts = parts_to_read
+            used_parts = total_parts
 
-            # Вычисляем приблизительное количество строк (без загрузки в память)
-            count = out_ddf.shape[0].compute()
+        # Если не нужно ограничивать строки - возвращаем как есть
+        if max_rows == 0:
+            count = ddf.shape[0].compute()
+            mem_estimate = ddf.memory_usage(deep=True).sum().compute() / (1024**2)
+            print(
+                f"{name}: {count:,} строк (использовано {used_parts} из {total_parts} партиций), ~{mem_estimate:.1f} MB"
+            )
+            return ddf
 
-        # Вычисляем использование памяти приблизительно
-        mem_estimate = out_ddf.memory_usage(deep=True).sum().compute() / (1024**2)
+        # Быстрый способ ограничить количество строк - берем первые max_rows
+        # Для этого сначала вычисляем общее количество строк
+        total_rows = ddf.shape[0].compute()
 
-        print(
-            f"{name}: {count:,} строк (использовано {used_parts} из {total_parts} партиций), ~{mem_estimate:.1f} MB"
-        )
-        return out_ddf
+        if total_rows <= max_rows:
+            # Если строк меньше лимита - возвращаем всё
+            count = total_rows
+            mem_estimate = ddf.memory_usage(deep=True).sum().compute() / (1024**2)
+            print(
+                f"{name}: {count:,} строк (использовано {used_parts} из {total_parts} партиций), ~{mem_estimate:.1f} MB"
+            )
+            return ddf
+        else:
+            # Если строк больше - создаем новый ddf с ограничением
+            # Для скорости используем head с последующим преобразованием
+            limited_ddf = ddf.head(max_rows, compute=False)
+            count = max_rows
+            mem_estimate = limited_ddf.memory_usage(deep=True).sum().compute() / (
+                1024**2
+            )
+            print(
+                f"{name}: {count:,} строк (использовано {used_parts} из {total_parts} партиций), ~{mem_estimate:.1f} MB"
+            )
+            return limited_ddf
 
     print("Загружаем данные...")
     orders_ddf = read_sample(

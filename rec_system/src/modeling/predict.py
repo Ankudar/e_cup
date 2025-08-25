@@ -124,54 +124,69 @@ class FastSubmissionGenerator:
         return None
 
     def _create_batch_features(self, user_ids):
-        """Создает features для батча пользователей"""
+        """Создает features для батча пользователей (векторизовано)"""
         n_users = len(user_ids)
-        n_features = self.item_features_matrix.shape[1]
+        n_items, n_features = self.item_features_matrix.shape
 
-        # Создаем большую матрицу для батча
-        batch_features = np.zeros(
-            (n_users * self.n_items, n_features), dtype=np.float32
-        )
+        # Базовая часть: повторяем item_features для каждого пользователя
+        batch_features = np.tile(self.item_features_matrix, (n_users, 1))
 
-        # Копируем item features для всех пользователей
-        for i in range(n_users):
-            start_idx = i * self.n_items
-            end_idx = start_idx + self.n_items
-            batch_features[start_idx:end_idx] = self.item_features_matrix
-
-        # Добавляем user features
+        # Добавляем user features только по нужным колонкам
+        user_vectors = np.zeros((n_users, n_features), dtype=np.float32)
         for i, user_id in enumerate(user_ids):
-            user_vector = self._get_user_features_vector(user_id)
-            if user_vector is not None:
-                start_idx = i * self.n_items
-                end_idx = start_idx + self.n_items
+            vec = self._get_user_features_vector(user_id)
+            if vec is not None:
+                user_vectors[i] = vec
 
-                # Добавляем user features ко всем товарам этого пользователя
-                for feat_idx in range(n_features):
-                    if self.feature_columns[feat_idx].startswith("user_"):
-                        batch_features[start_idx:end_idx, feat_idx] = user_vector[
-                            feat_idx
-                        ]
+        # Индексы user-фич
+        user_feat_indices = [
+            idx
+            for idx, col in enumerate(self.feature_columns)
+            if col.startswith("user_")
+        ]
+
+        if user_feat_indices:
+            # Реплицируем user_features по всем товарам пользователя
+            for i, u_vec in enumerate(user_vectors):
+                if u_vec.sum() != 0:  # если фичи есть
+                    start = i * n_items
+                    end = start + n_items
+                    batch_features[start:end, user_feat_indices] = u_vec[
+                        user_feat_indices
+                    ]
 
         return batch_features
 
     def _apply_dynamic_boosts(self, base_scores, user_id, user_items_slice):
-        """Применяет динамические бонусы к базовым scores"""
+        """Применяет динамические бонусы к базовым scores (O(len(recent_items)))"""
         boosted_scores = base_scores.copy()
 
         if user_id in self.recent_items_map:
             recent_items = self.recent_items_map[user_id]
-
-            # Бонус за последние просмотры (векторизовано)
-            for i, item_id in enumerate(self.all_items):
-                if item_id in recent_items:
-                    recency_idx = recent_items.index(item_id)
-                    recency_bonus = (
-                        0.5 * (len(recent_items) - recency_idx) / len(recent_items)
-                    )
-                    boosted_scores[i] += recency_bonus
+            if recent_items:
+                # Получаем индексы просмотренных товаров
+                indices = [
+                    self.item_map[item_id]
+                    for item_id in recent_items
+                    if item_id in self.item_map
+                ]
+                # Рассчитываем бонусы
+                n_recent = len(recent_items)
+                bonuses = np.array(
+                    [0.5 * (n_recent - i) / n_recent for i in range(len(indices))],
+                    dtype=np.float32,
+                )
+                # Добавляем к score
+                boosted_scores[indices] += bonuses
 
         return boosted_scores
+
+    def _get_top_k_items(self, scores, k=100):
+        """Быстрый выбор топ-k через argpartition"""
+        if len(scores) <= k:
+            return np.argsort(-scores)
+        top_idx = np.argpartition(-scores, k)[:k]
+        return top_idx[np.argsort(-scores[top_idx])]
 
     def generate_recommendations_batch(
         self, test_users_df, output_path, batch_size=100
@@ -204,7 +219,7 @@ class FastSubmissionGenerator:
                     final_scores = self._apply_dynamic_boosts(user_scores, user_id, i)
 
                     # 5. Берем топ-100
-                    top_indices = np.argsort(-final_scores)[:100]
+                    top_indices = self._get_top_k_items(final_scores, k=100)
                     recommended_items = [self.all_items[idx] for idx in top_indices]
 
                     submission_data.append(
