@@ -14,6 +14,7 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import polars as pl
+import psutil
 import torch
 import torch.nn.functional as F
 import torch.sparse
@@ -30,11 +31,27 @@ from tqdm.auto import tqdm
 tqdm.pandas()
 
 
+def check_memory(threshold_percent=85):
+    """Проверка использования памяти"""
+    memory = psutil.virtual_memory()
+    if memory.percent > threshold_percent:
+        print(f"⚠️  Внимание: память на {memory.percent}%!")
+        return False
+    return True
+
+
+def safe_memory_cleanup():
+    """Безопасная очистка памяти"""
+    gc.collect()
+    pl.clear_string_cache()
+
+
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=0):
+def load_train_data(max_parts=0, max_rows=10_000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
-    Ищем рекурсивно по папкам все .parquet файлы.
+    Ищем рекурсивно по папкам все .parquet файлы. При max_rows берём первые строки
+    из нескольких партиций, а не только из первой.
     """
     paths = {
         "orders": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_orders_data/",
@@ -53,8 +70,9 @@ def load_train_data(max_parts=0, max_rows=0):
     }
 
     def find_parquet_files(folder):
-        # Рекурсивно ищем все .parquet
-        return [f for f in glob(os.path.join(folder, "**/*.parquet"), recursive=True)]
+        files = glob(os.path.join(folder, "**", "*.parquet"), recursive=True)
+        files.sort()  # стабильный порядок "с начала"
+        return files
 
     def read_sample(
         folder, columns=None, name="", max_parts=max_parts, max_rows=max_rows
@@ -64,7 +82,6 @@ def load_train_data(max_parts=0, max_rows=0):
             print(f"{name}: parquet файлы не найдены в {folder}")
             return dd.from_pandas(pd.DataFrame(), npartitions=1)
 
-        # Индивидуальные настройки типов для разных наборов данных
         dtype_profiles = {
             "orders": {
                 "user_id": "int32",
@@ -82,7 +99,7 @@ def load_train_data(max_parts=0, max_rows=0):
                 "item_id": "int32",
                 "catalogid": "int32",
                 "itemname": "string",
-                "fclip_embed": "object",  # оставляем как object для массивов
+                "fclip_embed": "object",
             },
             "categories": {
                 "catalogid": "int32",
@@ -91,20 +108,15 @@ def load_train_data(max_parts=0, max_rows=0):
             },
             "test_users": {"user_id": "int32"},
         }
-
-        # Выбираем подходящий профиль типов по имени
         current_dtypes = dtype_profiles.get(name, {})
 
-        # Фильтруем только те типы, которые есть в запрошенных колонках
-        if columns is not None:
-            filtered_dtypes = {}
-            for col in columns:
-                if col in current_dtypes:
-                    filtered_dtypes[col] = current_dtypes[col]
-            current_dtypes = filtered_dtypes
-
-        # читаем все файлы с указанием типов
-        ddf = dd.read_parquet(files, dtype=current_dtypes if current_dtypes else None)
+        ddf = dd.read_parquet(
+            files,
+            engine="pyarrow",
+            dtype=current_dtypes if current_dtypes else None,
+            gather_statistics=False,
+            split_row_groups=True,
+        )
 
         if columns is not None:
             available_cols = [c for c in columns if c in ddf.columns]
@@ -114,33 +126,45 @@ def load_train_data(max_parts=0, max_rows=0):
             ddf = ddf[available_cols]
 
         total_parts = ddf.npartitions
-        if max_parts > 0:
-            used_parts = min(total_parts, max_parts)
-            ddf = dd.concat([ddf.get_partition(i) for i in range(used_parts)])
-        else:
+
+        # --- режим "все строки"
+        if max_rows == 0:
             used_parts = total_parts
+            out_ddf = ddf
+        else:
+            # --- режим "сэмпл фиксированного размера"
+            parts_to_read = (
+                total_parts if max_parts == 0 else min(max_parts, total_parts)
+            )
+            dfs = []
+            rows_accum = 0
+            for i in range(parts_to_read):
+                part = ddf.get_partition(i).compute()
+                if part.empty:
+                    continue
+                needed = max_rows - rows_accum
+                if len(part) > needed:
+                    dfs.append(part.iloc[:needed])
+                    rows_accum += needed
+                    break
+                else:
+                    dfs.append(part)
+                    rows_accum += len(part)
+                if rows_accum >= max_rows:
+                    break
+            out_df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+            out_ddf = dd.from_pandas(out_df, npartitions=1)
+            used_parts = i + 1
 
-        if max_rows > 0:
-            total_rows = ddf.map_partitions(len).compute().sum()
+        count = out_ddf.map_partitions(len).compute().sum()
+        mem_mb = out_ddf.map_partitions(
+            lambda df: df.memory_usage(deep=True).sum()
+        ).compute().sum() / (1024**2)
 
-            if total_rows <= max_rows:
-                df_all = ddf.compute()
-            else:
-                df_all = ddf.compute().tail(max_rows)
-
-            ddf = dd.from_pandas(df_all, npartitions=1)
-
-        count = ddf.map_partitions(len).compute().sum()
-        mem_bytes = (
-            ddf.map_partitions(lambda df: df.memory_usage(deep=True).sum())
-            .compute()
-            .sum()
-        )
-        mem_mb = mem_bytes / (1024**2)
         print(
             f"{name}: {count:,} строк (использовано {used_parts} из {total_parts} партиций), ~{mem_mb:.1f} MB"
         )
-        return ddf
+        return out_ddf
 
     print("Загружаем данные...")
     orders_ddf = read_sample(
@@ -358,7 +382,10 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
             vals = data["vals"]
 
             # Создаем sparse tensor для батча
-            indices = torch.tensor([rows, cols], dtype=torch.long, device="cuda")
+            indices_np = np.empty((2, len(rows)), dtype=np.int32)
+            indices_np[0] = rows
+            indices_np[1] = cols
+            indices = torch.tensor(indices_np, dtype=torch.long, device="cuda")
             values = torch.tensor(vals, dtype=torch.float32, device="cuda")
             sparse_batch = torch.sparse_coo_tensor(
                 indices, values, size=(len(user_map), len(item_map)), device="cuda"
@@ -1436,7 +1463,7 @@ def build_user_features_dict(interactions_files, orders_df, device="cuda"):
         user_stats = order_stats
 
     # 4. ВЫЧИСЛЕНИЕ ПРОИЗВОДНЫХ ПРИЗНАКОВ
-    current_time = pl.now()  # Исправлено: pl.datetime.now() -> pl.now()
+    current_time = pl.lit(datetime.now())  # Исправлено: pl.datetime.now() -> pl.now()
 
     user_stats = user_stats.with_columns(
         [
@@ -1561,7 +1588,7 @@ def build_item_features_dict(
     item_stats = item_stats.join(items_catalog, on="item_id", how="left")
 
     # 5. ВЫЧИСЛЕНИЕ ПРОИЗВОДНЫХ ПРИЗНАКОВ
-    current_time = pl.now()  # Исправлено
+    current_time = pl.lit(datetime.now())  # Исправлено
 
     item_stats = item_stats.with_columns(
         [
@@ -1641,7 +1668,7 @@ def build_user_item_features_dict(interactions_files, device="cuda"):
 
     # ВЫЧИСЛЕНИЕ ПРОИЗВОДНЫХ ПРИЗНАКОВ
     print("Вычисление производных признаков...")
-    current_time = pl.now()  # Исправлено
+    current_time = pl.lit(datetime.now())  # Исправлено
 
     final_stats = (
         final_stats.with_columns(
