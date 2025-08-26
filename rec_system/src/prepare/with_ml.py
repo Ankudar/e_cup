@@ -8,6 +8,7 @@ import tempfile
 import time
 import uuid
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from glob import glob
 from pathlib import Path
@@ -18,6 +19,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import psutil
+import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
@@ -41,7 +43,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=10_000_000):
+def load_train_data(max_parts=0, max_rows=1_000_000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -1056,14 +1058,26 @@ class LightGBMRecommender:
         recent_items_map,
         test_orders_df,
         sample_fraction=0.1,
-        negatives_per_positive=1,
+        negatives_per_positive=2,
         ui_features_dir=None,
         val_days: int = 7,
     ):
         log_message("Подготовка данных для LightGBM...")
         test_orders_df = test_orders_df.sample(frac=sample_fraction, random_state=42)
 
-        # 1. Загрузка взаимодействий с оптимизацией
+        # --- Пути ---
+        base_dir = Path("/home/root6/python/e_cup/rec_system/data/processed/")
+        base_dir.mkdir(parents=True, exist_ok=True)
+        pos_path = base_dir / "positives"
+        pos_path.mkdir(parents=True, exist_ok=True)
+        neg_path = base_dir / "negatives"
+        neg_path.mkdir(parents=True, exist_ok=True)
+        train_path = base_dir / "train.parquet"
+        val_path = base_dir / "val.parquet"
+
+        batch_size = 10000
+
+        # 1. Загружаем взаимодействия
         interactions_chunks = []
         for f in tqdm(interactions_files, desc="Загрузка взаимодействий"):
             df = pd.read_parquet(
@@ -1072,148 +1086,186 @@ class LightGBMRecommender:
             df["user_id"] = df["user_id"].astype("int64")
             df["item_id"] = df["item_id"].astype("int64")
             interactions_chunks.append(df)
-
         interactions_df = pd.concat(interactions_chunks, ignore_index=True)
         interactions_df["timestamp"] = pd.to_datetime(interactions_df["timestamp"])
         max_timestamp = interactions_df["timestamp"].max()
 
-        # 2. Рассчитываем split_time
+        # 2. split_time
         split_time = max_timestamp - pd.Timedelta(days=val_days)
         train_timestamp_fill = split_time - pd.Timedelta(seconds=1)
 
-        # 3. Позитивные примеры
+        # 3. Позитивы → на диск по батчам
         test_orders_df["user_id"] = test_orders_df["user_id"].astype("int64")
         test_orders_df["item_id"] = test_orders_df["item_id"].astype("int64")
-
         positive_df = test_orders_df[["user_id", "item_id"]].copy()
         positive_df["target"] = 1
+        positive_df["timestamp"] = train_timestamp_fill
 
-        # 4. История взаимодействий с оптимизацией
-        user_interacted_items = {}
-        user_positive_items = {}
+        for i in range(0, len(positive_df), batch_size):
+            batch = positive_df.iloc[i : i + batch_size]
+            batch_file = pos_path / f"positives_{i//batch_size}.parquet"
+            batch.to_parquet(batch_file, engine="pyarrow", index=False)
 
-        # Быстрое создание словарей через groupby
-        for user_id, group in interactions_df.groupby("user_id"):
-            user_interacted_items[user_id] = set(group["item_id"].unique())
+        # 4. История взаимодействий
+        user_interacted_items = {
+            uid: set(gr["item_id"].unique())
+            for uid, gr in interactions_df.groupby("user_id")
+        }
+        user_positive_items = {
+            uid: set(gr["item_id"].unique())
+            for uid, gr in positive_df.groupby("user_id")
+        }
 
-        for user_id, group in positive_df.groupby("user_id"):
-            user_positive_items[user_id] = set(group["item_id"].unique())
-
-        # 5. ОПТИМИЗИРОВАННЫЙ сэмплинг негативов
+        # 5. Доступные айтемы
         all_items = np.array(list(item_map.keys()), dtype=np.int64)
         popular_items_set = set(popularity_s.nlargest(10000).index.astype(np.int64))
-
-        negative_samples = []
-
-        # Предварительно вычисляем доступные items для каждого пользователя
         user_available_items = {}
-
         for user_id, pos_items in tqdm(
             user_positive_items.items(), desc="Подготовка негативных сэмплов"
         ):
             interacted = user_interacted_items.get(user_id, set())
             excluded = pos_items | interacted
-
-            # Используем numpy для быстрой фильтрации
-            available_mask = ~np.isin(all_items, list(excluded))
-            available_items = all_items[available_mask]
-
+            available_items = all_items[~np.isin(all_items, list(excluded))]
             if len(available_items) > 0:
                 user_available_items[user_id] = available_items
 
-        # Параллельная обработка пользователей
+        # 6. Генерация негативов
         def process_user(user_id):
             available_items = user_available_items.get(user_id)
             if available_items is None or len(available_items) == 0:
-                return []
-
+                return pd.DataFrame()
             n_neg = negatives_per_positive
-
-            # Быстрая проверка популярности через множества
             popular_mask = np.isin(available_items, list(popular_items_set))
             popular_candidates = available_items[popular_mask]
             random_candidates = available_items[~popular_mask]
 
             sampled_items = []
-
             if len(popular_candidates) > 0:
                 n_popular = min(n_neg // 2, len(popular_candidates))
                 sampled_items.extend(
                     np.random.choice(popular_candidates, n_popular, replace=False)
                 )
-
             if len(random_candidates) > 0 and len(sampled_items) < n_neg:
                 n_random = min(n_neg - len(sampled_items), len(random_candidates))
                 sampled_items.extend(
                     np.random.choice(random_candidates, n_random, replace=False)
                 )
 
-            return [
+            return pd.DataFrame(
                 {
-                    "user_id": int(user_id),
-                    "item_id": int(item_id),
-                    "timestamp": train_timestamp_fill,
-                    "target": 0,
+                    "user_id": [int(user_id)] * len(sampled_items),
+                    "item_id": [int(it) for it in sampled_items],
+                    "timestamp": [train_timestamp_fill] * len(sampled_items),
+                    "target": [0] * len(sampled_items),
                 }
-                for item_id in sampled_items
-            ]
+            )
 
-        # Используем многопоточность для ускорения
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        user_ids = list(user_available_items.keys())
-        negative_samples = []
+        # 7. Генерация негативов → батчи с немедленной записью
+        neg_shard_idx = 0
+        batch_accum = []
 
         with ThreadPoolExecutor(max_workers=8) as executor:
-            future_to_user = {
-                executor.submit(process_user, user_id): user_id for user_id in user_ids
+            futures = {
+                executor.submit(process_user, uid): uid
+                for uid in user_available_items.keys()
             }
 
             for future in tqdm(
-                as_completed(future_to_user),
-                total=len(user_ids),
-                desc="Генерация негативов",
+                as_completed(futures), total=len(futures), desc="Генерация негативов"
             ):
-                result = future.result()
-                negative_samples.extend(result)
+                df_part = future.result()
+                if df_part.empty:
+                    continue
 
-        negative_df = pd.DataFrame(negative_samples)
+                batch_accum.append(df_part)
 
-        # 6. Объединяем и перемешиваем
-        positive_with_time = positive_df.copy()
-        positive_with_time["timestamp"] = (
-            train_timestamp_fill  # Все позитивы в train зоне
-        )
+                # Пишем батч при достижении размера
+                if sum(len(df) for df in batch_accum) >= batch_size:
+                    df_batch = pd.concat(batch_accum, ignore_index=True)
+                    shard_file = neg_path / f"neg_{neg_shard_idx}.parquet"
+                    df_batch.to_parquet(shard_file, engine="pyarrow", index=False)
+                    log_message(
+                        f"Saved negative shard: {shard_file}, rows={len(df_batch)}"
+                    )
 
-        full_data = pd.concat([positive_with_time, negative_df], ignore_index=True)
-        full_data = full_data.sample(frac=1, random_state=42).reset_index(drop=True)
+                    neg_shard_idx += 1
+                    batch_accum = []
 
-        # 7. Разделяем train/val
-        train_data = full_data[full_data["timestamp"] <= split_time].copy()
-        val_data = full_data[full_data["timestamp"] > split_time].copy()
-
-        # Остальной код без изменений...
-        if len(val_data) == 0:
+        # Записываем остаток
+        if batch_accum:
+            df_batch = pd.concat(batch_accum, ignore_index=True)
+            shard_file = neg_path / f"neg_{neg_shard_idx}.parquet"
+            df_batch.to_parquet(shard_file, engine="pyarrow", index=False)
             log_message(
-                "⚠️ Валидация пуста — используем последние 10% примеров как val (fallback)."
-            )
-            cutoff = int(len(full_data) * 0.9)
-            train_data, val_data = (
-                full_data.iloc[:cutoff].copy(),
-                full_data.iloc[cutoff:].copy(),
+                f"Saved final negative shard: {shard_file}, rows={len(df_batch)}"
             )
 
-        # 8. Добавляем фичи
+        # 8. Train/Val split батчами с ParquetWriter
+        neg_files = list(neg_path.glob("neg_*.parquet"))
+        pos_files = list(pos_path.glob("positives_*.parquet"))
+        all_files = pos_files + neg_files
+        cols_order = ["user_id", "item_id", "timestamp", "target"]
+
+        # Train writer
+        writer_train = None
+        writer_val = None
+
+        for file in tqdm(all_files, desc="Train/Val батчи"):
+            df = pd.read_parquet(file)
+            df = df.sample(frac=1, random_state=42)
+            for i in range(0, len(df), batch_size):
+                batch_df = df.iloc[i : i + batch_size].reset_index(
+                    drop=True
+                )  # сброс индекса
+                batch_df = batch_df[cols_order]  # фиксируем порядок колонок
+
+                train_df = batch_df[batch_df["timestamp"] <= split_time]
+                val_df = batch_df[batch_df["timestamp"] > split_time]
+
+                if not train_df.empty:
+                    table_train = pa.Table.from_pandas(train_df, preserve_index=False)
+                    if writer_train is None:
+                        writer_train = pq.ParquetWriter(
+                            train_path, schema=table_train.schema
+                        )
+                    writer_train.write_table(table_train)
+
+                if not val_df.empty:
+                    table_val = pa.Table.from_pandas(val_df, preserve_index=False)
+                    if writer_val is None:
+                        writer_val = pq.ParquetWriter(val_path, schema=table_val.schema)
+                    writer_val.write_table(table_val)
+
+        if writer_train:
+            writer_train.close()
+        if writer_val:
+            writer_val.close()
+        else:
+            # создаем пустой val.parquet с нужными колонками
+            empty_val = pd.DataFrame(
+                columns=["user_id", "item_id", "timestamp", "target"]
+            )
+            empty_val.to_parquet(val_path, engine="pyarrow", index=False)
+
+        # 9. Загружаем train/val
+        train_data = pd.read_parquet(train_path)
+        val_data = pd.read_parquet(val_path)
+        if len(val_data) == 0:
+            cutoff = int(len(train_data) * 0.9)
+            train_data, val_data = (
+                train_data.iloc[:cutoff].copy(),
+                train_data.iloc[cutoff:].copy(),
+            )
+
+        # 10. Фичи
         train_data = self._add_rich_features(train_data, train_only_data=train_data)
         val_data = self._add_rich_features(val_data, train_only_data=train_data)
-
-        # 9. UI фичи (оптимизированная версия)
         if ui_features_dir and os.path.exists(ui_features_dir):
             train_data, val_data = self._add_ui_features_optimized(
                 train_data, val_data, ui_features_dir
             )
 
-        # 10. Диагностика
+        # 11. Лог
         def log_message_dist(df, name):
             counts = df["target"].value_counts(dropna=False).to_dict()
             log_message(f"{name}: rows={len(df)}; target_counts={counts}")
@@ -2027,7 +2079,7 @@ if __name__ == "__main__":
         """Функция для логирования сообщений в файл и вывод в консоль"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         full_message = f"[{timestamp}] {message}"
-        log_message(full_message)
+        print(full_message)
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(full_message + "\n")
 
