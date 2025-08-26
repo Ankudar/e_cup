@@ -6,7 +6,9 @@ import random
 import shutil
 import tempfile
 import time
+import traceback
 import uuid
+import warnings
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -33,12 +35,15 @@ from torch import nn
 from tqdm import tqdm
 from tqdm.auto import tqdm
 
+warnings.filterwarnings(
+    "ignore", category=FutureWarning, message=".*Downcasting object dtype arrays.*"
+)
 # tqdm интеграция с pandas
 tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=1_000_00):
+def load_train_data(max_parts=0, max_rows=1_000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -1434,11 +1439,11 @@ class LightGBMRecommender:
 
     def train(self, train_data, val_data=None, params=None):
         """
-        Обучение LightGBM с бинарной задачей вместо lambdarank.
+        Обучение LightGBM с бинарной целью, с оценкой NDCG@100 на валидации.
         """
         if params is None:
             params = {
-                "objective": "binary",  # вместо lambdarank
+                "objective": "binary",
                 "metric": "binary_logloss",
                 "learning_rate": 0.05,
                 "num_leaves": 31,
@@ -1449,6 +1454,10 @@ class LightGBMRecommender:
                 "bagging_freq": 1,
                 "verbosity": 1,
                 "force_row_wise": True,
+                "device": "cpu",  # можно "cuda", если GPU доступен
+                "num_threads": 8,
+                "max_bin": 200,
+                "boosting": "gbdt",
             }
 
         X_train = train_data[self.feature_columns]
@@ -1467,13 +1476,13 @@ class LightGBMRecommender:
             valid_sets.append(val_dataset)
             valid_names.append("valid")
 
-        log_message(f"Размер тренировочных данных: {len(X_train)}")
+        log_message(f"Размер train: {len(X_train)}")
         if val_data is not None:
-            log_message(f"Размер валидационных данных: {len(X_val)}")
+            log_message(f"Размер val: {len(X_val)}")
 
-        # --- Callback для вывода каждые 10 итераций ---
+        # Callback для логирования
         def log_every_N_iter(env):
-            if env.iteration % 50 == 0:
+            if env.iteration % 10 == 0:
                 metrics = ", ".join(
                     [
                         f"{name}_{metric}:{val:.4f}"
@@ -1488,51 +1497,39 @@ class LightGBMRecommender:
             num_boost_round=1000,
             valid_sets=valid_sets,
             valid_names=valid_names,
-            callbacks=[lgb.early_stopping(100), log_every_N_iter],  # ранняя остановка
+            callbacks=[lgb.early_stopping(50), log_every_N_iter],
         )
+
+        # Вычисляем NDCG@100 на валидации сразу после обучения
+        if val_data is not None:
+            ndcg_val = self.evaluate(val_data)
+            log_message(f"NDCG@100 на валидации: {ndcg_val:.4f}")
 
         return self.model
 
-    def evaluate(self, data):
-        """Оценка модели"""
+    def evaluate(self, data, k=100):
+        """Оценка модели через NDCG@k"""
         if self.model is None or len(data) == 0:
             return 0.0
 
-        # Предсказания вероятностей
-        preds = self.model.predict(data[self.feature_columns])
         data = data.copy()
-        data["score"] = preds
+        data["score"] = self.model.predict(data[self.feature_columns])
 
-        recommendations = {}
-        for user_id, group in data.groupby("user_id"):
-            top_items = group.nlargest(100, "score")["item_id"].tolist()
-            recommendations[user_id] = top_items
-
-        # NDCG можно посчитать вручную через уже отсортированные топ-100
         groups = data.groupby("user_id").size().values
         ndcg = ndcg_at_k_grouped(
-            data["score"].values, data["target"].values, groups, k=100
+            data["score"].values, data["target"].values, groups, k=k
         )
         return ndcg
 
-    def predict_rank(self, data):
-        """Предсказание рангов"""
-        X = data[self.feature_columns]
-        return self.model.predict(X)
+    def recommend(self, user_items_data, top_k=100):
+        """Генерация рекомендаций для пользователей, топ-K"""
+        data = user_items_data.copy()
+        data["score"] = self.model.predict(data[self.feature_columns])
 
-    def recommend(self, user_items_data):
-        """Генерация рекомендаций для пользователей"""
-        # 1. Предсказания модели
-        user_items_data["score"] = self.model.predict(
-            user_items_data[self.feature_columns]
-        )
-
-        # 2. Сортировка внутри пользователя и выбор топ-100
-        recommendations = {}
-        for user_id, group in user_items_data.groupby("user_id"):
-            top_items = group.nlargest(100, "score")["item_id"].tolist()
-            recommendations[user_id] = top_items
-
+        recommendations = {
+            user_id: group.nlargest(top_k, "score")["item_id"].tolist()
+            for user_id, group in data.groupby("user_id")
+        }
         return recommendations
 
 
@@ -2161,6 +2158,143 @@ def load_and_process_embeddings(
     return embeddings_dict
 
 
+# Функция для получения рекомендаций для одного пользователя
+def get_user_recommendations(user_id, top_k=100, **optimizations):
+    """Оптимизированная версия функции предсказаний"""
+    try:
+        # Используем оптимизированные функции если переданы
+        recent_items_get = optimizations.get("recent_items_get", recent_items_map.get)
+        copurchase_map_get = optimizations.get("copurchase_map_get", copurchase_map.get)
+        item_to_cat_get = optimizations.get("item_to_cat_get", item_to_cat.get)
+        cat_to_items_get = optimizations.get("cat_to_items_get", cat_to_items.get)
+        item_features_get = optimizations.get(
+            "item_features_get", item_features_dict.get
+        )
+        user_features_get = optimizations.get(
+            "user_features_get", user_features_dict.get
+        )
+        embeddings_dict_get = optimizations.get(
+            "embeddings_dict_get", embeddings_dict.get
+        )
+        popular_items_array = optimizations.get("popular_items_array", popular_items)
+
+        # Получаем recent items пользователя
+        recent_items = recent_items_get(user_id, [])
+
+        # Создаем кандидатов для рекомендации
+        candidates = set()
+
+        # Добавляем популярные товары
+        candidates.update(popular_items_array[:500])
+
+        # Добавляем товары из recent items
+        candidates.update(recent_items)
+
+        # Добавляем co-purchased товары для recent items
+        for item in recent_items:
+            co_items = copurchase_map_get(item, [])
+            if co_items:
+                candidates.update(co_items[:20])
+
+        # Добавляем товары из той же категории что и recent items
+        for item in recent_items:
+            cat_id = item_to_cat_get(item)
+            if cat_id:
+                cat_items = cat_to_items_get(cat_id, [])
+                if cat_items:
+                    candidates.update(cat_items[:50])
+
+        # Фильтруем существующие товары
+        candidates = [c for c in candidates if c in item_map]
+
+        if not candidates:
+            return popular_items_array[:top_k]
+
+        # Создаем DataFrame с кандидатами
+        candidate_df = pd.DataFrame(
+            {"user_id": [user_id] * len(candidates), "item_id": candidates}
+        )
+
+        # Добавляем REAL user features
+        user_feats = user_features_get(user_id, {})
+        for feat_name, feat_value in user_feats.items():
+            candidate_df[feat_name] = feat_value
+
+        # Добавляем REAL item features
+        for item_id in candidates:
+            item_feats = item_features_get(item_id, {})
+            for feat_name, feat_value in item_feats.items():
+                candidate_df.loc[candidate_df["item_id"] == item_id, feat_name] = (
+                    feat_value
+                )
+
+        # Добавляем REAL эмбеддинги
+        for i in range(10):
+            for item_id in candidates:
+                embedding = embeddings_dict_get(item_id)
+                if embedding is not None and i < len(embedding):
+                    candidate_df.loc[
+                        candidate_df["item_id"] == item_id, f"fclip_embed_{i}"
+                    ] = embedding[i]
+                else:
+                    candidate_df.loc[
+                        candidate_df["item_id"] == item_id, f"fclip_embed_{i}"
+                    ] = 0
+
+        # Добавляем простые признаки
+        candidate_df["is_weekend"] = 0
+        candidate_df["hour"] = 12
+        candidate_df["covisitation_score"] = 0
+
+        # UI признаки
+        ui_features = [
+            "ui_count",
+            "ui_sum",
+            "ui_max",
+            "ui_min",
+            "ui_mean",
+            "ui_days_since_last",
+            "ui_days_since_first",
+        ]
+        for feat in ui_features:
+            candidate_df[feat] = 0
+
+        # Заполняем пропущенные значения
+        candidate_df = candidate_df.fillna(0).infer_objects(copy=False)
+
+        # Убедимся что все колонки на месте
+        missing_cols = set(recommender.feature_columns) - set(candidate_df.columns)
+        if missing_cols:
+            for col in missing_cols:
+                candidate_df[col] = 0
+
+        # Выбираем только нужные колонки
+        X_candidate = candidate_df[recommender.feature_columns]
+
+        # Предсказываем вероятности
+        predictions = recommender.model.predict(X_candidate)
+
+        # Сортируем по убыванию вероятности
+        candidate_df["score"] = predictions
+        candidate_df = candidate_df.sort_values("score", ascending=False)
+
+        top_recommendations = candidate_df["item_id"].head(top_k).tolist()
+
+        # Логируем статистику (только для отладки)
+        if processed % 100 == 0:  # Логируем только каждого 100-го пользователя
+            unique_count = len(set(top_recommendations))
+            avg_score = candidate_df["score"].head(top_k).mean()
+            log_message(
+                f"User {user_id}: {unique_count} unique, score: {avg_score:.4f}"
+            )
+
+        return top_recommendations
+
+    except Exception as e:
+        log_message(f"Error for user {user_id}: {str(e)}")
+        return popular_items_array[:top_k]
+
+
 # -------------------- Основной запуск --------------------
 if __name__ == "__main__":
     start_time = time.time()
@@ -2399,6 +2533,111 @@ if __name__ == "__main__":
             f"Подготовка данных для LightGBM завершена за {timedelta(seconds=stage_time)}"
         )
 
+        # === ДЕТАЛЬНАЯ ПРОВЕРКА ПРИЗНАКОВ ===
+        stage_start = time.time()
+        log_message("=== ДЕТАЛЬНАЯ ПРОВЕРКА FEATURE GENERATION ===")
+
+        # 1. Проверка user features
+        log_message("--- ПРОВЕРКА USER FEATURES ---")
+        if user_features_dict:
+            sample_user = list(user_features_dict.keys())[0]
+            user_feats = user_features_dict[sample_user]
+            log_message(f"Пример user features для пользователя {sample_user}:")
+            for feat, value in user_feats.items():
+                log_message(f"  {feat}: {value}")
+
+            # Статистика по user features
+            users_with_features = len(user_features_dict)
+            users_with_real_features = sum(
+                1
+                for feats in user_features_dict.values()
+                if any(v != 0 for v in feats.values())
+            )
+            log_message(f"Пользователей с features: {users_with_features}")
+            log_message(
+                f"Пользователей с НЕнулевыми features: {users_with_real_features}"
+            )
+        else:
+            log_message("⚠️ user_features_dict ПУСТОЙ!")
+
+        # 2. Проверка item features
+        log_message("--- ПРОВЕРКА ITEM FEATURES ---")
+        if item_features_dict:
+            sample_item = list(item_features_dict.keys())[0]
+            item_feats = item_features_dict[sample_item]
+            log_message(f"Пример item features для товара {sample_item}:")
+            for feat, value in item_feats.items():
+                log_message(f"  {feat}: {value}")
+
+            # Статистика по item features
+            items_with_features = len(item_features_dict)
+            items_with_real_features = sum(
+                1
+                for feats in item_features_dict.values()
+                if any(v != 0 for v in feats.values())
+            )
+            log_message(f"Товаров с features: {items_with_features}")
+            log_message(f"Товаров с НЕнулевыми features: {items_with_real_features}")
+        else:
+            log_message("⚠️ item_features_dict ПУСТОЙ!")
+
+        # 3. Проверка UI features
+        log_message("--- ПРОВЕРКА UI FEATURES ---")
+        if ui_features_dir and os.path.exists(ui_features_dir):
+            metadata_path = os.path.join(ui_features_dir, "metadata.json")
+            if os.path.exists(metadata_path):
+                with open(metadata_path, "r") as f:
+                    metadata = json.load(f)
+                log_message(
+                    f"UI features files: {len(metadata.get('ui_feature_files', []))}"
+                )
+                log_message(f"UI features stats: {metadata.get('stats', {})}")
+            else:
+                log_message("⚠️ Метаданные UI features не найдены")
+        else:
+            log_message("⚠️ UI features directory не существует")
+
+        # 4. Проверка эмбеддингов
+        log_message("--- ПРОВЕРКА ЭМБЕДДИНГОВ ---")
+        if embeddings_dict:
+            sample_item = list(embeddings_dict.keys())[0]
+            embedding = embeddings_dict[sample_item]
+            log_message(
+                f"Пример эмбеддинга для товара {sample_item}: shape {embedding.shape}"
+            )
+            log_message(f"Эмбеддингов загружено: {len(embeddings_dict)}")
+            log_message(f"Пример значений: {embedding[:5]}")
+        else:
+            log_message("⚠️ embeddings_dict ПУСТОЙ!")
+
+        # 5. Проверка co-purchase map
+        log_message("--- ПРОВЕРКА CO-PURCHASE MAP ---")
+        if copurchase_map:
+            sample_item = list(copurchase_map.keys())[0]
+            co_items = copurchase_map[sample_item]
+            log_message(
+                f"Пример co-purchase для товара {sample_item}: {len(co_items)} товаров"
+            )
+            log_message(f"Co-purchase записей: {len(copurchase_map)}")
+        else:
+            log_message("⚠️ copurchase_map ПУСТОЙ!")
+
+        # 6. Проверка категорийных маппингов
+        log_message("--- ПРОВЕРКА КАТЕГОРИЙНЫХ МАППИНГОВ ---")
+        if item_to_cat and cat_to_items:
+            sample_item = list(item_to_cat.keys())[0]
+            cat_id = item_to_cat[sample_item]
+            cat_items = cat_to_items.get(cat_id, [])
+            log_message(f"Товар {sample_item} -> категория {cat_id}")
+            log_message(f"Категория {cat_id} -> {len(cat_items)} товаров")
+            log_message(f"Товаров в маппинге: {len(item_to_cat)}")
+            log_message(f"Категорий в маппинге: {len(cat_to_items)}")
+        else:
+            log_message("⚠️ Категорийные маппинги ПУСТЫЕ!")
+
+        stage_time = time.time() - stage_start
+        log_message(f"Проверка признаков завершена за {timedelta(seconds=stage_time)}")
+
         # === ОБУЧЕНИЕ LightGBM ===
         stage_start = time.time()
         log_message("=== ОБУЧЕНИЕ LightGBM ===")
@@ -2451,7 +2690,7 @@ if __name__ == "__main__":
             "popular_items": popular_items,
             "user_features_dict": user_features_dict,
             "item_features_dict": item_features_dict,
-            "ui_features_dir": ui_features_dir,  # сохраняем путь к UI-признакам
+            "ui_features_dir": ui_features_dir,
             "recent_items_map": recent_items_map,
             "copurchase_map": copurchase_map,
             "item_to_cat": item_to_cat,
@@ -2467,15 +2706,114 @@ if __name__ == "__main__":
         log_message(f"Сохранение модели завершено за {timedelta(seconds=stage_time)}")
         log_message(f"Модель сохранена в: {model_path}")
 
-        # === ФИНАЛЬНАЯ СТАТИСТИКА ===
+        # === ОПТИМИЗИРОВАННЫЕ ПРЕДСКАЗАНИЯ С МОДЕЛЬЮ ===
+        stage_start = time.time()
+        log_message("=== ОПТИМИЗИРОВАННЫЕ ПРЕДСКАЗАНИЯ С МОДЕЛЬЮ ===")
+
+        # Загружаем тестовых пользователей
+        test_users = test_users_ddf.compute()["user_id"].unique()
+        log_message(f"Тестовых пользователей для предсказания: {len(test_users)}")
+
+        # Оптимизация: предварительно загружаем все что нужно
+        popular_items_array = np.array(popular_items, dtype=np.int64)
+
+        # Оптимизация: кэшируем методы доступа для скорости
+        recent_items_get = recent_items_map.get
+        copurchase_map_get = copurchase_map.get
+        item_to_cat_get = item_to_cat.get
+        cat_to_items_get = cat_to_items.get
+        item_features_get = item_features_dict.get
+        user_features_get = user_features_dict.get
+        embeddings_dict_get = embeddings_dict.get
+
+        # Создаем рекомендации
+        recommendations = {}
+        processed = 0
+        batch_size = 20  # Малый батч для экономии памяти
+
+        log_message(
+            f"Начинаем создание рекомендаций для {len(test_users)} пользователей..."
+        )
+
+        start_time = time.time()
+        for i in range(0, len(test_users), batch_size):
+            batch_users = test_users[i : i + batch_size]
+            batch_start = time.time()
+
+            for user_id in batch_users:
+                try:
+                    recommendations[user_id] = get_user_recommendations(
+                        user_id,
+                        top_k=K,
+                        # Передаем оптимизированные функции
+                        recent_items_get=recent_items_get,
+                        copurchase_map_get=copurchase_map_get,
+                        item_to_cat_get=item_to_cat_get,
+                        cat_to_items_get=cat_to_items_get,
+                        item_features_get=item_features_get,
+                        user_features_get=user_features_get,
+                        embeddings_dict_get=embeddings_dict_get,
+                        popular_items_array=popular_items_array,
+                    )
+                    processed += 1
+
+                except Exception as e:
+                    # Fallback на популярные товары при ошибке
+                    recommendations[user_id] = popular_items[:K]
+                    log_message(f"Ошибка для пользователя {user_id}: {e}")
+
+            # Логируем прогресс
+            if processed % 100 == 0 or i + batch_size >= len(test_users):
+                batch_time = time.time() - batch_start
+                total_time = time.time() - start_time
+                avg_time_per_user = total_time / processed if processed > 0 else 0
+
+                log_message(f"Обработано {processed}/{len(test_users)} пользователей")
+                log_message(
+                    f"Текущий батч: {batch_time:.2f} сек, Среднее время: {avg_time_per_user:.4f} сек/пользователь"
+                )
+
+        # Сохраняем рекомендации
+        stage_start_save = time.time()
+        results_dir = "/home/root6/python/e_cup/rec_system/results"
+        os.makedirs(results_dir, exist_ok=True)
+        output_file = os.path.join(results_dir, "submit.csv")
+
+        # Быстрая запись в CSV
+        with open(output_file, "w", encoding="utf-8", buffering=8192) as f:
+            f.write("user_id,item_id_1 item_id_2 ... item_id_100\n")
+            for user_id, items in recommendations.items():
+                items_str = " ".join(str(int(item)) for item in items)
+                f.write(f"{int(user_id)},{items_str}\n")
+
+        save_time = time.time() - stage_start_save
+        log_message(f"Рекомендации сохранены за {save_time:.2f} сек")
+
+        # Финальная статистика
+        all_items = set()
+        for recs in recommendations.values():
+            all_items.update(recs)
+
+        log_message(f"Создано рекомендаций для {len(recommendations)} пользователей")
+        log_message(f"Уникальных рекомендованных товаров: {len(all_items)}")
+        log_message(f"Охват товаров: {len(all_items)/len(item_map)*100:.1f}%")
+
+        stage_time = time.time() - stage_start
+        log_message(
+            f"Создание рекомендаций завершено за {timedelta(seconds=stage_time)}"
+        )
+
+        # === ФИНАЛЬНАЯ СТАТИСТИКА (обновленная) ===
         total_time = time.time() - start_time
-        log_message("=== ОБУЧЕНИЕ ЗАВЕРШЕНО УСПЕШНО ===")
+        log_message("=== ОБУЧЕНИЕ И ПРЕДСКАЗАНИЯ ЗАВЕРШЕНЫ УСПЕШНО ===")
         log_message(f"Общее время выполнения: {timedelta(seconds=total_time)}")
         log_message(f"Пользователей: {len(user_map)}")
         log_message(f"Товаров: {len(item_map)}")
         log_message(f"Признаков: {len(recommender.feature_columns)}")
         log_message(f"NDCG@100 train: {train_ndcg:.4f}")
         log_message(f"NDCG@100 val: {val_ndcg:.4f}")
+        log_message(f"Тестовых пользователей: {len(test_users)}")
+        log_message(f"Рекомендаций создано: {len(recommendations)}")
 
         # Информация о системе
         log_message("=== СИСТЕМНАЯ ИНФОРМАЦИЯ ===")
