@@ -24,6 +24,31 @@ logger = logging.getLogger(__name__)
 class FastSubmissionGenerator:
     def __init__(self, model_path):
         self.start_time = time.time()
+
+        # Конфигурация тумблеров (по умолчанию все включено)
+        self.config = {
+            "use_popularity": True,
+            "use_recent_interactions": False,
+            "use_similar_items": False,
+            "use_category_items": False,
+            "use_copurchase": False,
+            "use_als_recommendations": False,
+            "use_user_features": False,
+            "use_type_weights": False,
+            "use_time_decay": False,
+        }
+
+        # ("use_popularity", "Использовать популярные товары", True),
+        # ("use_recent_interactions", "Учитывать последние взаимодействия", True),
+        # ("use_similar_items", "Рекомендовать похожие товары", True),
+        # ("use_category_items", "Рекомендовать товары из той же категории", True),
+        # ("use_copurchase", "Учитывать совместные покупки", True),
+        # ("use_als_recommendations", "Использовать ALS рекомендации", True),
+        # ("use_user_features", "Использовать фичи пользователей", True),
+        # ("use_type_weights", "Применять веса по типам взаимодействий", True),
+        # ("use_time_decay", "Учитывать временной декей", True),
+        # ("use_gpu_acceleration", "Использовать GPU ускорение", True),
+
         logger.info("Загрузка модели и данных...")
         with open(model_path, "rb") as f:
             model_data = pickle.load(f)
@@ -77,19 +102,21 @@ class FastSubmissionGenerator:
     def _precompute_similar_items(self, top_n=20):
         if self.item_embeddings is None:
             return {}
-        logger.info("Вычисление похожих товаров...")
-        nn = NearestNeighbors(n_neighbors=top_n + 1, metric="cosine")
+
+        logger.info("Вычисление всех похожих товаров...")
+        nn = NearestNeighbors(n_neighbors=top_n + 1, metric="cosine", n_jobs=-1)
         nn.fit(self.item_embeddings)
+
+        # Вычисляем для всех товаров сразу
+        distances, indices = nn.kneighbors(self.item_embeddings)
+
         similar_items_cache = {}
-        for item_id in tqdm(self.all_items[:10000], desc="ALS similar items"):
-            if item_id in self.item_map:
-                item_idx = self.item_map[item_id]
-                distances, indices = nn.kneighbors(
-                    self.item_embeddings[item_idx].reshape(1, -1)
-                )
-                similar_items_cache[item_id] = [
-                    self.inv_item_map[idx] for idx in indices[0][1 : top_n + 1]
-                ]
+        for item_idx in range(len(self.all_items)):
+            item_id = self.inv_item_map[item_idx]
+            similar_items_cache[item_id] = [
+                self.inv_item_map[idx] for idx in indices[item_idx][1 : top_n + 1]
+            ]
+
         return similar_items_cache
 
     def _precompute_category_items(self):
@@ -117,60 +144,99 @@ class FastSubmissionGenerator:
         return None
 
     def _compute_user_item_scores(self, user_id, top_candidates=1000):
-        """Предсказание только для топ-кандидатов (500-1000) с учетом разных типов взаимодействий"""
-        candidate_items = set(self.popular_items[:500])  # популярные
-        recent_interactions = self.recent_items_map.get(user_id, [])
+        # Используем OrderedDict для сохранения порядка и быстрого доступа
+        candidate_scores = {}
 
-        # Берем последние 100 взаимодействий
-        recent_interactions = recent_interactions[-100:]
+        # Базовые популярные товары
+        if self.config["use_popularity"]:
+            for i, item_id in enumerate(self.popular_items[:200]):
+                candidate_scores[item_id] = 1.0 - (i / 200)  # Вес популярности
 
-        # Добавляем последние просмотры, добавления в избранное и в корзину
-        for inter in recent_interactions:
-            candidate_items.add(inter["item_id"])
-            # похожие, категория, совместные покупки
-            candidate_items.update(self.similar_items_cache.get(inter["item_id"], []))
-            cat = self.item_to_cat.get(inter["item_id"])
-            if cat:
-                candidate_items.update(self.category_items_dict.get(cat, []))
-            candidate_items.update(self.copurchase_map.get(inter["item_id"], []))
+        # 2. Добавляем кандидаты на основе последних взаимодействий пользователя
+        recent_interactions = self.recent_items_map.get(user_id, [])[
+            -100:
+        ]  # Берем последние 100
 
-        candidate_items = list(candidate_items)[:top_candidates]
+        if self.config["use_recent_interactions"]:
+            for inter in recent_interactions:
+                candidate_scores.add(inter["item_id"])
+
+        # 3. Добавляем похожие товары (на основе ALS эмбеддингов)
+        if self.config["use_similar_items"] and self.similar_items_cache:
+            for inter in recent_interactions:
+                similar = self.similar_items_cache.get(inter["item_id"], [])
+                candidate_scores.update(
+                    similar[:10]
+                )  # Ограничиваем количество с каждого айтема
+
+        # 4. Добавляем товары из тех же категорий
+        if self.config["use_category_items"]:
+            for inter in recent_interactions:
+                cat = self.item_to_cat.get(inter["item_id"])
+                if cat:
+                    cat_items = self.category_items_dict.get(cat, [])
+                    candidate_scores.update(cat_items[:20])  # Берем топ-N из категории
+
+        # 5. Добавляем товары для совместной покупки
+        if self.config["use_copurchase"]:
+            for inter in recent_interactions:
+                copurchase = self.copurchase_map.get(inter["item_id"], [])
+                candidate_scores.update(copurchase[:10])
+
+        # Преобразуем set в list и ограничиваем общее количество кандидатов
+        candidate_items = list(candidate_scores)[:top_candidates]
+
+        # Если кандидатов нет (крайний холодный старт), используем популярные
+        if not candidate_items:
+            return self.popular_items[:100]
+
+        # Получаем индексы кандидатов для features_matrix
         candidate_indices = [
             self.item_map[i] for i in candidate_items if i in self.item_map
         ]
 
-        if not candidate_indices:
-            # cold start
-            return self.popular_items[:100]
-
+        # Подготавливаем фичи для модели
         batch_features = self.item_features_matrix[candidate_indices].copy()
-        user_vec = self._get_user_features_vector(user_id)
-        user_feat_indices = [
-            i for i, col in enumerate(self.feature_columns) if col.startswith("user_")
-        ]
-        if user_vec is not None and user_feat_indices:
-            batch_features[:, user_feat_indices] = user_vec[user_feat_indices]
 
+        # 6. Добавляем пользовательские фичи, если включено
+        if self.config["use_user_features"]:
+            user_vec = self._get_user_features_vector(user_id)
+            if user_vec is not None:
+                # Копируем user features для всех кандидатов
+                user_feat_mask = [
+                    col.startswith("user_") for col in self.feature_columns
+                ]
+                batch_features[:, user_feat_mask] = user_vec[user_feat_mask]
+
+        # Предсказание модели
         scores = self.model.predict(batch_features, num_iteration=-1)
 
-        # применяем веса для разных типов взаимодействий
-        type_weights = {"page_view": 2.0, "favorite": 5.0, "to_cart": 10.0}
-        for i, item_id in enumerate(candidate_items):
-            for inter in recent_interactions:
-                if inter["item_id"] == item_id:
-                    scores[i] += type_weights.get(
-                        inter.get("action_type", "page_view"), 0.0
-                    )
-            # базовая популярность
-            if item_id in self.popular_items:
-                scores[i] += 1.0
+        # 7. Применяем веса по типам взаимодействий, если включено
+        if self.config["use_type_weights"]:
+            type_weights = {"page_view": 2.0, "favorite": 5.0, "to_cart": 10.0}
+            for i, item_id in enumerate(candidate_items):
+                for inter in recent_interactions:
+                    if inter["item_id"] == item_id:
+                        scores[i] += type_weights.get(
+                            inter.get("action_type", "page_view"), 0.0
+                        )
 
-        # топ-100
+        # 8. Добавляем бонус за популярность (даже если основной механизм отключен, это легкий буст)
+        for i, item_id in enumerate(candidate_items):
+            if (
+                item_id in self.popular_items[:500]
+            ):  # Проверяем вхождение в топ-500 популярных
+                popularity_rank = self.popular_items.index(item_id)
+                # Чем выше популярность, тем больше бонус (но уменьшающийся с ростом ранга)
+                popularity_bonus = 1.0 * (1 - popularity_rank / 500)
+                scores[i] += popularity_bonus
+
+        # Выбираем топ-100
         n_top = min(100, len(scores))
         top_idx = np.argsort(-scores)[:n_top]
-
-        # если меньше 100, дополняем популярными
         recommended = [candidate_items[i] for i in top_idx]
+
+        # Дополняем популярными, если нужно
         if len(recommended) < 100:
             recommended += [i for i in self.popular_items if i not in recommended][
                 : 100 - len(recommended)
@@ -179,39 +245,50 @@ class FastSubmissionGenerator:
         return recommended
 
     def generate_recommendations_batch(
-        self, test_users_df, output_path, batch_size=1000
+        self, test_users_df, output_path, batch_size=5000  # Увеличиваем размер батча
     ):
         user_ids = test_users_df["user_id"].tolist()
         total_users = len(user_ids)
+
+        # Предварительная загрузка популярных товаров в строку
+        popular_items_str = " ".join(map(str, self.popular_items[:100]))
+
+        # Используем list comprehension для более быстрой обработки
         submission_data = []
 
-        for batch_start in tqdm(range(0, total_users, batch_size), desc="Users"):
+        for batch_start in tqdm(
+            range(0, total_users, batch_size), desc="Processing users"
+        ):
             batch_end = min(batch_start + batch_size, total_users)
             batch_user_ids = user_ids[batch_start:batch_end]
 
+            # Обрабатываем батч пользователей
+            batch_results = []
             for user_id in batch_user_ids:
                 try:
                     recommended_items = self._compute_user_item_scores(user_id)
-                    submission_data.append(
-                        {
-                            "user_id": user_id,
-                            "item_id_1 item_id_2 ... item_id_100": " ".join(
-                                map(str, recommended_items)
-                            ),
-                        }
-                    )
-                except Exception:
-                    submission_data.append(
-                        {
-                            "user_id": user_id,
-                            "item_id_1 item_id_2 ... item_id_100": " ".join(
-                                map(str, self.popular_items[:100])
-                            ),
-                        }
-                    )
+                    # Сразу формируем строку для экономии памяти
+                    items_str = " ".join(map(str, recommended_items))
+                    batch_results.append((user_id, items_str))
+                except Exception as e:
+                    # Логируем ошибку, но используем популярные товары
+                    logger.debug(f"Error for user {user_id}: {e}")
+                    batch_results.append((user_id, popular_items_str))
 
-            self._save_submission_batch(submission_data, output_path)
-            submission_data = []
+            # Формируем данные для сохранения
+            batch_submission = [
+                {"user_id": user_id, "item_id_1 item_id_2 ... item_id_100": items_str}
+                for user_id, items_str in batch_results
+            ]
+
+            # Сохраняем батч
+            self._save_submission_batch(batch_submission, output_path)
+
+            # Очищаем память
+            del batch_results, batch_submission
+            gc.collect()
+
+        logger.info(f"Обработано {total_users} пользователей")
 
     def _save_submission_batch(self, submission_data, output_path):
         df = pd.DataFrame(submission_data)
@@ -223,10 +300,15 @@ class FastSubmissionGenerator:
         test_users_ddf = dd.read_parquet(test_users_path, columns=["user_id"])
         return test_users_ddf.compute()
 
+    def update_config(self, new_config):
+        """Обновляет конфигурацию тумблеров"""
+        self.config.update(new_config)
+        logger.info(f"Конфигурация обновлена: {self.config}")
+
 
 if __name__ == "__main__":
     start_time = time.time()
-    MODEL_PATH = "/home/root6/python/e_cup/rec_system/src/models/lgbm_model_full.pkl"
+    MODEL_PATH = "/home/root6/python/e_cup/rec_system/src/models/lgbm_model.pkl"
     TEST_USERS_PATH = "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_test_for_participants/test_for_participants/*.parquet"
     OUTPUT_PATH = "/home/root6/python/e_cup/rec_system/result/submission.csv"
 
