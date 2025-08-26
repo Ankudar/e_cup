@@ -38,7 +38,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=1_000_000):
+def load_train_data(max_parts=0, max_rows=500_000_000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -475,14 +475,14 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
 
 
 def build_copurchase_map(
-    train_orders_df, min_co_items=2, top_n=20, device="cuda", max_items=1_000_000
+    train_orders_df, min_co_items=2, top_n=10, device="cuda", max_items=1000
 ):
     """
     строим словарь совместных покупок для топ-N товаров
     """
     log_message("Строим co-purchase матрицу для топ-N товаров...")
 
-    # 1. Находим топ-10000 популярных товаров
+    # 1. Находим топ популярных товаров
     item_popularity = train_orders_df["item_id"].value_counts()
     top_items = item_popularity.head(max_items).index.tolist()
     popular_items_set = set(top_items)
@@ -1173,9 +1173,10 @@ class LightGBMRecommender:
         ui_features_dir=None,
         val_days: int = 7,
     ):
+
         log_message("Подготовка данных для LightGBM (streaming)...")
 
-        # берем только fraction каждой партиции
+        # Берём fraction каждой партиции
         orders_ddf = orders_ddf.map_partitions(
             lambda df: df.sample(frac=sample_fraction, random_state=42)
         )
@@ -1185,7 +1186,8 @@ class LightGBMRecommender:
         train_path = base_dir / "train.parquet"
         val_path = base_dir / "val.parquet"
 
-        batch_size = 5000  # маленькие батчи, чтобы память не перегружать
+        batch_size = 50_000  # увеличенный для скорости
+        small_batch = []
 
         # --- Загружаем взаимодействия ---
         interactions_chunks = []
@@ -1203,11 +1205,10 @@ class LightGBMRecommender:
         split_time = max_timestamp - pd.Timedelta(days=val_days)
         train_timestamp_fill = split_time - pd.Timedelta(seconds=1)
 
-        # ВАЖНО: Разделяем interactions на train и val для user_interacted_items
+        # Разделяем interactions на train и val для user_interacted_items
         interactions_train = interactions_df[interactions_df["timestamp"] <= split_time]
         interactions_val = interactions_df[interactions_df["timestamp"] > split_time]
 
-        # Для генерации train используем только train interactions
         user_interacted_items_train = {
             uid: set(gr["item_id"].unique())
             for uid, gr in interactions_train.groupby("user_id")
@@ -1215,6 +1216,9 @@ class LightGBMRecommender:
 
         all_items = np.array(list(item_map.keys()), dtype=np.int64)
         popular_items_set = set(popularity_s.nlargest(10000).index.astype(np.int64))
+
+        all_items_tensor = torch.tensor(all_items, device="cuda")
+        popular_items_tensor = torch.tensor(list(popular_items_set), device="cuda")
 
         cols_order = ["user_id", "item_id", "timestamp", "target"]
 
@@ -1242,18 +1246,31 @@ class LightGBMRecommender:
                     writer_val = pq.ParquetWriter(val_path, schema=table_val.schema)
                 writer_val.write_table(table_val)
 
-        small_batch = []
-
         # --- Генерация TRAIN данных ---
-        for part in tqdm(orders_ddf.to_delayed(), desc="Streaming генерация"):
-            pdf = part.compute()  # только одна партиция в память
-            for uid, gr in pdf.groupby("user_id"):
+        for part_idx, part in enumerate(
+            tqdm(orders_ddf.to_delayed(), desc="Streaming генерация партиций")
+        ):
+            pdf = part.compute()
+            user_groups = pdf.groupby("user_id")
+
+            for uid, gr in tqdm(
+                user_groups,
+                desc=f"Обработка партиции {part_idx+1}/{len(orders_ddf.to_delayed())}",
+                leave=False,
+            ):
                 pos_items = set(gr[gr["target"] == 1]["item_id"])
                 neg_items_existing = set(gr[gr["target"] == 0]["item_id"])
-                # Используем только train interactions для исключения
                 interacted = user_interacted_items_train.get(uid, set())
                 excluded = pos_items | neg_items_existing | interacted
-                available_items = all_items[~np.isin(all_items, list(excluded))]
+
+                # --- available items на GPU (без падений) ---
+                excluded_tensor = (
+                    torch.tensor(list(excluded), device="cuda")
+                    if excluded
+                    else torch.tensor([], device="cuda")
+                )
+                mask = ~torch.isin(all_items_tensor, excluded_tensor)
+                available_items_tensor = all_items_tensor[mask]
 
                 # Позитивы
                 for it in pos_items:
@@ -1267,35 +1284,37 @@ class LightGBMRecommender:
                 n_needed = max(
                     0, len(pos_items) * negatives_per_positive - len(neg_items_existing)
                 )
-                if n_needed > 0 and len(available_items) > 0:
-                    popular_mask = np.isin(available_items, list(popular_items_set))
-                    popular_candidates = available_items[popular_mask]
-                    random_candidates = available_items[~popular_mask]
+                if n_needed > 0 and len(available_items_tensor) > 0:
+                    popular_mask = torch.isin(
+                        available_items_tensor, popular_items_tensor
+                    )
+                    popular_candidates = available_items_tensor[popular_mask]
+                    random_candidates = available_items_tensor[~popular_mask]
 
                     n_popular = min(n_needed // 2, len(popular_candidates))
                     n_random = min(n_needed - n_popular, len(random_candidates))
 
                     sampled_items = []
                     if n_popular > 0:
+                        perm = torch.randperm(len(popular_candidates), device="cuda")
                         sampled_items.extend(
-                            np.random.choice(
-                                popular_candidates, n_popular, replace=False
-                            )
+                            popular_candidates[perm[:n_popular]].tolist()
                         )
                     if n_random > 0:
+                        perm = torch.randperm(len(random_candidates), device="cuda")
                         sampled_items.extend(
-                            np.random.choice(random_candidates, n_random, replace=False)
+                            random_candidates[perm[:n_random]].tolist()
                         )
 
                     for it in sampled_items:
                         small_batch.append([uid, it, train_timestamp_fill, 0])
 
-                # --- Если набрался небольшой батч, пишем ---
+                # --- Запись батча ---
                 if len(small_batch) >= batch_size:
                     write_small_batch(small_batch)
                     small_batch = []
 
-        # --- Записываем остаток ---
+        # --- Остатки ---
         if small_batch:
             write_small_batch(small_batch)
 
@@ -1318,10 +1337,10 @@ class LightGBMRecommender:
                 train_data.iloc[cutoff:].copy(),
             )
 
-        # ВАЖНО: Обучаем ковизитацию на train данных ДО добавления фич
+        # --- Обучаем ковизитацию на train данных ---
         self._train_covisitation_matrix(train_data)
 
-        # Теперь добавляем фичи
+        # --- Добавляем фичи ---
         log_message("Добавление фичей для train данных...")
         train_data = self._add_rich_features(train_data, train_only_data=train_data)
 
@@ -1418,28 +1437,19 @@ class LightGBMRecommender:
         Обучение LightGBM с NDCG optimization
         """
         if params is None:
-            # params = {
-            #     "objective": "lambdarank",
-            #     "metric": "ndcg",
-            #     "ndcg_eval_at": [100],
-            #     "learning_rate": 0.05,
-            #     "num_leaves": 31,
-            #     "max_depth": -1,
-            #     "min_data_in_leaf": 20,  # Увеличить для предотвращения переобучения
-            #     "feature_fraction": 0.8,
-            #     "bagging_fraction": 0.8,
-            #     "bagging_freq": 5,
-            #     "lambda_l1": 0.1,  # L1 регуляризация
-            #     "lambda_l2": 0.1,  # L2 регуляризация
-            #     "early_stopping_rounds": 10,
-            # }
             params = {
                 "objective": "lambdarank",
                 "metric": "ndcg",
                 "ndcg_eval_at": [100],
                 "learning_rate": 0.05,
-                "num_leaves": 7,  # Очень простая модель
-                "max_depth": 3,
+                "num_leaves": 31,  # увеличили вместимость модели
+                "max_depth": 6,  # глубже, чтобы ловить взаимодействия признаков
+                "min_data_in_leaf": 20,  # для стабильности
+                "feature_fraction": 0.8,  # рандомизация признаков
+                "bagging_fraction": 0.8,  # рандомизация строк
+                "bagging_freq": 1,
+                "verbosity": 1,
+                "force_row_wise": True,  # чтобы не было лишнего overhead
             }
 
         # Группы для lambdarank (количество товаров на пользователя)
@@ -1479,8 +1489,7 @@ class LightGBMRecommender:
             valid_sets=valid_sets,
             valid_names=valid_names,
             callbacks=[
-                lgb.log_evaluation(50),
-                lgb.early_stopping(5),
+                lgb.early_stopping(50),
             ],
         )
 
