@@ -38,7 +38,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=500_000_000):
+def load_train_data(max_parts=0, max_rows=1_000_00):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -1434,80 +1434,85 @@ class LightGBMRecommender:
 
     def train(self, train_data, val_data=None, params=None):
         """
-        Обучение LightGBM с NDCG optimization
+        Обучение LightGBM с бинарной задачей вместо lambdarank.
         """
         if params is None:
             params = {
-                "objective": "lambdarank",
-                "metric": "ndcg",
-                "ndcg_eval_at": [100],
+                "objective": "binary",  # вместо lambdarank
+                "metric": "binary_logloss",
                 "learning_rate": 0.05,
-                "num_leaves": 31,  # увеличили вместимость модели
-                "max_depth": 6,  # глубже, чтобы ловить взаимодействия признаков
-                "min_data_in_leaf": 20,  # для стабильности
-                "feature_fraction": 0.8,  # рандомизация признаков
-                "bagging_fraction": 0.8,  # рандомизация строк
+                "num_leaves": 31,
+                "max_depth": 6,
+                "min_data_in_leaf": 20,
+                "feature_fraction": 0.8,
+                "bagging_fraction": 0.8,
                 "bagging_freq": 1,
                 "verbosity": 1,
-                "force_row_wise": True,  # чтобы не было лишнего overhead
+                "force_row_wise": True,
             }
 
-        # Группы для lambdarank (количество товаров на пользователя)
-        train_groups = train_data.groupby("user_id").size().values
         X_train = train_data[self.feature_columns]
         y_train = train_data["target"]
-
-        log_message(f"Размер тренировочных данных: {len(X_train)}")
-        log_message(f"Количество групп: {len(train_groups)}")
-
         train_dataset = lgb.Dataset(
-            X_train,
-            label=y_train,
-            group=train_groups,
-            feature_name=list(X_train.columns),
+            X_train, label=y_train, feature_name=list(X_train.columns)
         )
 
+        valid_sets = [train_dataset]
+        valid_names = ["train"]
+
         if val_data is not None:
-            val_groups = val_data.groupby("user_id").size().values
             X_val = val_data[self.feature_columns]
             y_val = val_data["target"]
+            val_dataset = lgb.Dataset(X_val, label=y_val, reference=train_dataset)
+            valid_sets.append(val_dataset)
+            valid_names.append("valid")
 
-            val_dataset = lgb.Dataset(
-                X_val, label=y_val, group=val_groups, reference=train_dataset
-            )
-            valid_sets = [train_dataset, val_dataset]
-            valid_names = ["train", "valid"]
-        else:
-            valid_sets = [train_dataset]
-            valid_names = ["train"]
+        log_message(f"Размер тренировочных данных: {len(X_train)}")
+        if val_data is not None:
+            log_message(f"Размер валидационных данных: {len(X_val)}")
 
-        log_message("Начинаем обучение LightGBM...")
+        # --- Callback для вывода каждые 10 итераций ---
+        def log_every_N_iter(env):
+            if env.iteration % 50 == 0:
+                metrics = ", ".join(
+                    [
+                        f"{name}_{metric}:{val:.4f}"
+                        for name, metric, val, _ in env.evaluation_result_list
+                    ]
+                )
+                print(f"[Iter {env.iteration}] {metrics}")
+
         self.model = lgb.train(
             params,
             train_dataset,
             num_boost_round=1000,
             valid_sets=valid_sets,
             valid_names=valid_names,
-            callbacks=[
-                lgb.early_stopping(50),
-            ],
+            callbacks=[lgb.early_stopping(100), log_every_N_iter],  # ранняя остановка
         )
 
         return self.model
 
     def evaluate(self, data):
         """Оценка модели"""
-        if self.model is None:
-            log_message("Модель не обучена")
+        if self.model is None or len(data) == 0:
             return 0.0
 
-        if len(data) == 0:
-            log_message("Нет данных для оценки")
-            return 0.0
+        # Предсказания вероятностей
+        preds = self.model.predict(data[self.feature_columns])
+        data = data.copy()
+        data["score"] = preds
 
-        predictions = self.predict_rank(data)
+        recommendations = {}
+        for user_id, group in data.groupby("user_id"):
+            top_items = group.nlargest(100, "score")["item_id"].tolist()
+            recommendations[user_id] = top_items
+
+        # NDCG можно посчитать вручную через уже отсортированные топ-100
         groups = data.groupby("user_id").size().values
-        ndcg = ndcg_at_k_grouped(predictions, data["target"].values, groups, k=100)
+        ndcg = ndcg_at_k_grouped(
+            data["score"].values, data["target"].values, groups, k=100
+        )
         return ndcg
 
     def predict_rank(self, data):
@@ -1516,10 +1521,13 @@ class LightGBMRecommender:
         return self.model.predict(X)
 
     def recommend(self, user_items_data):
-        """Генерация рекомендаций"""
-        predictions = self.predict_rank(user_items_data)
-        user_items_data["score"] = predictions
+        """Генерация рекомендаций для пользователей"""
+        # 1. Предсказания модели
+        user_items_data["score"] = self.model.predict(
+            user_items_data[self.feature_columns]
+        )
 
+        # 2. Сортировка внутри пользователя и выбор топ-100
         recommendations = {}
         for user_id, group in user_items_data.groupby("user_id"):
             top_items = group.nlargest(100, "score")["item_id"].tolist()
