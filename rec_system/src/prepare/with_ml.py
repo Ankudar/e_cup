@@ -36,14 +36,9 @@ from tqdm.auto import tqdm
 # tqdm интеграция с pandas
 tqdm.pandas()
 
-# 1000 строк ок
-# 1_000_000 строк ок скор 0.0002
-# 100_000_000 строк ок скор 0.0005
-# 1_000_000_000 строк ок скор
-
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=1_000_000):
+def load_train_data(max_parts=0, max_rows=100_000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -193,13 +188,26 @@ def load_train_data(max_parts=0, max_rows=1_000_000):
 # -------------------- Фильтрация данных --------------------
 def filter_data(orders_ddf, tracker_ddf, items_ddf):
     """
-    Фильтруем: берём только доставленные заказы и действия page_view, favorite, to_cart.
+    Фильтруем: оставляем delivered_orders (позитив) и canceled_orders (негатив),
+    а также действия page_view, favorite, to_cart.
     """
     log_message("Фильтрация данных...")
-    orders_ddf = orders_ddf[orders_ddf["last_status"] == "delivered_orders"]
+
+    # Заказы: оставляем только delivered и canceled
+    orders_ddf = orders_ddf[
+        orders_ddf["last_status"].isin(["delivered_orders", "canceled_orders"])
+    ].copy()
+
+    # delivered_orders = 1, canceled_orders = 0
+    orders_ddf["target"] = orders_ddf["last_status"].apply(
+        lambda x: 1 if x == "delivered_orders" else 0, meta=("target", "int8")
+    )
+
+    # Действия
     tracker_ddf = tracker_ddf[
         tracker_ddf["action_type"].isin(["page_view", "favorite", "to_cart"])
     ]
+
     log_message("Фильтрация завершена")
     return orders_ddf, tracker_ddf, items_ddf
 
@@ -1052,32 +1060,31 @@ class LightGBMRecommender:
     def prepare_training_data(
         self,
         interactions_files,
+        orders_ddf,
         user_map,
         item_map,
         popularity_s,
         recent_items_map,
-        test_orders_df,
         sample_fraction=0.1,
-        negatives_per_positive=2,
+        negatives_per_positive=3,
         ui_features_dir=None,
         val_days: int = 7,
     ):
-        log_message("Подготовка данных для LightGBM...")
-        test_orders_df = test_orders_df.sample(frac=sample_fraction, random_state=42)
+        log_message("Подготовка данных для LightGBM (streaming)...")
 
-        # --- Пути ---
+        # берем только fraction каждой партиции
+        orders_ddf = orders_ddf.map_partitions(
+            lambda df: df.sample(frac=sample_fraction, random_state=42)
+        )
+
         base_dir = Path("/home/root6/python/e_cup/rec_system/data/processed/")
         base_dir.mkdir(parents=True, exist_ok=True)
-        pos_path = base_dir / "positives"
-        pos_path.mkdir(parents=True, exist_ok=True)
-        neg_path = base_dir / "negatives"
-        neg_path.mkdir(parents=True, exist_ok=True)
         train_path = base_dir / "train.parquet"
         val_path = base_dir / "val.parquet"
 
-        batch_size = 10000
+        batch_size = 5000  # маленькие батчи, чтобы память не перегружать
 
-        # 1. Загружаем взаимодействия
+        # --- Загружаем взаимодействия ---
         interactions_chunks = []
         for f in tqdm(interactions_files, desc="Загрузка взаимодействий"):
             df = pd.read_parquet(
@@ -1090,164 +1097,106 @@ class LightGBMRecommender:
         interactions_df["timestamp"] = pd.to_datetime(interactions_df["timestamp"])
         max_timestamp = interactions_df["timestamp"].max()
 
-        # 2. split_time
         split_time = max_timestamp - pd.Timedelta(days=val_days)
         train_timestamp_fill = split_time - pd.Timedelta(seconds=1)
 
-        # 3. Позитивы → на диск по батчам
-        test_orders_df["user_id"] = test_orders_df["user_id"].astype("int64")
-        test_orders_df["item_id"] = test_orders_df["item_id"].astype("int64")
-        positive_df = test_orders_df[["user_id", "item_id"]].copy()
-        positive_df["target"] = 1
-        positive_df["timestamp"] = train_timestamp_fill
-
-        for i in range(0, len(positive_df), batch_size):
-            batch = positive_df.iloc[i : i + batch_size]
-            batch_file = pos_path / f"positives_{i//batch_size}.parquet"
-            batch.to_parquet(batch_file, engine="pyarrow", index=False)
-
-        # 4. История взаимодействий
         user_interacted_items = {
             uid: set(gr["item_id"].unique())
             for uid, gr in interactions_df.groupby("user_id")
         }
-        user_positive_items = {
-            uid: set(gr["item_id"].unique())
-            for uid, gr in positive_df.groupby("user_id")
-        }
 
-        # 5. Доступные айтемы
         all_items = np.array(list(item_map.keys()), dtype=np.int64)
         popular_items_set = set(popularity_s.nlargest(10000).index.astype(np.int64))
-        user_available_items = {}
-        for user_id, pos_items in tqdm(
-            user_positive_items.items(), desc="Подготовка негативных сэмплов"
-        ):
-            interacted = user_interacted_items.get(user_id, set())
-            excluded = pos_items | interacted
-            available_items = all_items[~np.isin(all_items, list(excluded))]
-            if len(available_items) > 0:
-                user_available_items[user_id] = available_items
 
-        # 6. Генерация негативов
-        def process_user(user_id):
-            available_items = user_available_items.get(user_id)
-            if available_items is None or len(available_items) == 0:
-                return pd.DataFrame()
-            n_neg = negatives_per_positive
-            popular_mask = np.isin(available_items, list(popular_items_set))
-            popular_candidates = available_items[popular_mask]
-            random_candidates = available_items[~popular_mask]
-
-            sampled_items = []
-            if len(popular_candidates) > 0:
-                n_popular = min(n_neg // 2, len(popular_candidates))
-                sampled_items.extend(
-                    np.random.choice(popular_candidates, n_popular, replace=False)
-                )
-            if len(random_candidates) > 0 and len(sampled_items) < n_neg:
-                n_random = min(n_neg - len(sampled_items), len(random_candidates))
-                sampled_items.extend(
-                    np.random.choice(random_candidates, n_random, replace=False)
-                )
-
-            return pd.DataFrame(
-                {
-                    "user_id": [int(user_id)] * len(sampled_items),
-                    "item_id": [int(it) for it in sampled_items],
-                    "timestamp": [train_timestamp_fill] * len(sampled_items),
-                    "target": [0] * len(sampled_items),
-                }
-            )
-
-        # 7. Генерация негативов → батчи с немедленной записью
-        neg_shard_idx = 0
-        batch_accum = []
-
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {
-                executor.submit(process_user, uid): uid
-                for uid in user_available_items.keys()
-            }
-
-            for future in tqdm(
-                as_completed(futures), total=len(futures), desc="Генерация негативов"
-            ):
-                df_part = future.result()
-                if df_part.empty:
-                    continue
-
-                batch_accum.append(df_part)
-
-                # Пишем батч при достижении размера
-                if sum(len(df) for df in batch_accum) >= batch_size:
-                    df_batch = pd.concat(batch_accum, ignore_index=True)
-                    shard_file = neg_path / f"neg_{neg_shard_idx}.parquet"
-                    df_batch.to_parquet(shard_file, engine="pyarrow", index=False)
-                    log_message(
-                        f"Saved negative shard: {shard_file}, rows={len(df_batch)}"
-                    )
-
-                    neg_shard_idx += 1
-                    batch_accum = []
-
-        # Записываем остаток
-        if batch_accum:
-            df_batch = pd.concat(batch_accum, ignore_index=True)
-            shard_file = neg_path / f"neg_{neg_shard_idx}.parquet"
-            df_batch.to_parquet(shard_file, engine="pyarrow", index=False)
-            log_message(
-                f"Saved final negative shard: {shard_file}, rows={len(df_batch)}"
-            )
-
-        # 8. Train/Val split батчами с ParquetWriter
-        neg_files = list(neg_path.glob("neg_*.parquet"))
-        pos_files = list(pos_path.glob("positives_*.parquet"))
-        all_files = pos_files + neg_files
         cols_order = ["user_id", "item_id", "timestamp", "target"]
 
-        # Train writer
+        # --- Инициализация ParquetWriter ---
         writer_train = None
         writer_val = None
 
-        for file in tqdm(all_files, desc="Train/Val батчи"):
-            df = pd.read_parquet(file)
-            df = df.sample(frac=1, random_state=42)
-            for i in range(0, len(df), batch_size):
-                batch_df = df.iloc[i : i + batch_size].reset_index(
-                    drop=True
-                )  # сброс индекса
-                batch_df = batch_df[cols_order]  # фиксируем порядок колонок
+        def write_small_batch(batch_list):
+            nonlocal writer_train, writer_val
+            batch_df = pd.DataFrame(batch_list, columns=cols_order)
+            train_df = batch_df[batch_df["timestamp"] <= split_time]
+            val_df = batch_df[batch_df["timestamp"] > split_time]
 
-                train_df = batch_df[batch_df["timestamp"] <= split_time]
-                val_df = batch_df[batch_df["timestamp"] > split_time]
+            if not train_df.empty:
+                table_train = pa.Table.from_pandas(train_df, preserve_index=False)
+                if writer_train is None:
+                    writer_train = pq.ParquetWriter(
+                        train_path, schema=table_train.schema
+                    )
+                writer_train.write_table(table_train)
 
-                if not train_df.empty:
-                    table_train = pa.Table.from_pandas(train_df, preserve_index=False)
-                    if writer_train is None:
-                        writer_train = pq.ParquetWriter(
-                            train_path, schema=table_train.schema
+            if not val_df.empty:
+                table_val = pa.Table.from_pandas(val_df, preserve_index=False)
+                if writer_val is None:
+                    writer_val = pq.ParquetWriter(val_path, schema=table_val.schema)
+                writer_val.write_table(table_val)
+
+        small_batch = []
+
+        for part in tqdm(orders_ddf.to_delayed(), desc="Streaming генерация"):
+            pdf = part.compute()  # только одна партиция в память
+            for uid, gr in pdf.groupby("user_id"):
+                pos_items = set(gr[gr["target"] == 1]["item_id"])
+                neg_items_existing = set(gr[gr["target"] == 0]["item_id"])
+                interacted = user_interacted_items.get(uid, set())
+                excluded = pos_items | neg_items_existing | interacted
+                available_items = all_items[~np.isin(all_items, list(excluded))]
+
+                # Позитивы
+                for it in pos_items:
+                    small_batch.append([uid, it, train_timestamp_fill, 1])
+
+                # Существующие негативы
+                for it in neg_items_existing:
+                    small_batch.append([uid, it, train_timestamp_fill, 0])
+
+                # Дополнительные негативы
+                n_needed = max(
+                    0, len(pos_items) * negatives_per_positive - len(neg_items_existing)
+                )
+                if n_needed > 0 and len(available_items) > 0:
+                    popular_mask = np.isin(available_items, list(popular_items_set))
+                    popular_candidates = available_items[popular_mask]
+                    random_candidates = available_items[~popular_mask]
+
+                    n_popular = min(n_needed // 2, len(popular_candidates))
+                    n_random = min(n_needed - n_popular, len(random_candidates))
+
+                    sampled_items = []
+                    if n_popular > 0:
+                        sampled_items.extend(
+                            np.random.choice(popular_candidates, n_popular, replace=False)
                         )
-                    writer_train.write_table(table_train)
+                    if n_random > 0:
+                        sampled_items.extend(
+                            np.random.choice(random_candidates, n_random, replace=False)
+                        )
 
-                if not val_df.empty:
-                    table_val = pa.Table.from_pandas(val_df, preserve_index=False)
-                    if writer_val is None:
-                        writer_val = pq.ParquetWriter(val_path, schema=table_val.schema)
-                    writer_val.write_table(table_val)
+                    for it in sampled_items:
+                        small_batch.append([uid, it, train_timestamp_fill, 0])
 
+                # --- Если набрался небольшой батч, пишем ---
+                if len(small_batch) >= batch_size:
+                    write_small_batch(small_batch)
+                    small_batch = []
+
+        # --- Записываем остаток ---
+        if small_batch:
+            write_small_batch(small_batch)
+
+        # --- Закрываем writers ---
         if writer_train:
             writer_train.close()
         if writer_val:
             writer_val.close()
         else:
-            # создаем пустой val.parquet с нужными колонками
-            empty_val = pd.DataFrame(
-                columns=["user_id", "item_id", "timestamp", "target"]
-            )
+            empty_val = pd.DataFrame(columns=cols_order)
             empty_val.to_parquet(val_path, engine="pyarrow", index=False)
 
-        # 9. Загружаем train/val
+        # --- Загружаем train/val ---
         train_data = pd.read_parquet(train_path)
         val_data = pd.read_parquet(val_path)
         if len(val_data) == 0:
@@ -1257,7 +1206,7 @@ class LightGBMRecommender:
                 train_data.iloc[cutoff:].copy(),
             )
 
-        # 10. Фичи
+        # --- Фичи ---
         train_data = self._add_rich_features(train_data, train_only_data=train_data)
         val_data = self._add_rich_features(val_data, train_only_data=train_data)
         if ui_features_dir and os.path.exists(ui_features_dir):
@@ -1265,7 +1214,7 @@ class LightGBMRecommender:
                 train_data, val_data, ui_features_dir
             )
 
-        # 11. Лог
+        # --- Лог ---
         def log_message_dist(df, name):
             counts = df["target"].value_counts(dropna=False).to_dict()
             log_message(f"{name}: rows={len(df)}; target_counts={counts}")
@@ -2280,14 +2229,16 @@ if __name__ == "__main__":
 
         # Используем обновленный метод с UI-признаками
         train_data, val_data = recommender.prepare_training_data(
-            interactions_files,
-            user_map,
-            item_map,
-            popularity_s,
-            recent_items_map,
-            sample_test_orders,
+            interactions_files=interactions_files,
+            orders_ddf=orders_ddf,
+            user_map=user_map,
+            item_map=item_map,
+            popularity_s=popularity_s,
+            recent_items_map=recent_items_map,
             sample_fraction=config["sample_fraction"],
-            ui_features_dir=ui_features_dir,  # передаем путь к UI-признакам
+            negatives_per_positive=3,
+            ui_features_dir=ui_features_dir,
+            val_days=7,
         )
 
         # Разделяем на train/validation
