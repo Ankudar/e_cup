@@ -38,7 +38,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=1_000):
+def load_train_data(max_parts=0, max_rows=1_000_000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -1169,7 +1169,7 @@ class LightGBMRecommender:
         popularity_s,
         recent_items_map,
         sample_fraction=0.1,
-        negatives_per_positive=2,
+        negatives_per_positive=1,
         ui_features_dir=None,
         val_days: int = 7,
     ):
@@ -1434,8 +1434,9 @@ class LightGBMRecommender:
             #     "early_stopping_rounds": 10,
             # }
             params = {
-                "objective": "binary",
-                "metric": "binary_error",
+                "objective": "lambdarank",
+                "metric": "ndcg",
+                "ndcg_eval_at": [100],
                 "learning_rate": 0.05,
                 "num_leaves": 7,  # Очень простая модель
                 "max_depth": 3,
