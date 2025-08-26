@@ -43,7 +43,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=1_000):
+def load_train_data(max_parts=0, max_rows=1000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -370,7 +370,7 @@ def compute_global_popularity(orders_df, cutoff_ts_info):
 # -------------------- Обучение ALS --------------------
 def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
     """
-    Версия с сохранением батчей на указанный диск
+    Версия с сохранением батчей на диск + сохранение item_map.pkl
     """
     # 1. ПРОХОД: Построение маппингов
     user_set = set()
@@ -388,10 +388,17 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
         f"Маппинги построены. Уников: users={len(user_map)}, items={len(item_map)}"
     )
 
-    # 2. ПРОХОД: Сохранение батчей на указанный диск
+    # 💾 Сохраняем item_map.pkl
+    map_dir = "/home/root6/python/e_cup/rec_system/data/processed/"
+    os.makedirs(map_dir, exist_ok=True)
+    item_map_path = os.path.join(map_dir, "item_map.pkl")
+    with open(item_map_path, "wb") as f:
+        pickle.dump(item_map, f)
+    log_message(f"item_map сохранен: {item_map_path}")
+
+    # 2. ПРОХОД: Сохранение батчей на диск
     log_message("Сохранение батчей на диск...")
 
-    # Используем указанный адрес вместо временной директории
     batch_dir = "/home/root6/python/e_cup/rec_system/data/processed/als_batches/"
     os.makedirs(batch_dir, exist_ok=True)
 
@@ -410,7 +417,6 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
         df = df.join(item_map_df, on="item_id", how="inner")
 
         if len(df) > 0:
-            # Сохраняем батч на указанный диск
             batch_path = os.path.join(batch_dir, f"batch_{i:04d}.npz")
             np.savez(
                 batch_path,
@@ -429,26 +435,21 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
 
     for batch_path in tqdm(batch_files):
         try:
-            # Загружаем батч с диска
             data = np.load(batch_path)
-            rows = data["rows"]
-            cols = data["cols"]
-            vals = data["vals"]
+            rows, cols, vals = data["rows"], data["cols"], data["vals"]
 
-            # Создаем sparse tensor для батча
             indices_np = np.empty((2, len(rows)), dtype=np.int32)
             indices_np[0] = rows
             indices_np[1] = cols
-            indices = torch.tensor(indices_np, dtype=torch.long, device="cuda")
-            values = torch.tensor(vals, dtype=torch.float32, device="cuda")
+            indices = torch.tensor(indices_np, dtype=torch.long, device=device)
+            values = torch.tensor(vals, dtype=torch.float32, device=device)
+
             sparse_batch = torch.sparse_coo_tensor(
-                indices, values, size=(len(user_map), len(item_map)), device="cuda"
+                indices, values, size=(len(user_map), len(item_map)), device=device
             )
 
-            # Обучаем на одном батче
             als_model.partial_fit(sparse_batch, iterations=5, lr=0.005)
 
-            # Очищаем
             del sparse_batch, indices, values
             if device == "cuda":
                 torch.cuda.empty_cache()
@@ -457,7 +458,7 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
             log_message(f"Ошибка обработки батча {batch_path}: {e}")
             continue
 
-    # Опционально: удаляем временные файлы после обучения
+    # Очистка временных файлов
     log_message("Очистка временных файлов...")
     for batch_path in batch_files:
         try:
@@ -465,7 +466,6 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
         except Exception as e:
             log_message(f"Ошибка удаления файла {batch_path}: {e}")
 
-    # Проверяем, пуста ли директория и удаляем ее
     try:
         if not os.listdir(batch_dir):
             os.rmdir(batch_dir)
@@ -480,26 +480,31 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
 
 
 def build_copurchase_map(
-    train_orders_df, min_co_items=2, top_n=10, device="cuda", max_items=1000
+    train_orders_df,
+    min_co_items=2,
+    top_n=10,
+    device="cuda",
+    max_items=1000,
+    output_dir="/home/root6/python/e_cup/rec_system/data/processed/",
 ):
     """
     строим словарь совместных покупок для топ-N товаров
+    и сохраняем его в JSON
     """
     log_message("Строим co-purchase матрицу для топ-N товаров...")
 
-    # 1. Находим топ популярных товаров
+    # 1. Топ популярных товаров
     item_popularity = train_orders_df["item_id"].value_counts()
     top_items = item_popularity.head(max_items).index.tolist()
     popular_items_set = set(top_items)
 
     log_message(f"Топ-{len(top_items)} популярных товаров определены")
 
-    # 2. Группируем корзины и фильтруем только популярные товары
+    # 2. Группировка корзин
     baskets = []
     for items in train_orders_df.groupby(["user_id", "created_timestamp"])[
         "item_id"
     ].apply(list):
-        # Фильтруем только популярные товары
         filtered_items = [item for item in items if item in popular_items_set]
         if len(filtered_items) >= min_co_items:
             baskets.append(filtered_items)
@@ -510,36 +515,28 @@ def build_copurchase_map(
 
     log_message(f"Обрабатываем {len(baskets)} корзин с популярными товарами")
 
-    # 3. Словарь {item_id -> index} только для популярных товаров
+    # 3. Словари индексов
     item2idx = {it: i for i, it in enumerate(top_items)}
     idx2item = {i: it for it, i in item2idx.items()}
     n_items = len(top_items)
 
     log_message(f"Уникальных популярных товаров: {n_items}")
 
-    # 4. Вместо плотной матрицы используем sparse coo format
+    # 4. Sparse матрица
     rows, cols, values = [], [], []
-
     for items in tqdm(baskets, desc="Обработка корзин"):
-        if len(items) < min_co_items:
-            continue
-
-        # Получаем индексы товаров в корзине
         idxs = [item2idx[it] for it in items if it in item2idx]
         if len(idxs) < 2:
             continue
 
         weight = 1.0 / len(idxs)
-
-        # Добавляем все пары товаров в корзине
         for i in range(len(idxs)):
             for j in range(len(idxs)):
-                if i != j:  # исключаем диагональ
+                if i != j:
                     rows.append(idxs[i])
                     cols.append(idxs[j])
                     values.append(weight)
 
-    # 5. Создаем sparse матрицу на GPU
     if not rows:
         log_message("Нет данных для построения матрицы")
         return {}
@@ -555,29 +552,27 @@ def build_copurchase_map(
         values_tensor,
         size=(n_items, n_items),
         device=device,
-    ).coalesce()  # объединяем дубликаты
+    ).coalesce()
 
     log_message(
         f"Sparse матрица построена: {co_matrix.shape}, ненулевых элементов: {co_matrix._nnz()}"
     )
 
-    # 6. Нормализация построчно
+    # 6. Нормализация
     row_sums = torch.sparse.sum(co_matrix, dim=1).to_dense().clamp(min=1e-9)
 
-    # 7. Формируем финальный словарь топ-N для каждого item
+    # 7. Формируем финальный словарь
     final_copurchase = {}
     indices = co_matrix.indices()
     values = co_matrix.values()
 
     log_message("Формируем рекомендации...")
     for i in tqdm(range(n_items), desc="Обработка товаров"):
-        # Находим все элементы в i-й строке
         mask = indices[0] == i
         if mask.any():
             col_indices = indices[1][mask]
-            row_values = values[mask] / row_sums[i]  # нормализуем
+            row_values = values[mask] / row_sums[i]
 
-            # Берем топ-N
             if len(row_values) > 0:
                 topk_vals, topk_idx = torch.topk(
                     row_values, k=min(top_n, len(row_values))
@@ -590,20 +585,34 @@ def build_copurchase_map(
 
     log_message(f"Co-purchase словарь построен для {len(final_copurchase)} товаров")
 
-    # 8. Статистика
     avg_recommendations = sum(len(v) for v in final_copurchase.values()) / max(
         1, len(final_copurchase)
     )
     log_message(f"В среднем {avg_recommendations:.1f} рекомендаций на товар")
 
+    # 9. Сохраняем результат
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, "copurchase_map.pkl")
+
+    with open(output_file, "wb") as f:
+        pickle.dump(final_copurchase, f)
+
+    log_message(f"Co-purchase словарь сохранен в {output_file}")
+
     return final_copurchase
 
 
-def build_category_maps(items_df, categories_df):
+def build_category_maps(
+    items_df,
+    categories_df,
+    save_dir="/home/root6/python/e_cup/rec_system/data/processed/",
+):
     """
-    Ускоренная версия: строим маппинги товаров и категорий.
+    Ускоренная версия: строим маппинги товаров и категорий и сохраняем в файлы.
     """
     log_message("Построение категорийных маппингов...")
+
+    os.makedirs(save_dir, exist_ok=True)
 
     # Товар -> категория
     item_to_cat = dict(zip(items_df["item_id"], items_df["catalogid"]))
@@ -625,6 +634,15 @@ def build_category_maps(items_df, categories_df):
             if parent in cat_to_items:
                 all_items.update(cat_to_items[parent])
         extended_cat_to_items[cat_id] = np.array(list(all_items))
+
+    # ---- Сохраняем результаты ----
+    with open(os.path.join(save_dir, "item_to_cat.pkl"), "wb") as f:
+        pickle.dump(item_to_cat, f)
+
+    with open(os.path.join(save_dir, "extended_cat_to_items.pkl"), "wb") as f:
+        pickle.dump(extended_cat_to_items, f)
+
+    log_message(f"Сохранено: item_to_cat.pkl и extended_cat_to_items.pkl в {save_dir}")
 
     return item_to_cat, extended_cat_to_items
 
@@ -668,14 +686,19 @@ def ndcg_at_k(recommended, ground_truth, k=100, device="cuda"):
     return (dcg / idcg).item() if idcg > 0 else 0.0
 
 
-def build_recent_items_map_from_batches(batch_dir, recent_n=5):
-    """Версия где weight влияет на порядок items"""
+def build_recent_items_map_from_batches(
+    batch_dir,
+    recent_n=5,
+    save_path="/home/root6/python/e_cup/rec_system/data/processed/recent_items_map.pkl",
+):
+    """Версия где weight влияет на порядок items.
+    save_path: путь для сохранения (если None — не сохраняем).
+    """
     batch_files = sorted(Path(batch_dir).glob("*.parquet"))
     recent_items_map = {}
 
     for f in tqdm(batch_files, desc="Обработка батчей"):
         try:
-            # Читаем с weight
             df = pl.read_parquet(
                 f, columns=["user_id", "item_id", "timestamp", "weight"]
             )
@@ -689,8 +712,7 @@ def build_recent_items_map_from_batches(batch_dir, recent_n=5):
                 ]
             )
 
-            # Создаем комбинированный score: weight + временной коэффициент
-            # (новые взаимодействия имеют небольшое преимущество)
+            # Комбинированный score
             df = df.with_columns(
                 (
                     pl.col("weight") * 0.8
@@ -698,18 +720,14 @@ def build_recent_items_map_from_batches(batch_dir, recent_n=5):
                 ).alias("score")
             )
 
-            # Сортируем по score
             df_sorted = df.sort(["user_id", "score"], descending=[False, True])
 
-            # Группируем и берем топ-N
             grouped = df_sorted.group_by("user_id").agg(
                 pl.col("item_id").head(recent_n).alias("items")
             )
 
-            # Обновляем словарь (простая версия)
             for row in grouped.iter_rows():
                 user_id, items = row[0], row[1]
-
                 if user_id not in recent_items_map:
                     recent_items_map[user_id] = items
                 else:
@@ -719,6 +737,15 @@ def build_recent_items_map_from_batches(batch_dir, recent_n=5):
         except Exception as e:
             log_message(f"Ошибка обработки файла {f}: {e}")
             continue
+
+    # Сохранение в файл
+    if save_path is not None:
+        try:
+            with open(save_path, "wb") as f:
+                pickle.dump(recent_items_map, f)
+            log_message(f"Словарь сохранен в {save_path}")
+        except Exception as e:
+            log_message(f"Ошибка сохранения {save_path}: {e}")
 
     return recent_items_map
 
@@ -1533,17 +1560,23 @@ class LightGBMRecommender:
         return recommendations
 
 
-def build_user_features_dict(interactions_files, orders_df, device="cuda"):
+def build_user_features_dict(
+    interactions_files,
+    orders_df,
+    device="cuda",
+    save_path="/home/root6/python/e_cup/rec_system/data/processed/user_features_dict.pkl",
+):
     """
     Оптимизированная версия с использованием Polars
     """
+    import pickle
+
     import polars as pl
 
     log_message("Построение словаря пользовательских признаков...")
 
     # 1. АГРЕГАЦИЯ ПО ТРЕКЕРУ (взаимодействия)
     user_stats_list = []
-
     for f in tqdm(interactions_files, desc="Обработка трекера"):
         df = pl.read_parquet(f)
 
@@ -1557,7 +1590,6 @@ def build_user_features_dict(interactions_files, orders_df, device="cuda"):
                 pl.col("timestamp").min().alias("first_ts"),
             ]
         )
-
         user_stats_list.append(chunk_stats)
 
     # Объединяем все статистики
@@ -1595,41 +1627,32 @@ def build_user_features_dict(interactions_files, orders_df, device="cuda"):
 
     # 3. ОБЪЕДИНЕНИЕ ДАННЫХ
     if len(final_stats) > 0 and len(order_stats) > 0:
-        user_stats = final_stats.join(
-            order_stats, on="user_id", how="full"
-        )  # Исправлено: outer -> full
+        user_stats = final_stats.join(order_stats, on="user_id", how="full")
     elif len(final_stats) > 0:
         user_stats = final_stats
     else:
         user_stats = order_stats
 
     # 4. ВЫЧИСЛЕНИЕ ПРОИЗВОДНЫХ ПРИЗНАКОВ
-    current_time = pl.lit(datetime.now())  # Исправлено: pl.datetime.now() -> pl.now()
+    current_time = pl.lit(datetime.now())
 
     user_stats = user_stats.with_columns(
         [
-            # Заполняем пропущенные значения
             pl.col("user_count").fill_null(0),
             pl.col("user_sum").fill_null(0),
             pl.col("user_orders_count").fill_null(0),
-            # Вычисляем среднее
             (pl.col("user_sum") / pl.col("user_count")).alias("user_mean"),
-            # Время с последнего взаимодействия
             ((current_time - pl.col("user_last_ts")).dt.total_days()).alias(
                 "user_days_since_last"
             ),
-            # Время с первого взаимодействия
             ((current_time - pl.col("user_first_ts")).dt.total_days()).alias(
                 "user_days_since_first"
             ),
-            # Время с последнего заказа
             ((current_time - pl.col("user_last_order_ts")).dt.total_days()).alias(
                 "user_days_since_last_order"
             ),
         ]
-    ).fill_nan(
-        0
-    )  # Заполняем NaN от деления на 0
+    ).fill_nan(0)
 
     # 5. КОНВЕРТАЦИЯ В СЛОВАРЬ
     user_stats_dict = {}
@@ -1650,8 +1673,12 @@ def build_user_features_dict(interactions_files, orders_df, device="cuda"):
             "user_days_since_last_order": row["user_days_since_last_order"],
         }
 
+    # 6. СОХРАНЕНИЕ В PICKLE
+    with open(save_path, "wb") as f:
+        pickle.dump(user_stats_dict, f)
+
     log_message(
-        f"Словарь пользовательских признаков построен. Записей: {len(user_stats_dict)}"
+        f"Словарь пользовательских признаков построен и сохранён в {save_path}. Записей: {len(user_stats_dict)}"
     )
     return user_stats_dict
 
@@ -1678,15 +1705,16 @@ def build_item_features_dict(
     interactions_files, items_df, orders_df, embeddings_dict, device="cuda"
 ):
     """
-    Оптимизированная версия с использованием Polars
+    Оптимизированная версия с использованием Polars + сохранение словаря item_features_dict.pkl
     """
+    import pickle
+
     import polars as pl
 
     log_message("Построение словаря товарных признаков...")
 
     # 1. АГРЕГАЦИЯ ПО ТРЕКЕРУ И ЗАКАЗАМ
     item_stats_list = []
-
     for f in tqdm(interactions_files, desc="Обработка взаимодействий"):
         df = pl.read_parquet(f)
 
@@ -1700,7 +1728,6 @@ def build_item_features_dict(
                 pl.col("timestamp").min().alias("first_ts"),
             ]
         )
-
         item_stats_list.append(chunk_stats)
 
     # Объединяем статистики
@@ -1743,11 +1770,11 @@ def build_item_features_dict(
     items_catalog = items_pl.select(["item_id", "catalogid"]).unique()
 
     # 4. ОБЪЕДИНЕНИЕ ВСЕХ ДАННЫХ
-    item_stats = final_stats.join(order_stats, on="item_id", how="full")  # Исправлено
+    item_stats = final_stats.join(order_stats, on="item_id", how="full")
     item_stats = item_stats.join(items_catalog, on="item_id", how="left")
 
     # 5. ВЫЧИСЛЕНИЕ ПРОИЗВОДНЫХ ПРИЗНАКОВ
-    current_time = pl.lit(datetime.now())  # Исправлено
+    current_time = pl.lit(datetime.now())
 
     item_stats = item_stats.with_columns(
         [
@@ -1789,6 +1816,15 @@ def build_item_features_dict(
                 item_stats_dict[item_id][f"fclip_embed_{i}"] = float(embedding[i])
 
     log_message(f"Словарь товарных признаков построен. Записей: {len(item_stats_dict)}")
+
+    # 8. СОХРАНЕНИЕ В PKL
+    output_path = (
+        "/home/root6/python/e_cup/rec_system/data/processed/item_features_dict.pkl"
+    )
+    with open(output_path, "wb") as f:
+        pickle.dump(item_stats_dict, f)
+
+    log_message(f"Словарь сохранён в {output_path}")
     return item_stats_dict
 
 
@@ -2158,143 +2194,6 @@ def load_and_process_embeddings(
     return embeddings_dict
 
 
-# Функция для получения рекомендаций для одного пользователя
-def get_user_recommendations(user_id, top_k=100, **optimizations):
-    """Оптимизированная версия функции предсказаний"""
-    try:
-        # Используем оптимизированные функции если переданы
-        recent_items_get = optimizations.get("recent_items_get", recent_items_map.get)
-        copurchase_map_get = optimizations.get("copurchase_map_get", copurchase_map.get)
-        item_to_cat_get = optimizations.get("item_to_cat_get", item_to_cat.get)
-        cat_to_items_get = optimizations.get("cat_to_items_get", cat_to_items.get)
-        item_features_get = optimizations.get(
-            "item_features_get", item_features_dict.get
-        )
-        user_features_get = optimizations.get(
-            "user_features_get", user_features_dict.get
-        )
-        embeddings_dict_get = optimizations.get(
-            "embeddings_dict_get", embeddings_dict.get
-        )
-        popular_items_array = optimizations.get("popular_items_array", popular_items)
-
-        # Получаем recent items пользователя
-        recent_items = recent_items_get(user_id, [])
-
-        # Создаем кандидатов для рекомендации
-        candidates = set()
-
-        # Добавляем популярные товары
-        candidates.update(popular_items_array[:500])
-
-        # Добавляем товары из recent items
-        candidates.update(recent_items)
-
-        # Добавляем co-purchased товары для recent items
-        for item in recent_items:
-            co_items = copurchase_map_get(item, [])
-            if co_items:
-                candidates.update(co_items[:20])
-
-        # Добавляем товары из той же категории что и recent items
-        for item in recent_items:
-            cat_id = item_to_cat_get(item)
-            if cat_id:
-                cat_items = cat_to_items_get(cat_id, [])
-                if cat_items:
-                    candidates.update(cat_items[:50])
-
-        # Фильтруем существующие товары
-        candidates = [c for c in candidates if c in item_map]
-
-        if not candidates:
-            return popular_items_array[:top_k]
-
-        # Создаем DataFrame с кандидатами
-        candidate_df = pd.DataFrame(
-            {"user_id": [user_id] * len(candidates), "item_id": candidates}
-        )
-
-        # Добавляем REAL user features
-        user_feats = user_features_get(user_id, {})
-        for feat_name, feat_value in user_feats.items():
-            candidate_df[feat_name] = feat_value
-
-        # Добавляем REAL item features
-        for item_id in candidates:
-            item_feats = item_features_get(item_id, {})
-            for feat_name, feat_value in item_feats.items():
-                candidate_df.loc[candidate_df["item_id"] == item_id, feat_name] = (
-                    feat_value
-                )
-
-        # Добавляем REAL эмбеддинги
-        for i in range(10):
-            for item_id in candidates:
-                embedding = embeddings_dict_get(item_id)
-                if embedding is not None and i < len(embedding):
-                    candidate_df.loc[
-                        candidate_df["item_id"] == item_id, f"fclip_embed_{i}"
-                    ] = embedding[i]
-                else:
-                    candidate_df.loc[
-                        candidate_df["item_id"] == item_id, f"fclip_embed_{i}"
-                    ] = 0
-
-        # Добавляем простые признаки
-        candidate_df["is_weekend"] = 0
-        candidate_df["hour"] = 12
-        candidate_df["covisitation_score"] = 0
-
-        # UI признаки
-        ui_features = [
-            "ui_count",
-            "ui_sum",
-            "ui_max",
-            "ui_min",
-            "ui_mean",
-            "ui_days_since_last",
-            "ui_days_since_first",
-        ]
-        for feat in ui_features:
-            candidate_df[feat] = 0
-
-        # Заполняем пропущенные значения
-        candidate_df = candidate_df.fillna(0).infer_objects(copy=False)
-
-        # Убедимся что все колонки на месте
-        missing_cols = set(recommender.feature_columns) - set(candidate_df.columns)
-        if missing_cols:
-            for col in missing_cols:
-                candidate_df[col] = 0
-
-        # Выбираем только нужные колонки
-        X_candidate = candidate_df[recommender.feature_columns]
-
-        # Предсказываем вероятности
-        predictions = recommender.model.predict(X_candidate)
-
-        # Сортируем по убыванию вероятности
-        candidate_df["score"] = predictions
-        candidate_df = candidate_df.sort_values("score", ascending=False)
-
-        top_recommendations = candidate_df["item_id"].head(top_k).tolist()
-
-        # Логируем статистику (только для отладки)
-        if processed % 100 == 0:  # Логируем только каждого 100-го пользователя
-            unique_count = len(set(top_recommendations))
-            avg_score = candidate_df["score"].head(top_k).mean()
-            log_message(
-                f"User {user_id}: {unique_count} unique, score: {avg_score:.4f}"
-            )
-
-        return top_recommendations
-
-    except Exception as e:
-        log_message(f"Error for user {user_id}: {str(e)}")
-        return popular_items_array[:top_k]
-
-
 # -------------------- Основной запуск --------------------
 if __name__ == "__main__":
     start_time = time.time()
@@ -2408,6 +2307,11 @@ if __name__ == "__main__":
             orders_df_full, cutoff_ts_per_user
         )  # теперь это pd.Timestamp
         popular_items = popularity_s.index.tolist()
+        save_path = (
+            "/home/root6/python/e_cup/rec_system/data/processed/popular_items.pkl"
+        )
+        with open(save_path, "wb") as f:
+            pickle.dump(popular_items, f)
         stage_time = time.time() - stage_start
         log_message(f"Обучение ALS завершено за {timedelta(seconds=stage_time)}")
         log_message(f"Пользователей: {len(user_map)}, Товаров: {len(item_map)}")
@@ -2706,104 +2610,10 @@ if __name__ == "__main__":
         log_message(f"Сохранение модели завершено за {timedelta(seconds=stage_time)}")
         log_message(f"Модель сохранена в: {model_path}")
 
-        # === ОПТИМИЗИРОВАННЫЕ ПРЕДСКАЗАНИЯ С МОДЕЛЬЮ ===
-        stage_start = time.time()
-        log_message("=== ОПТИМИЗИРОВАННЫЕ ПРЕДСКАЗАНИЯ С МОДЕЛЬЮ ===")
-
-        # Загружаем тестовых пользователей
-        test_users = test_users_ddf.compute()["user_id"].unique()
-        log_message(f"Тестовых пользователей для предсказания: {len(test_users)}")
-
-        # Оптимизация: предварительно загружаем все что нужно
-        popular_items_array = np.array(popular_items, dtype=np.int64)
-
-        # Оптимизация: кэшируем методы доступа для скорости
-        recent_items_get = recent_items_map.get
-        copurchase_map_get = copurchase_map.get
-        item_to_cat_get = item_to_cat.get
-        cat_to_items_get = cat_to_items.get
-        item_features_get = item_features_dict.get
-        user_features_get = user_features_dict.get
-        embeddings_dict_get = embeddings_dict.get
-
-        # Создаем рекомендации
-        recommendations = {}
-        processed = 0
-        batch_size = 20  # Малый батч для экономии памяти
-
-        log_message(
-            f"Начинаем создание рекомендаций для {len(test_users)} пользователей..."
-        )
-
-        start_time = time.time()
-        for i in range(0, len(test_users), batch_size):
-            batch_users = test_users[i : i + batch_size]
-            batch_start = time.time()
-
-            for user_id in batch_users:
-                try:
-                    recommendations[user_id] = get_user_recommendations(
-                        user_id,
-                        top_k=K,
-                        # Передаем оптимизированные функции
-                        recent_items_get=recent_items_get,
-                        copurchase_map_get=copurchase_map_get,
-                        item_to_cat_get=item_to_cat_get,
-                        cat_to_items_get=cat_to_items_get,
-                        item_features_get=item_features_get,
-                        user_features_get=user_features_get,
-                        embeddings_dict_get=embeddings_dict_get,
-                        popular_items_array=popular_items_array,
-                    )
-                    processed += 1
-
-                except Exception as e:
-                    # Fallback на популярные товары при ошибке
-                    recommendations[user_id] = popular_items[:K]
-                    log_message(f"Ошибка для пользователя {user_id}: {e}")
-
-            # Логируем прогресс
-            if processed % 100 == 0 or i + batch_size >= len(test_users):
-                batch_time = time.time() - batch_start
-                total_time = time.time() - start_time
-                avg_time_per_user = total_time / processed if processed > 0 else 0
-
-                log_message(f"Обработано {processed}/{len(test_users)} пользователей")
-                log_message(
-                    f"Текущий батч: {batch_time:.2f} сек, Среднее время: {avg_time_per_user:.4f} сек/пользователь"
-                )
-
-        # Сохраняем рекомендации
-        stage_start_save = time.time()
-        results_dir = "/home/root6/python/e_cup/rec_system/results"
-        os.makedirs(results_dir, exist_ok=True)
-        output_file = os.path.join(results_dir, "submit.csv")
-
-        # Быстрая запись в CSV
-        with open(output_file, "w", encoding="utf-8", buffering=8192) as f:
-            f.write("user_id,item_id_1 item_id_2 ... item_id_100\n")
-            for user_id, items in recommendations.items():
-                items_str = " ".join(str(int(item)) for item in items)
-                f.write(f"{int(user_id)},{items_str}\n")
-
-        save_time = time.time() - stage_start_save
-        log_message(f"Рекомендации сохранены за {save_time:.2f} сек")
-
         # Финальная статистика
         all_items = set()
-        for recs in recommendations.values():
-            all_items.update(recs)
 
-        log_message(f"Создано рекомендаций для {len(recommendations)} пользователей")
-        log_message(f"Уникальных рекомендованных товаров: {len(all_items)}")
-        log_message(f"Охват товаров: {len(all_items)/len(item_map)*100:.1f}%")
-
-        stage_time = time.time() - stage_start
-        log_message(
-            f"Создание рекомендаций завершено за {timedelta(seconds=stage_time)}"
-        )
-
-        # === ФИНАЛЬНАЯ СТАТИСТИКА (обновленная) ===
+        # === ФИНАЛЬНАЯ СТАТИСТИКА ===
         total_time = time.time() - start_time
         log_message("=== ОБУЧЕНИЕ И ПРЕДСКАЗАНИЯ ЗАВЕРШЕНЫ УСПЕШНО ===")
         log_message(f"Общее время выполнения: {timedelta(seconds=total_time)}")
@@ -2812,8 +2622,6 @@ if __name__ == "__main__":
         log_message(f"Признаков: {len(recommender.feature_columns)}")
         log_message(f"NDCG@100 train: {train_ndcg:.4f}")
         log_message(f"NDCG@100 val: {val_ndcg:.4f}")
-        log_message(f"Тестовых пользователей: {len(test_users)}")
-        log_message(f"Рекомендаций создано: {len(recommendations)}")
 
         # Информация о системе
         log_message("=== СИСТЕМНАЯ ИНФОРМАЦИЯ ===")

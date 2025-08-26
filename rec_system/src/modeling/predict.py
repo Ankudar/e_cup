@@ -4,6 +4,7 @@ import os
 import pickle
 import sys
 import time
+from datetime import datetime, timedelta
 
 import dask.dataframe as dd
 import numpy as np
@@ -30,206 +31,322 @@ logger.info("Загружаем модель из %s", MODEL_PATH)
 with open(MODEL_PATH, "rb") as f:
     model_data = pickle.load(f)
 
-# 1. Проверьте тип объекта
-print(f"Тип загруженного объекта: {type(model_data)}")
 
-# 2. Если это словарь (чаще всего)
-if isinstance(model_data, dict):
-    print("Ключи в словаре модели:")
-    for key in model_data.keys():
-        print(f"  - {key}")
-    
-    # Посмотрите содержимое основных ключей
-    for key, value in model_data.items():
-        print(f"\n--- {key} ---")
-        print(f"Тип: {type(value)}")
-        
-        if hasattr(value, 'shape'):
-            print(f"Размер: {value.shape}")
-        elif hasattr(value, '__len__'):
-            print(f"Длина: {len(value)}")
-        
-        # Для небольших объектов покажите содержимое
-        if key in ['feature_importances_', 'feature_names_', 'best_params_']:
-            print(f"Содержимое: {value}")
-
-# 3. Если это модель LightGBM
-if hasattr(model_data, 'feature_name_'):
-    print(f"\nПризнаки модели: {model_data.feature_name_}")
-    print(f"Важность признаков: {model_data.feature_importances_}")
-
-# 4. Детальное исследование структуры
-def explore_object(obj, depth=0, max_depth=2):
-    if depth > max_depth:
-        return
-    
-    indent = "  " * depth
-    if hasattr(obj, '__dict__'):
-        print(f"{indent}Объект: {type(obj).__name__}")
-        for attr_name in dir(obj):
-            if not attr_name.startswith('_'):
-                attr_value = getattr(obj, attr_name)
-                if not callable(attr_value):
-                    print(f"{indent}  {attr_name}: {type(attr_value)}")
-                    if depth < max_depth:
-                        explore_object(attr_value, depth + 1, max_depth)
-    elif isinstance(obj, (list, tuple)) and len(obj) > 0:
-        print(f"{indent}Коллекция [{type(obj).__name__}] с {len(obj)} элементами")
-        if len(obj) > 0:
-            explore_object(obj[0], depth + 1, max_depth)
-    elif isinstance(obj, dict) and len(obj) > 0:
-        print(f"{indent}Словарь с {len(obj)} ключами")
-        for key, value in list(obj.items())[:3]:  # первые 3 элемента
-            print(f"{indent}  {key}: {type(value)}")
-            explore_object(value, depth + 1, max_depth)
-
-# Запустите исследование
-explore_object(model_data)
-
-model = model_data["lgbm_model"]
-feature_columns = model_data["feature_columns"]
-user_features_dict = model_data.get("user_features_dict", {})
-item_features_dict = model_data.get("item_features_dict", {})
-item_map = model_data["item_map"]
-
-popular_items = model_data.get("popular_items", [])
-recent_items_map = model_data.get("recent_items_map", {})
-copurchase_map = model_data.get("copurchase_map", {})
-
-all_items = list(item_map.keys())
-logger.info("Всего товаров в item_map: %d", len(all_items))
-
-# --- заготовка матрицы признаков товаров ---
-logger.info("Строим матрицу признаков для товаров...")
-n_features = len(feature_columns)
-item_features_matrix = {}
-for item_id in all_items:
-    feats = np.zeros(n_features, dtype=np.float32)
-    for f_name, f_val in item_features_dict.get(item_id, {}).items():
-        if f_name in feature_columns:
-            feats[feature_columns.index(f_name)] = float(f_val)
-    item_features_matrix[item_id] = feats
-logger.info("Готово: %d товаров с признаками", len(item_features_matrix))
-
-
-# --- генератор кандидатов ---
-def get_candidates(user_id, top_n=CANDIDATES_PER_USER):
-    candidates = set()
-
-    # 1. последние товары юзера
-    recent_items = recent_items_map.get(user_id, [])
-    candidates.update(recent_items)
-
-    # 2. ковизиты
-    for item in recent_items:
-        if item in copurchase_map:
-            candidates.update(copurchase_map[item])
-
-    # 3. fallback на популярные
-    if len(candidates) < top_n:
-        candidates.update(popular_items[: top_n - len(candidates)])
-
-    return list(candidates)[:top_n]
-
-
-# --- чтение тестовых пользователей ---
-logger.info("Читаем тестовых пользователей из %s", TEST_USERS_PATH)
-ddf = dd.read_parquet(TEST_USERS_PATH, columns=["user_id"])
-delayed_batches = ddf.to_delayed()
-logger.info("Dask разбил на %d партиций", len(delayed_batches))
-
-if os.path.exists(OUTPUT_PATH):
-    os.remove(OUTPUT_PATH)
-logger.info("Файл %s очищен", OUTPUT_PATH)
-
-csv_header = True
-
-for part_idx, delayed_df in enumerate(tqdm(delayed_batches, desc="Dask partitions")):
+# ===== СУПЕР-БЫСТРЫЕ РЕКОМЕНДАЦИИ =====
+def get_user_recommendations_super_fast(user_id, top_k=100, **kwargs):
+    """СУПЕР-БЫСТРАЯ функция: топ-10 по модели, остальные популярные"""
     try:
-        batch_df = delayed_df.compute()
+        recent_items_get = kwargs.get("recent_items_get")
+        popular_items_array = kwargs.get("popular_items_array")
+        recommender = kwargs.get("recommender")
+        copurchase_map = kwargs.get("copurchase_map")
+        item_to_cat = kwargs.get("item_to_cat")
+        cat_to_items = kwargs.get("cat_to_items")
+        item_map = kwargs.get("item_map")
+        user_features_dict = kwargs.get("user_features_dict")
+        item_features_dict = kwargs.get("item_features_dict")
+
+        # ключевые признаки (только 5–7)
+        key_features = [
+            "user_count",
+            "user_mean",
+            "user_orders_count",  # user
+            "item_count",
+            "item_orders_count",
+            "item_category",  # item
+        ]
+
+        # недавние товары
+        recent_items = recent_items_get(user_id, [])
+
+        candidates = set()
+        candidates.update(recent_items[:15])  # недавние
+
+        # co-purchase (макс 5 товаров, по 8 кандидатов)
+        for item in recent_items[:5]:
+            co_items = copurchase_map.get(item, [])
+            candidates.update(co_items[:8])
+
+        # товары из категорий (макс 3 товара, по 10 кандидатов)
+        for item in recent_items[:3]:
+            cat_id = item_to_cat.get(item)
+            if cat_id and cat_id in cat_to_items:
+                candidates.update(cat_to_items[cat_id][:10])
+
+        # фильтруем и ограничиваем 100
+        candidates = [c for c in candidates if c in item_map][:100]
+        if not candidates:
+            return popular_items_array[:top_k].tolist()
+
+        # датафрейм
+        candidate_df = pd.DataFrame(
+            {"user_id": [user_id] * len(candidates), "item_id": candidates}
+        )
+
+        # добавляем только ключевые признаки
+        user_feats = user_features_dict.get(user_id, {})
+        for feat_name in key_features:
+            if feat_name in user_feats:
+                candidate_df[feat_name] = user_feats[feat_name]
+            elif feat_name.startswith("item_"):
+                for item_id in candidates:
+                    item_feats = item_features_dict.get(item_id, {})
+                    candidate_df.loc[candidate_df["item_id"] == item_id, feat_name] = (
+                        item_feats.get(feat_name, 0)
+                    )
+
+        candidate_df = candidate_df.fillna(0)
+
+        # все нужные колонки модели
+        for col in recommender.feature_columns:
+            if col not in candidate_df.columns:
+                candidate_df[col] = 0
+
+        X_candidate = candidate_df[recommender.feature_columns]
+
+        # предсказания
+        predictions = recommender.model.predict(X_candidate)
+        candidate_df["score"] = predictions
+        candidate_df = candidate_df.sort_values("score", ascending=False)
+
+        # топ-10 по модели
+        top_model_recs = candidate_df["item_id"].head(10).tolist()
+
+        # добавляем популярные до top_k
+        final_recs = top_model_recs.copy()
+        for item in popular_items_array:
+            if item not in final_recs and len(final_recs) < top_k:
+                final_recs.append(item)
+            if len(final_recs) >= top_k:
+                break
+
+        return final_recs[:top_k]
+
+    except Exception:
+        return popular_items_array[:top_k].tolist()
+
+
+# ===== КЭШ ДЛЯ ПОХОЖИХ ПОЛЬЗОВАТЕЛЕЙ =====
+user_recommendation_cache = {}
+similar_user_threshold = 5  # если >=5 общих recent items → считаем похожими
+
+
+def get_user_recommendations_with_cache(user_id, top_k=100, **kwargs):
+    """Рекомендации с кэшированием"""
+    recent_items_get = kwargs.get("recent_items_get")
+
+    # кэш прямого попадания
+    if user_id in user_recommendation_cache:
+        return user_recommendation_cache[user_id]
+
+    recent_items = recent_items_get(user_id, [])
+
+    # ищем похожих
+    for cached_user_id, cached_recs in user_recommendation_cache.items():
+        cached_recent = recent_items_get(cached_user_id, [])
+        if len(set(recent_items) & set(cached_recent)) >= similar_user_threshold:
+            user_recommendation_cache[user_id] = cached_recs
+            return cached_recs
+
+    # вычисляем заново
+    recs = get_user_recommendations_super_fast(user_id, top_k, **kwargs)
+    if len(user_recommendation_cache) < 10000:  # ограничение размера
+        user_recommendation_cache[user_id] = recs
+
+    return recs
+
+
+# ===== ОБРАБОТКА ВСЕХ ПОЛЬЗОВАТЕЛЕЙ =====
+def generate_recommendations_for_users(
+    test_users,
+    recommender,
+    recent_items_map,
+    copurchase_map,
+    item_to_cat,
+    cat_to_items,
+    user_features_dict,
+    item_features_dict,
+    item_map,
+    popular_items,
+    K,
+    log_message,
+    output_path=None,
+):
+    log_message("=== ГЕНЕРАЦИЯ РЕКОМЕНДАЦИЙ (super_fast + cache) ===")
+    stage_start = time.time()
+
+    popular_items_array = np.array(popular_items, dtype=np.int64)
+    recent_items_get = recent_items_map.get
+
+    recommendations = {}
+    processed = 0
+    batch_size = 50
+    header_written = False
+
+    with tqdm(total=len(test_users), desc="Создание рекомендаций") as pbar:
+        for i in range(0, len(test_users), batch_size):
+            batch_users = test_users[i : i + batch_size]
+
+            for user_id in batch_users:
+                try:
+                    recommendations[user_id] = get_user_recommendations_with_cache(
+                        user_id,
+                        K,
+                        recent_items_get=recent_items_get,
+                        popular_items_array=popular_items_array,
+                        recommender=recommender,
+                        copurchase_map=copurchase_map,
+                        item_to_cat=item_to_cat,
+                        cat_to_items=cat_to_items,
+                        item_map=item_map,
+                        user_features_dict=user_features_dict,
+                        item_features_dict=item_features_dict,
+                    )
+                except Exception as e:
+                    recommendations[user_id] = popular_items_array[:K]
+                    log_message(f"Ошибка для пользователя {user_id}: {e}")
+
+                processed += 1
+                pbar.update(1)
+
+                # каждые 10000 пользователей сохраняем и очищаем словарь
+                if output_path and processed % 10000 == 0:
+                    save_recommendations_to_csv(
+                        recommendations,
+                        output_path,
+                        log_message,
+                        header=not header_written,
+                    )
+                    header_written = True
+                    recommendations.clear()
+
+    # сохранить хвост
+    if output_path and recommendations:
+        save_recommendations_to_csv(
+            recommendations,
+            output_path,
+            log_message,
+            header=not header_written,
+        )
+
+    stage_time = time.time() - stage_start
+    log_message(f"Генерация завершена за {timedelta(seconds=stage_time)}")
+
+    return {}  # так как всё уже сохранено, возвращаем пустое
+
+
+# ===== СОХРАНЕНИЕ И СТАТИСТИКА =====
+def save_recommendations_to_csv(recommendations, output_path, log_message, header=True):
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    mode = "w" if header else "a"
+    with open(output_path, mode, encoding="utf-8", buffering=16384) as f:
+        if header:
+            f.write("user_id,item_id\n")
+        for user_id, items in recommendations.items():
+            items_str = " ".join(str(int(item)) for item in items)
+            f.write(f"{int(user_id)},{items_str}\n")
+    log_message(
+        f"Сохранено {len(recommendations)} пользователей (header={header}) в {output_path}"
+    )
+
+
+def log_final_statistics(recommendations, item_map, start_time, log_message):
+    all_items = {i for recs in recommendations.values() for i in recs}
+    log_message(f"Пользователей: {len(recommendations)}")
+    log_message(f"Уникальных товаров: {len(all_items)}")
+    log_message(f"Охват: {len(all_items)/len(item_map)*100:.1f}%")
+    total_time = time.time() - start_time
+    log_message(f"Общее время: {timedelta(seconds=total_time)}")
+
+
+if __name__ == "__main__":
+    start_time = time.time()
+    log_file = "/home/root6/python/e_cup/rec_system/predict_log.txt"
+
+    def log_message(message: str):
+        """Логирование в файл и консоль"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg = f"[{timestamp}] {message}"
+        print(msg)
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+
+    try:
+        log_message("=== Запуск генерации рекомендаций ===")
+
+        # === 1. Загружаем тестовых пользователей ===
+        log_message("Загрузка тестовых пользователей...")
+        test_df = dd.read_parquet(TEST_USERS_PATH).compute()
+        test_users = test_df["user_id"].unique().tolist()
+        log_message(f"Загружено {len(test_users)} пользователей")
+
+        # === 2. Загружаем вспомогательные данные ===
+        log_message("Загрузка маппингов и фичей...")
+        # ⚠️ здесь нужно подгрузить заранее подготовленные pickle/parquet с картами
+        with open(
+            "/home/root6/python/e_cup/rec_system/data/processed/recent_items_map.pkl",
+            "rb",
+        ) as f:
+            recent_items_map = pickle.load(f)
+        with open(
+            "/home/root6/python/e_cup/rec_system/data/processed/copurchase_map.pkl",
+            "rb",
+        ) as f:
+            copurchase_map = pickle.load(f)
+        with open(
+            "/home/root6/python/e_cup/rec_system/data/processed/item_to_cat.pkl", "rb"
+        ) as f:
+            item_to_cat = pickle.load(f)
+        with open(
+            "/home/root6/python/e_cup/rec_system/data/processed/extended_cat_to_items.pkl",
+            "rb",
+        ) as f:
+            cat_to_items = pickle.load(f)
+        with open(
+            "/home/root6/python/e_cup/rec_system/data/processed/user_features_dict.pkl",
+            "rb",
+        ) as f:
+            user_features_dict = pickle.load(f)
+        with open(
+            "/home/root6/python/e_cup/rec_system/data/processed/item_features_dict.pkl",
+            "rb",
+        ) as f:
+            item_features_dict = pickle.load(f)
+        with open(
+            "/home/root6/python/e_cup/rec_system/data/processed/item_map.pkl", "rb"
+        ) as f:
+            item_map = pickle.load(f)
+        with open(
+            "/home/root6/python/e_cup/rec_system/data/processed/popular_items.pkl", "rb"
+        ) as f:
+            popular_items = pickle.load(f)
+
+        # === 3. Генерация рекомендаций ===
+        generate_recommendations_for_users(
+            test_users=test_users,
+            recommender=model_data,
+            recent_items_map=recent_items_map,
+            copurchase_map=copurchase_map,
+            item_to_cat=item_to_cat,
+            cat_to_items=cat_to_items,
+            user_features_dict=user_features_dict,
+            item_features_dict=item_features_dict,
+            item_map=item_map,
+            popular_items=popular_items,
+            K=TOP_K,
+            log_message=log_message,
+            output_path=OUTPUT_PATH,  # <--- передаём путь для инкрементального сохранения
+        )
+
+        # === 4. Лог финальной статистики ===
+        log_final_statistics({}, item_map, start_time, log_message)
+
+        log_message("=== Завершено успешно ===")
+
     except Exception as e:
-        logger.error("Ошибка при compute партиции %d: %s", part_idx, str(e))
-        continue
-
-    user_ids = batch_df["user_id"].dropna().unique().tolist()
-    logger.info("Партиция %d: %d пользователей", part_idx, len(user_ids))
-
-    for start in tqdm(range(0, len(user_ids), USER_BATCH_SIZE), desc="User batches"):
-        batch_users = user_ids[start : start + USER_BATCH_SIZE]
-        logger.info(
-            "Обрабатываем пользователей %d–%d (всего %d)",
-            start,
-            start + len(batch_users),
-            len(user_ids),
-        )
-
-        batch_feats = []
-        batch_meta = []
-
-        for user_id in batch_users:
-            candidates = get_candidates(user_id, top_n=CANDIDATES_PER_USER)
-            if not candidates:
-                logger.debug("У пользователя %s нет кандидатов", user_id)
-                continue
-
-            user_vec = user_features_dict.get(user_id, {})
-
-            for cand in candidates:
-                item_id = cand[0] if isinstance(cand, tuple) else cand
-                if item_id not in item_features_matrix:
-                    continue
-
-                vec = item_features_matrix[item_id].copy()
-                for f_name, f_val in user_vec.items():
-                    if f_name in feature_columns:
-                        vec[feature_columns.index(f_name)] = float(f_val)
-
-                batch_feats.append(vec)
-                batch_meta.append((user_id, item_id))
-
-        if not batch_feats:
-            logger.warning("Пропускаем батч %d: нет признаков", start)
-            continue
-
-        batch_feats = np.array(batch_feats, dtype=np.float32)
-        logger.info(
-            "Батч готов: %d пар (user,item), shape=%s",
-            len(batch_feats),
-            batch_feats.shape,
-        )
-
-        try:
-            scores = model.predict(batch_feats, num_iteration=-1)
-        except Exception as e:
-            logger.error("Ошибка при предсказании: %s", str(e))
-            del batch_feats, batch_meta
-            gc.collect()
-            continue
-
-        user2items = {}
-        for (uid, iid), score in zip(batch_meta, scores):
-            user2items.setdefault(uid, []).append((iid, score))
-
-        rows = []
-        for uid, pairs in user2items.items():
-            top_items = [iid for iid, _ in sorted(pairs, key=lambda x: -x[1])[:TOP_K]]
-            rows.append([uid, " ".join(map(str, top_items))])
-
-        try:
-            pd.DataFrame(
-                rows, columns=["user_id", "item_id_1 item_id_2 ... item_id_100"]
-            ).to_csv(OUTPUT_PATH, index=False, mode="a", header=csv_header)
-            csv_header = False
-        except Exception as e:
-            logger.error("Ошибка при записи CSV: %s", str(e))
-
-        logger.info("Батч %d записан: %d пользователей", start, len(rows))
-
-        del batch_feats, batch_meta, rows, user2items, scores
-        gc.collect()
-
-#         time.sleep(0.01)  # чуть разгрузим CPU
-
+        error_msg = f"Ошибка: {str(e)}"
+        log_message(error_msg)
+        raise
 
 # что сейчас учитывается
 # 1) Полный список факторов для формирования рекомендаций:
