@@ -264,7 +264,8 @@ def prepare_interactions(
         batch = batch.assign(
             timestamp=batch["created_timestamp"],
             weight=5.0 * time_factor,
-        )[["user_id", "item_id", "weight", "timestamp"]]
+            action_type="order",
+        )[["user_id", "item_id", "weight", "timestamp", "action_type"]]
 
         path = os.path.join(output_dir, f"orders_batch_{start}.parquet")
         batch.to_parquet(path, index=False, engine="pyarrow")
@@ -273,7 +274,7 @@ def prepare_interactions(
         gc.collect()
         log_message(f"Сохранен orders-батч {start}-{min(start+batch_size, n_rows)}")
 
-    # ====== Tracker ====== # ИСПРАВЛЕНИЕ ЗДЕСЬ
+    # ====== Tracker ======
     log_message("... для tracker")
     tracker_ddf = tracker_ddf[["user_id", "item_id", "timestamp", "action_type"]]
 
@@ -296,7 +297,7 @@ def prepare_interactions(
         days_ago = (ref_time - part["timestamp"]).dt.days.clip(lower=1)
         time_factor = np.log1p(days_ago / scale_days)
         part = part.assign(weight=aw * time_factor)[
-            ["user_id", "item_id", "weight", "timestamp"]
+            ["user_id", "item_id", "weight", "timestamp", "action_type"]
         ]
 
         path = os.path.join(output_dir, f"tracker_part_{partition_id}.parquet")
@@ -1168,7 +1169,9 @@ class LightGBMRecommender:
                     sampled_items = []
                     if n_popular > 0:
                         sampled_items.extend(
-                            np.random.choice(popular_candidates, n_popular, replace=False)
+                            np.random.choice(
+                                popular_candidates, n_popular, replace=False
+                            )
                         )
                     if n_random > 0:
                         sampled_items.extend(
