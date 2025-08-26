@@ -38,7 +38,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=100_000):
+def load_train_data(max_parts=0, max_rows=1_000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -418,7 +418,9 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
     # 3. Постепенная загрузка и обучение
     log_message("Постепенное обучение...")
 
-    als_model = TorchALS(len(user_map), len(item_map), n_factors=64, device="cuda")
+    als_model = TorchALS(
+        len(user_map), len(item_map), n_factors=n_factors, device=device
+    )
 
     for batch_path in tqdm(batch_files):
         try:
@@ -867,6 +869,7 @@ class LightGBMRecommender:
         self.cat_to_items = None
         self.user_map = None
         self.item_map = None
+        self.covisitation_matrix = None
 
     def set_als_embeddings(self, als_model):
         """Сохраняем ALS эмбеддинги для использования в признаках"""
@@ -886,6 +889,44 @@ class LightGBMRecommender:
         self.cat_to_items = cat_to_items
         self.user_map = user_map
         self.item_map = item_map
+
+    def _train_covisitation_matrix(
+        self, train_data: pd.DataFrame, min_cooccurrence: int = 5
+    ):
+        """Обучение матрицы ковизитации на тренировочных данных."""
+        log_message("Обучение матрицы ковизитации на train данных...")
+
+        # Создаем словарь: user_id -> список item_id с которыми взаимодействовал
+        user_items = {}
+        for user_id, group in train_data.groupby("user_id"):
+            user_items[user_id] = set(group["item_id"].unique())
+
+        # Считаем ковизитацию (совместные появления)
+        cooccurrence = defaultdict(int)
+
+        for user_id, items in user_items.items():
+            items_list = list(items)
+            for i in range(len(items_list)):
+                for j in range(i + 1, len(items_list)):
+                    item1, item2 = items_list[i], items_list[j]
+                    # Упорядочиваем пару для consistency
+                    pair = (min(item1, item2), max(item1, item2))
+                    cooccurrence[pair] += 1
+
+        # Фильтруем по минимальному количеству совместных появлений
+        self.covisitation_matrix = {}
+        for (item1, item2), count in cooccurrence.items():
+            if count >= min_cooccurrence:
+                self.covisitation_matrix[item1] = (
+                    self.covisitation_matrix.get(item1, 0) + count
+                )
+                self.covisitation_matrix[item2] = (
+                    self.covisitation_matrix.get(item2, 0) + count
+                )
+
+        log_message(
+            f"Размер матрицы ковизитации: {len(self.covisitation_matrix)} товаров"
+        )
 
     def _load_ui_features_for_pairs(self, pairs_df, ui_features_path):
         """
@@ -938,38 +979,95 @@ class LightGBMRecommender:
                 data["is_weekend"] = 0
                 data["hour"] = -1
         else:
-            log_message("⚠️ Внимание: в данных нет колонки 'timestamp'.")
             data["is_weekend"] = np.nan
             data["hour"] = np.nan
 
-        # Используем только тренировочные данные для расчета статистик
-        if train_only_data is None:
+        # Если train_only_data не передан, берём подмножество data
+        if train_only_data is None or train_only_data.empty:
             train_only_data = data[data.get("target", 0) == 0]
 
-        # Популярность товара
-        item_pop = (
-            train_only_data.groupby("item_id")["user_id"]
-            .count()
-            .rename("item_popularity")
-            .reset_index()
-        )
-        data = data.merge(item_pop, on="item_id", how="left")
-        data["item_popularity"] = data["item_popularity"].fillna(0)
-
-        # Популярность категории
-        if "category_id" in data.columns:
-            cat_pop = (
-                train_only_data.groupby("category_id")["user_id"]
+        # --- Популярность товара ---
+        if not train_only_data.empty:
+            item_pop = (
+                train_only_data.groupby("item_id")["user_id"]
                 .count()
-                .rename("category_popularity")
+                .rename("item_popularity")
                 .reset_index()
             )
-            data = data.merge(cat_pop, on="category_id", how="left")
-            data["category_popularity"] = data["category_popularity"].fillna(0)
+            # Проверяем, что item_pop не пустой
+            if not item_pop.empty:
+                data = data.merge(item_pop, on="item_id", how="left")
+
+        # Создаем колонку если ее нет или заполняем нулями
+        if "item_popularity" not in data.columns:
+            data["item_popularity"] = 0
+        else:
+            data["item_popularity"] = data["item_popularity"].fillna(0)
+
+        # --- Популярность категории ---
+        if "category_id" in data.columns:
+            if not train_only_data.empty and "category_id" in train_only_data.columns:
+                cat_pop = (
+                    train_only_data.groupby("category_id")["user_id"]
+                    .count()
+                    .rename("category_popularity")
+                    .reset_index()
+                )
+                if not cat_pop.empty:
+                    data = data.merge(cat_pop, on="category_id", how="left")
+
+            if "category_popularity" not in data.columns:
+                data["category_popularity"] = 0
+            else:
+                data["category_popularity"] = data["category_popularity"].fillna(0)
         else:
             data["category_popularity"] = 0
 
-        # Ковизиты
+        # --- Активность пользователя ---
+        if not train_only_data.empty:
+            user_activity = (
+                train_only_data.groupby("user_id")["item_id"]
+                .count()
+                .rename("user_activity")
+                .reset_index()
+            )
+            if not user_activity.empty:
+                data = data.merge(user_activity, on="user_id", how="left")
+
+        if "user_activity" not in data.columns:
+            data["user_activity"] = 0
+        else:
+            data["user_activity"] = data["user_activity"].fillna(0)
+
+        # --- Средняя популярность товаров у пользователя ---
+        if not train_only_data.empty and "item_popularity" in data.columns:
+            train_with_pop = (
+                train_only_data.merge(item_pop, on="item_id", how="left")
+                if not item_pop.empty
+                else train_only_data.copy()
+            )
+
+            if "item_popularity" in train_with_pop.columns:
+                train_with_pop["item_popularity"] = train_with_pop[
+                    "item_popularity"
+                ].fillna(0)
+                user_avg_pop = (
+                    train_with_pop.groupby("user_id")["item_popularity"]
+                    .mean()
+                    .rename("user_avg_item_popularity")
+                    .reset_index()
+                )
+                if not user_avg_pop.empty:
+                    data = data.merge(user_avg_pop, on="user_id", how="left")
+
+        if "user_avg_item_popularity" not in data.columns:
+            data["user_avg_item_popularity"] = 0
+        else:
+            data["user_avg_item_popularity"] = data["user_avg_item_popularity"].fillna(
+                0
+            )
+
+        # --- Ковизитация ---
         if (
             hasattr(self, "covisitation_matrix")
             and self.covisitation_matrix is not None
@@ -982,8 +1080,8 @@ class LightGBMRecommender:
         else:
             data["covisitation_score"] = 0
 
-        # FCLIP эмбеддинги
-        if self.external_embeddings_dict:
+        # --- FCLIP эмбеддинги ---
+        if getattr(self, "external_embeddings_dict", None):
             log_message("Ускоренная обработка FCLIP эмбеддингов на GPU...")
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             all_item_ids = list(self.external_embeddings_dict.keys())
@@ -1001,7 +1099,7 @@ class LightGBMRecommender:
                 )
 
             item_id_to_idx = {item_id: idx for idx, item_id in enumerate(all_item_ids)}
-            batch_size = 100000
+            batch_size = 100_000
             total_rows = len(data)
 
             for i in range(n_fclip_dims):
@@ -1038,16 +1136,20 @@ class LightGBMRecommender:
             del embeddings_tensor, item_id_to_idx
             torch.cuda.empty_cache()
 
-        # Регистрируем новые признаки
+        # --- Регистрируем новые признаки ---
         new_features = [
             "is_weekend",
             "hour",
             "item_popularity",
             "category_popularity",
+            "user_activity",
+            "user_avg_item_popularity",
             "covisitation_score",
-        ] + [f"fclip_embed_{i}" for i in range(n_fclip_dims)]
+        ]
+        if getattr(self, "external_embeddings_dict", None):
+            new_features += [f"fclip_embed_{i}" for i in range(n_fclip_dims)]
 
-        existing_features = set(self.feature_columns)
+        existing_features = set(getattr(self, "feature_columns", []))
         for feature in new_features:
             if feature in data.columns and feature not in existing_features:
                 self.feature_columns.append(feature)
@@ -1067,7 +1169,7 @@ class LightGBMRecommender:
         popularity_s,
         recent_items_map,
         sample_fraction=0.1,
-        negatives_per_positive=3,
+        negatives_per_positive=2,
         ui_features_dir=None,
         val_days: int = 7,
     ):
@@ -1101,9 +1203,14 @@ class LightGBMRecommender:
         split_time = max_timestamp - pd.Timedelta(days=val_days)
         train_timestamp_fill = split_time - pd.Timedelta(seconds=1)
 
-        user_interacted_items = {
+        # ВАЖНО: Разделяем interactions на train и val для user_interacted_items
+        interactions_train = interactions_df[interactions_df["timestamp"] <= split_time]
+        interactions_val = interactions_df[interactions_df["timestamp"] > split_time]
+
+        # Для генерации train используем только train interactions
+        user_interacted_items_train = {
             uid: set(gr["item_id"].unique())
-            for uid, gr in interactions_df.groupby("user_id")
+            for uid, gr in interactions_train.groupby("user_id")
         }
 
         all_items = np.array(list(item_map.keys()), dtype=np.int64)
@@ -1137,12 +1244,14 @@ class LightGBMRecommender:
 
         small_batch = []
 
+        # --- Генерация TRAIN данных ---
         for part in tqdm(orders_ddf.to_delayed(), desc="Streaming генерация"):
             pdf = part.compute()  # только одна партиция в память
             for uid, gr in pdf.groupby("user_id"):
                 pos_items = set(gr[gr["target"] == 1]["item_id"])
                 neg_items_existing = set(gr[gr["target"] == 0]["item_id"])
-                interacted = user_interacted_items.get(uid, set())
+                # Используем только train interactions для исключения
+                interacted = user_interacted_items_train.get(uid, set())
                 excluded = pos_items | neg_items_existing | interacted
                 available_items = all_items[~np.isin(all_items, list(excluded))]
 
@@ -1209,9 +1318,16 @@ class LightGBMRecommender:
                 train_data.iloc[cutoff:].copy(),
             )
 
-        # --- Фичи ---
+        # ВАЖНО: Обучаем ковизитацию на train данных ДО добавления фич
+        self._train_covisitation_matrix(train_data)
+
+        # Теперь добавляем фичи
+        log_message("Добавление фичей для train данных...")
         train_data = self._add_rich_features(train_data, train_only_data=train_data)
+
+        log_message("Добавление фичей для val данных (на основе train статистик)...")
         val_data = self._add_rich_features(val_data, train_only_data=train_data)
+
         if ui_features_dir and os.path.exists(ui_features_dir):
             train_data, val_data = self._add_ui_features_optimized(
                 train_data, val_data, ui_features_dir
@@ -1302,20 +1418,27 @@ class LightGBMRecommender:
         Обучение LightGBM с NDCG optimization
         """
         if params is None:
+            # params = {
+            #     "objective": "lambdarank",
+            #     "metric": "ndcg",
+            #     "ndcg_eval_at": [100],
+            #     "learning_rate": 0.05,
+            #     "num_leaves": 31,
+            #     "max_depth": -1,
+            #     "min_data_in_leaf": 20,  # Увеличить для предотвращения переобучения
+            #     "feature_fraction": 0.8,
+            #     "bagging_fraction": 0.8,
+            #     "bagging_freq": 5,
+            #     "lambda_l1": 0.1,  # L1 регуляризация
+            #     "lambda_l2": 0.1,  # L2 регуляризация
+            #     "early_stopping_rounds": 10,
+            # }
             params = {
-                "objective": "lambdarank",
-                "metric": "ndcg",
-                "ndcg_eval_at": [100],
+                "objective": "binary",
+                "metric": "binary_error",
                 "learning_rate": 0.05,
-                "num_leaves": 31,
-                "max_depth": -1,
-                "min_data_in_leaf": 20,  # Увеличить для предотвращения переобучения
-                "feature_fraction": 0.8,
-                "bagging_fraction": 0.8,
-                "bagging_freq": 5,
-                "lambda_l1": 0.1,  # L1 регуляризация
-                "lambda_l2": 0.1,  # L2 регуляризация
-                "early_stopping_rounds": 10,
+                "num_leaves": 7,  # Очень простая модель
+                "max_depth": 3,
             }
 
         # Группы для lambdarank (количество товаров на пользователя)
