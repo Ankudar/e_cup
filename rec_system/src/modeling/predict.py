@@ -141,14 +141,45 @@ logger.info(f"Количество фич: {len(feature_columns)}")
 logger.info(f"Первые 10 фич: {feature_columns[:10]}")
 
 
-# ===== ИСПРАВЛЕННАЯ СУПЕР-БЫСТРАЯ ФУНКЦИЯ =====
+# ===== ВЕКТОРИЗИРОВАННАЯ ФУНКЦИЯ ДЛЯ ПОДГОТОВКИ ФИЧ =====
+def prepare_features_vectorized(
+    user_id, candidates, user_features_dict, item_features_dict, feature_columns
+):
+    """Векторизированная подготовка признаков для кандидатов"""
+    num_candidates = len(candidates)
+
+    # Создаем матрицу признаков
+    features_matrix = np.zeros((num_candidates, len(feature_columns)), dtype=np.float32)
+
+    # Получаем user features
+    user_feats = user_features_dict.get(user_id, {})
+
+    # Заполняем user features
+    for j, feat_name in enumerate(feature_columns):
+        if feat_name in user_feats:
+            features_matrix[:, j] = user_feats[feat_name]
+
+    # Заполняем item features
+    for j, feat_name in enumerate(feature_columns):
+        if any(
+            feat_name.startswith(prefix) for prefix in ["item_", "fclip_", "category_"]
+        ):
+            for i, item_id in enumerate(candidates):
+                item_feats = item_features_dict.get(item_id, {})
+                if feat_name in item_feats:
+                    features_matrix[i, j] = item_feats[feat_name]
+
+    return features_matrix
+
+
+# ===== ОПТИМИЗИРОВАННАЯ СУПЕР-БЫСТРАЯ ФУНКЦИЯ =====
 def get_user_recommendations_super_fast(user_id, top_k=100, **kwargs):
-    """СУПЕР-БЫСТРАЯ функция: персонализированные рекомендации"""
+    """СУПЕР-БЫСТРАЯ функция: персонализированные рекомендации с векторизацией"""
     try:
         recent_items_get = kwargs.get("recent_items_get")
         popular_items_array = kwargs.get("popular_items_array")
-        model = kwargs.get("model")  # получаем модель
-        feature_columns = kwargs.get("feature_columns")  # получаем feature_columns
+        model = kwargs.get("model")
+        feature_columns = kwargs.get("feature_columns")
         copurchase_map = kwargs.get("copurchase_map")
         item_to_cat = kwargs.get("item_to_cat")
         cat_to_items = kwargs.get("cat_to_items")
@@ -158,9 +189,6 @@ def get_user_recommendations_super_fast(user_id, top_k=100, **kwargs):
 
         # недавние товары пользователя
         recent_items = recent_items_get(user_id, [])
-
-        # user features
-        user_feats = user_features_dict.get(user_id, {})
 
         # Генерация кандидатов
         candidates = set()
@@ -188,55 +216,30 @@ def get_user_recommendations_super_fast(user_id, top_k=100, **kwargs):
         if not candidates:
             return popular_items_array[:top_k].tolist()
 
-        # Создаем DataFrame с кандидатами
-        candidate_df = pd.DataFrame(
-            {"user_id": [user_id] * len(candidates), "item_id": candidates}
+        # Векторизированная подготовка признаков
+        X_candidate = prepare_features_vectorized(
+            user_id, candidates, user_features_dict, item_features_dict, feature_columns
         )
-
-        # Добавляем USER фичи
-        for feat_name, feat_value in user_feats.items():
-            if feat_name in feature_columns:  # добавляем только нужные фичи
-                candidate_df[feat_name] = feat_value
-
-        # Добавляем ITEM фичи
-        item_features_list = []
-        for item_id in candidates:
-            item_feats = item_features_dict.get(item_id, {})
-            # Фильтруем только нужные фичи
-            filtered_feats = {
-                k: v for k, v in item_feats.items() if k in feature_columns
-            }
-            item_features_list.append(filtered_feats)
-
-        if item_features_list:
-            item_features_df = pd.DataFrame(item_features_list)
-            candidate_df = pd.concat([candidate_df, item_features_df], axis=1)
-
-        # Убеждаемся, что все фичи модели присутствуют
-        for col in feature_columns:
-            if col not in candidate_df.columns:
-                candidate_df[col] = 0
-
-        # Выбираем только нужные колонки в правильном порядке
-        X_candidate = candidate_df[feature_columns]
 
         # Предсказания
         predictions = model.predict(X_candidate)
-        candidate_df["score"] = predictions
 
         # Сортируем и получаем топ-K
-        candidate_df = candidate_df.sort_values("score", ascending=False)
-        top_recs = candidate_df["item_id"].head(top_k).tolist()
+        sorted_indices = np.argsort(predictions)[::-1][:top_k]
+        top_recs = [candidates[i] for i in sorted_indices]
 
         # Заполняем популярными, если не хватает
         if len(top_recs) < top_k:
+            additional_items = []
             for item in popular_items_array:
-                if item not in top_recs:
-                    top_recs.append(item)
-                if len(top_recs) >= top_k:
+                if item not in top_recs and item not in additional_items:
+                    additional_items.append(item)
+                if len(top_recs) + len(additional_items) >= top_k:
                     break
+            top_recs.extend(additional_items)
+            top_recs = top_recs[:top_k]
 
-        return top_recs[:top_k]
+        return top_recs
 
     except Exception as e:
         logger.error(f"Error for user {user_id}: {e}")
@@ -295,7 +298,7 @@ def generate_recommendations_for_users(
 
     recommendations = {}
     processed = 0
-    batch_size = 50
+    batch_size = 100  # Увеличиваем батч благодаря оптимизации
     header_written = False
 
     with tqdm(total=len(test_users), desc="Создание рекомендаций") as pbar:
