@@ -359,7 +359,6 @@ def save_recommendations_to_csv(recommendations, output_path, log_message, heade
         for user_id, items in recommendations.items():
             items_str = " ".join(str(int(item)) for item in items)
             f.write(f"{int(user_id)},{items_str}\n")
-    log_message(f"Сохранено {len(recommendations)} пользователей в {output_path}")
 
 
 if __name__ == "__main__":

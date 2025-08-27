@@ -1481,7 +1481,7 @@ class LightGBMRecommender:
                 "bagging_freq": 1,
                 "verbosity": 1,
                 "force_row_wise": True,
-                "device": "cpu",  # можно "cuda", если GPU доступен
+                "device": "cpu",  # можно "cuda", но чет не запустилось :(
                 "num_threads": 8,
                 "max_bin": 200,
                 "boosting": "gbdt",
