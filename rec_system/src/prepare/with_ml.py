@@ -43,17 +43,18 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=500_000_000):
+def load_train_data(max_parts=0, max_rows=1000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
     """
+
     paths = {
-        "orders": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_orders_data/",
-        "tracker": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_tracker_data/",
-        "items": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train/final_apparel_items_data/",
+        "orders": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train_final_apparel_orders_data/",
+        "tracker": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train_final_apparel_tracker_data/",
+        "items": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train_final_apparel_items_data/",
         "categories": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train_final_categories_tree/",
-        "test_users": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_test_for_participants/test_for_participants/",
+        "test_users": "/home/root6/python/e_cup/rec_system/data/raw/test_users/",
     }
 
     columns_map = {

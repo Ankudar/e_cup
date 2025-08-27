@@ -358,7 +358,7 @@ def save_recommendations_to_csv(recommendations, output_path, log_message, heade
     mode = "w" if header else "a"
     with open(output_path, mode, encoding="utf-8", buffering=16384) as f:
         if header:
-            f.write("user_id,item_id\n")
+            f.write("user_id,item_id_1 item_id_2 ... item_id_100\n")
         for user_id, items in recommendations.items():
             items_str = " ".join(str(int(item)) for item in items)
             f.write(f"{int(user_id)},{items_str}\n")
