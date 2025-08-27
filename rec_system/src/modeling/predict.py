@@ -20,7 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 MODEL_PATH = "/home/root6/python/e_cup/rec_system/src/models/lgbm_model_full.pkl"
-TEST_USERS_PATH = "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_test_for_participants/test_for_participants/*.parquet"
+TEST_USERS_PATH = "/home/root6/python/e_cup/rec_system/data/raw/test_users/*.parquet"
 OUTPUT_PATH = "/home/root6/python/e_cup/rec_system/result/submission.csv"
 TOP_K = 100
 USER_BATCH_SIZE = 1000
@@ -388,7 +388,7 @@ if __name__ == "__main__":
             "recent_items_map": "/home/root6/python/e_cup/rec_system/data/processed/recent_items_map.pkl",
             "copurchase_map": "/home/root6/python/e_cup/rec_system/data/processed/copurchase_map.pkl",
             "item_to_cat": "/home/root6/python/e_cup/rec_system/data/processed/item_to_cat.pkl",
-            "cat_to_items": "/home/root6/python/e_cup/rec_system/data/processed/extended_cat_to_items.pkl",
+            "cat_to_items": "/home/root6/python/e_cup/rec_system/data/processed/cat_to_items.pkl",
             "user_features_dict": "/home/root6/python/e_cup/rec_system/data/processed/user_features_dict.pkl",
             "item_features_dict": "/home/root6/python/e_cup/rec_system/data/processed/item_features_dict.pkl",
             "item_map": "/home/root6/python/e_cup/rec_system/data/processed/item_map.pkl",

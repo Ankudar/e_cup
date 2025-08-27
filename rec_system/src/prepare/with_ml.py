@@ -44,7 +44,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=1_000):
+def load_train_data(max_parts=0, max_rows=10000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -1340,30 +1340,44 @@ class LightGBMRecommender:
 
         # --- генерация train/val ---
         small_batch = []
-        for part in tqdm(orders_ddf.to_delayed(), desc="Streaming генерация партиций"):
+
+        train_file_idx = 0
+        val_file_idx = 0
+
+        # суммарное число строк для отображения прогресса (можно по пользователям, если удобнее)
+        total_users = orders_ddf["user_id"].nunique().compute()
+
+        for part in orders_ddf.to_delayed():
             pdf = part.compute()
-            for uid, gr in pdf.groupby("user_id"):
+            for uid, gr in tqdm(
+                pdf.groupby("user_id"),
+                desc="Streaming генерация пользователей",
+                total=pdf["user_id"].nunique(),
+                leave=False,
+            ):
                 pos_items = set(gr[gr["target"] == 1]["item_id"])
                 neg_items_existing = set(gr[gr["target"] == 0]["item_id"])
                 interacted = user_interacted_items_train.get(uid, set())
                 excluded = pos_items | neg_items_existing | interacted
 
+                # --- формируем маску доступных товаров на GPU ---
                 excluded_tensor = (
-                    torch.tensor(list(excluded), device="cuda")
+                    torch.tensor(list(excluded), device="cuda", dtype=torch.int32)
                     if excluded
-                    else torch.tensor([], device="cuda")
+                    else torch.tensor([], device="cuda", dtype=torch.int32)
                 )
                 mask = ~torch.isin(all_items_tensor, excluded_tensor)
                 available_items_tensor = all_items_tensor[mask]
 
-                inter_user = []
+                # --- подгружаем взаимодействия пользователя (из всех файлов) ---
+                inter_user_list = []
                 for f in interactions_out_dir.glob("*.parquet"):
                     d = pd.read_parquet(
                         f, columns=["user_id", "item_id", "timestamp", "weight"]
                     )
-                    inter_user.append(d[d["user_id"] == uid])
-                if inter_user:
-                    inter_user = pd.concat(inter_user)
+                    inter_user_list.append(d[d["user_id"] == uid])
+                if inter_user_list:
+                    inter_user = pd.concat(inter_user_list)
                 else:
                     inter_user = pd.DataFrame(
                         columns=["item_id", "timestamp", "weight"]
@@ -1386,6 +1400,7 @@ class LightGBMRecommender:
                     feature_values = [feats.get(c, 0) for c in feature_cols]
                     small_batch.append([uid, it, ts, target, weight] + feature_values)
 
+                # --- генерация негативов ---
                 n_needed = max(
                     0, len(pos_items) * negatives_per_positive - len(neg_items_existing)
                 )
@@ -1395,9 +1410,11 @@ class LightGBMRecommender:
                     )
                     popular_candidates = available_items_tensor[popular_mask]
                     random_candidates = available_items_tensor[~popular_mask]
+
                     n_popular = min(n_needed // 2, len(popular_candidates))
                     n_random = min(n_needed - n_popular, len(random_candidates))
                     sampled_items = []
+
                     if n_popular > 0:
                         perm = torch.randperm(len(popular_candidates), device="cuda")
                         sampled_items.extend(
@@ -1408,6 +1425,7 @@ class LightGBMRecommender:
                         sampled_items.extend(
                             random_candidates[perm[:n_random]].tolist()
                         )
+
                     for it in sampled_items:
                         feats = enrich_features(uid, it)
                         feature_values = [feats.get(c, 0) for c in feature_cols]
@@ -1415,6 +1433,7 @@ class LightGBMRecommender:
                             [uid, it, train_timestamp_fill, 0, 0.0] + feature_values
                         )
 
+                # --- запись батча ---
                 if len(small_batch) >= batch_size:
                     cols_order = [
                         "user_id",
@@ -1425,6 +1444,15 @@ class LightGBMRecommender:
                     ] + feature_cols
                     batch_df = pd.DataFrame(small_batch, columns=cols_order)
 
+                    # сжатие типов для экономии памяти
+                    batch_df["user_id"] = batch_df["user_id"].astype("int32")
+                    batch_df["item_id"] = batch_df["item_id"].astype("int32")
+                    batch_df["target"] = batch_df["target"].astype("int8")
+                    batch_df["weight"] = batch_df["weight"].astype("float32")
+                    for c in feature_cols:
+                        batch_df[c] = batch_df[c].astype("float32")
+
+                    # --- разделение на train/val ---
                     if split_by_time:
                         train_df = batch_df[batch_df["timestamp"] <= split_time]
                         val_df = batch_df[batch_df["timestamp"] > split_time]
@@ -1437,6 +1465,7 @@ class LightGBMRecommender:
                         train_df = batch_df.iloc[:idx_split]
                         val_df = batch_df.iloc[idx_split:]
 
+                    # --- сохранение ---
                     if not train_df.empty:
                         train_df = train_df.drop(columns=["timestamp"])
                         train_df.to_parquet(
@@ -1446,6 +1475,7 @@ class LightGBMRecommender:
                         )
                         train_data_batches.append(train_df)
                         train_file_idx += 1
+
                     if not val_df.empty:
                         val_df = val_df.drop(columns=["timestamp"])
                         val_df.to_parquet(
@@ -1458,7 +1488,7 @@ class LightGBMRecommender:
 
                     small_batch.clear()
 
-        # --- финализация ---
+        # --- финализация остатка ---
         if small_batch:
             cols_order = [
                 "user_id",
@@ -1468,6 +1498,13 @@ class LightGBMRecommender:
                 "weight",
             ] + feature_cols
             batch_df = pd.DataFrame(small_batch, columns=cols_order)
+
+            batch_df["user_id"] = batch_df["user_id"].astype("int32")
+            batch_df["item_id"] = batch_df["item_id"].astype("int32")
+            batch_df["target"] = batch_df["target"].astype("int8")
+            batch_df["weight"] = batch_df["weight"].astype("float32")
+            for c in feature_cols:
+                batch_df[c] = batch_df[c].astype("float32")
 
             if split_by_time:
                 train_df = batch_df[batch_df["timestamp"] <= split_time]
@@ -1564,11 +1601,11 @@ class LightGBMRecommender:
             params = {
                 "objective": "binary",
                 "metric": "binary_logloss",
-                "learning_rate": 0.05,
-                "num_leaves": 31,
-                "max_depth": 6,
-                "min_data_in_leaf": 20,
-                "feature_fraction": 0.8,
+                "learning_rate": 0.02,
+                "num_leaves": 63,
+                "max_depth": 10,
+                "min_data_in_leaf": 50,
+                "feature_fraction": 0.6,
                 "bagging_fraction": 0.8,
                 "bagging_freq": 1,
                 "verbosity": 1,
