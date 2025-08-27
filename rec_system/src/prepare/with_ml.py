@@ -44,7 +44,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=1000):
+def load_train_data(max_parts=0, max_rows=1_000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -590,17 +590,11 @@ def build_copurchase_map(
     return final_copurchase
 
 
-def build_category_maps(
-    items_df,
-    categories_df,
-    save_dir="/home/root6/python/e_cup/rec_system/data/processed/",
-):
+def build_category_maps(items_df, categories_df):
     """
     Ускоренная версия: строим маппинги товаров и категорий и сохраняем в файлы.
     """
     log_message("Построение категорийных маппингов...")
-
-    os.makedirs(save_dir, exist_ok=True)
 
     # Товар -> категория
     item_to_cat = dict(zip(items_df["item_id"], items_df["catalogid"]))
@@ -622,16 +616,6 @@ def build_category_maps(
             if parent in cat_to_items:
                 all_items.update(cat_to_items[parent])
         extended_cat_to_items[cat_id] = np.array(list(all_items))
-
-    # ---- Сохраняем результаты ----
-    with open(os.path.join(save_dir, "item_to_cat.pkl"), "wb") as f:
-        pickle.dump(item_to_cat, f)
-
-    with open(os.path.join(save_dir, "extended_cat_to_items.pkl"), "wb") as f:
-        pickle.dump(extended_cat_to_items, f)
-
-    log_message(f"Сохранено: item_to_cat.pkl и extended_cat_to_items.pkl в {save_dir}")
-
     return item_to_cat, extended_cat_to_items
 
 
@@ -1285,8 +1269,6 @@ class LightGBMRecommender:
         # --- фиксируем признаки ---
         fixed_feature_keys = [
             "copurchase_count",
-            "category_id",
-            "items_in_category_count",
         ]
 
         user_feature_keys, item_feature_keys = [], []
@@ -1298,10 +1280,25 @@ class LightGBMRecommender:
         if item_features_dict:
             all_item_keys = set()
             for feats in item_features_dict.values():
-                all_item_keys.update(feats.keys())
+                if isinstance(feats, dict):
+                    all_item_keys.update(feats.keys())
+                elif isinstance(feats, np.ndarray):
+                    all_item_keys.update(
+                        [f"emb_{i}" for i in range(min(30, feats.shape[0]))]
+                    )
+                else:
+                    raise TypeError(f"Неожиданный тип признаков: {type(feats)}")
             item_feature_keys = [f"item_{k}" for k in sorted(all_item_keys)]
 
         feature_cols = fixed_feature_keys + user_feature_keys + item_feature_keys
+
+        # Сохраняем feature_columns для использования в обучении
+        self.feature_columns = feature_cols
+
+        log_message(f"Определены признаки: {feature_cols}")
+        log_message(
+            f"User features: {len(user_feature_keys)}, Item features: {len(item_feature_keys)}"
+        )
 
         # --- enrich_features ---
         def enrich_features(uid, item_id):
@@ -1311,22 +1308,34 @@ class LightGBMRecommender:
                 if copurchase_map and item_id in copurchase_map
                 else 0.0
             )
-            features["category_id"] = (
-                item_to_cat.get(item_id, -1) if item_to_cat else -1
-            )
-            features["items_in_category_count"] = (
-                len(cat_to_items.get(features["category_id"], []))
-                if cat_to_items
-                else 0
-            )
+
+            # user features
             user_feats = user_features_dict.get(uid, {}) if user_features_dict else {}
             for k, v in user_feats.items():
                 features[f"user_{k}"] = v
-            item_feats = (
+
+            # item features (унифицировано)
+            raw_item_feats = (
                 item_features_dict.get(item_id, {}) if item_features_dict else {}
             )
+            item_feats = normalize_item_feats(raw_item_feats, max_emb_dim=30)
+
             for k, v in item_feats.items():
-                features[f"item_{k}"] = v
+                if k.startswith("emb_"):
+                    idx = int(k.split("_")[1])
+                    if idx < 30:
+                        features[f"item_{k}"] = v
+                elif k.startswith("item_fclip_embed_"):
+                    features[f"item_{k}"] = v
+                elif k in [
+                    "item_item_count",
+                    "item_item_orders_count",
+                    "item_item_mean",
+                ]:
+                    features[f"item_{k}"] = np.log1p(v)
+                else:
+                    features[f"item_{k}"] = v
+
             return features
 
         # --- генерация train/val ---
@@ -1347,7 +1356,6 @@ class LightGBMRecommender:
                 mask = ~torch.isin(all_items_tensor, excluded_tensor)
                 available_items_tensor = all_items_tensor[mask]
 
-                # подгружаем реальные ts для пользователя
                 inter_user = []
                 for f in interactions_out_dir.glob("*.parquet"):
                     d = pd.read_parquet(
@@ -1361,7 +1369,6 @@ class LightGBMRecommender:
                         columns=["item_id", "timestamp", "weight"]
                     )
 
-                # позитивы и старые негативы
                 candidate_items = list(pos_items | neg_items_existing)
                 for it in candidate_items:
                     target = 1 if it in pos_items else 0
@@ -1379,7 +1386,6 @@ class LightGBMRecommender:
                     feature_values = [feats.get(c, 0) for c in feature_cols]
                     small_batch.append([uid, it, ts, target, weight] + feature_values)
 
-                # новые негативы
                 n_needed = max(
                     0, len(pos_items) * negatives_per_positive - len(neg_items_existing)
                 )
@@ -1409,7 +1415,6 @@ class LightGBMRecommender:
                             [uid, it, train_timestamp_fill, 0, 0.0] + feature_values
                         )
 
-                # --- запись батча ---
                 if len(small_batch) >= batch_size:
                     cols_order = [
                         "user_id",
@@ -1423,7 +1428,7 @@ class LightGBMRecommender:
                     if split_by_time:
                         train_df = batch_df[batch_df["timestamp"] <= split_time]
                         val_df = batch_df[batch_df["timestamp"] > split_time]
-                        if val_df.empty:  # fallback индексный сплит
+                        if val_df.empty:
                             idx_split = int(len(batch_df) * (1 - split))
                             train_df = batch_df.iloc[:idx_split]
                             val_df = batch_df.iloc[idx_split:]
@@ -1463,6 +1468,7 @@ class LightGBMRecommender:
                 "weight",
             ] + feature_cols
             batch_df = pd.DataFrame(small_batch, columns=cols_order)
+
             if split_by_time:
                 train_df = batch_df[batch_df["timestamp"] <= split_time]
                 val_df = batch_df[batch_df["timestamp"] > split_time]
@@ -1474,6 +1480,7 @@ class LightGBMRecommender:
                 idx_split = int(len(batch_df) * (1 - split))
                 train_df = batch_df.iloc[:idx_split]
                 val_df = batch_df.iloc[idx_split:]
+
             if not train_df.empty:
                 train_df = train_df.drop(columns=["timestamp"])
                 train_df.to_parquet(
@@ -1498,6 +1505,18 @@ class LightGBMRecommender:
             else:
                 counts = {}
             log_message(f"{name}: rows={len(df)}; target_counts={counts}")
+
+            # Дополнительно: проверяем наличие признаков
+            if hasattr(self, "feature_columns"):
+                missing_features = [
+                    f for f in self.feature_columns if f not in df.columns
+                ]
+                if missing_features:
+                    log_message(f"⚠️ В {name} отсутствуют признаки: {missing_features}")
+                else:
+                    log_message(
+                        f"✅ В {name} все признаки на месте: {len(self.feature_columns)} шт"
+                    )
 
         train_data = (
             pd.concat(train_data_batches, ignore_index=True)
@@ -1554,31 +1573,76 @@ class LightGBMRecommender:
                 "bagging_freq": 1,
                 "verbosity": 1,
                 "force_row_wise": True,
-                "device": "cpu",  # можно "cuda", но чет не запустилось :(
+                "device": "cpu",
                 "num_threads": 8,
                 "max_bin": 200,
                 "boosting": "gbdt",
             }
 
+        # КРИТИЧЕСКИ ВАЖНО: Проверяем, что признаки существуют
+        if not hasattr(self, "feature_columns") or not self.feature_columns:
+            log_message("❌ ОШИБКА: Нет признаков для обучения!")
+            log_message(
+                "Проверьте, что user_features_dict и item_features_dict не пустые"
+            )
+            return None
+
+        missing_features = [
+            f for f in self.feature_columns if f not in train_data.columns
+        ]
+        if missing_features:
+            log_message(
+                f"❌ ОШИБКА: В train_data отсутствуют признаки: {missing_features}"
+            )
+            log_message(f"Доступные колонки: {list(train_data.columns)}")
+            return None
+
         X_train = train_data[self.feature_columns]
         y_train = train_data["target"]
 
+        log_message(f"Размер train: {len(X_train)}")
+        log_message(f"Используемые признаки: {list(X_train.columns)}")
+        log_message(f"Пример данных: {X_train.iloc[0].to_dict()}")
+
+        # Явно указываем категориальные признаки
+        categorical_features = []
+        for col in X_train.columns:
+            if col in ["user_id", "item_id"] or col.startswith(("user_", "item_")):
+                categorical_features.append(col)
+
+        log_message(f"Категориальные признаки: {categorical_features}")
+
         train_dataset = lgb.Dataset(
-            X_train, label=y_train, feature_name=list(X_train.columns)
+            X_train,
+            label=y_train,
+            categorical_feature=categorical_features,
+            feature_name=list(X_train.columns),
         )
 
         valid_sets = [train_dataset]
         valid_names = ["train"]
 
         if val_data is not None:
+            # Проверяем признаки в validation
+            missing_val_features = [
+                f for f in self.feature_columns if f not in val_data.columns
+            ]
+            if missing_val_features:
+                log_message(
+                    f"❌ ОШИБКА: В val_data отсутствуют признаки: {missing_val_features}"
+                )
+                return None
+
             X_val = val_data[self.feature_columns]
             y_val = val_data["target"]
-            val_dataset = lgb.Dataset(X_val, label=y_val, reference=train_dataset)
+            val_dataset = lgb.Dataset(
+                X_val,
+                label=y_val,
+                categorical_feature=categorical_features,
+                reference=train_dataset,
+            )
             valid_sets.append(val_dataset)
             valid_names.append("valid")
-
-        log_message(f"Размер train: {len(X_train)}")
-        if val_data is not None:
             log_message(f"Размер val: {len(X_val)}")
 
         # Callback для логирования
@@ -1590,23 +1654,29 @@ class LightGBMRecommender:
                         for name, metric, val, _ in env.evaluation_result_list
                     ]
                 )
-                print(f"[Iter {env.iteration}] {metrics}")
+                log_message(f"[Iter {env.iteration}] {metrics}")
 
-        self.model = lgb.train(
-            params,
-            train_dataset,
-            num_boost_round=1000,
-            valid_sets=valid_sets,
-            valid_names=valid_names,
-            callbacks=[lgb.early_stopping(50), log_every_N_iter],
-        )
+        try:
+            self.model = lgb.train(
+                params,
+                train_dataset,
+                num_boost_round=1000,
+                valid_sets=valid_sets,
+                valid_names=valid_names,
+                callbacks=[lgb.early_stopping(50), log_every_N_iter],
+            )
 
-        # Вычисляем NDCG@100 на валидации сразу после обучения
-        if val_data is not None:
-            ndcg_val = self.evaluate(val_data)
-            log_message(f"NDCG@100 на валидации: {ndcg_val:.4f}")
+            # Вычисляем NDCG@100 на валидации
+            if val_data is not None:
+                ndcg_val = self.evaluate(val_data)
+                log_message(f"NDCG@100 на валидации: {ndcg_val:.4f}")
 
-        return self.model
+            return self.model
+
+        except Exception as e:
+            log_message(f"❌ ОШИБКА при обучении LightGBM: {e}")
+            log_message("Проверьте параметры и данные")
+            return None
 
     def evaluate(self, data, k=100):
         """Оценка модели через NDCG@k"""
@@ -1633,13 +1703,37 @@ class LightGBMRecommender:
         }
         return recommendations
 
+    def debug_data_info(self, data, name="data"):
+        """Выводит детальную информацию о данных"""
+        if data is None or data.empty:
+            log_message(f"{name}: Пусто")
+            return
 
-def build_user_features_dict(
-    interactions_files,
-    orders_df,
-    device="cuda",
-    save_path="/home/root6/python/e_cup/rec_system/data/processed/user_features_dict.pkl",
-):
+        log_message(f"=== ДЕБАГ ИНФОРМАЦИЯ: {name} ===")
+        log_message(f"Размер: {len(data)} строк")
+        log_message(f"Колонки: {list(data.columns)}")
+
+        if hasattr(self, "feature_columns"):
+            missing = [f for f in self.feature_columns if f not in data.columns]
+            if missing:
+                log_message(f"❌ Отсутствуют признаки: {missing}")
+            else:
+                log_message(f"✅ Все признаки присутствуют")
+
+        # Статистика по целевой переменной
+        if "target" in data.columns:
+            target_counts = data["target"].value_counts()
+            log_message(f"Целевая переменная: {dict(target_counts)}")
+
+        # Пример первых нескольких строк
+        if len(data) > 0:
+            log_message("Пример первой строки:")
+            for col in data.columns:
+                if col in data.columns:
+                    log_message(f"  {col}: {data[col].iloc[0]}")
+
+
+def build_user_features_dict(interactions_files, orders_df, device="cuda"):
     """
     Оптимизированная версия с использованием Polars
     """
@@ -1721,10 +1815,6 @@ def build_user_features_dict(
             "user_orders_count": row["user_orders_count"],
         }
 
-    # 6. СОХРАНЕНИЕ В PICKLE
-    with open(save_path, "wb") as f:
-        pickle.dump(user_stats_dict, f)
-
     log_message(
         f"Словарь пользовательских признаков построен и сохранён в {save_path}. Записей: {len(user_stats_dict)}"
     )
@@ -1753,7 +1843,7 @@ def build_item_features_dict(
     interactions_files, items_df, orders_df, embeddings_dict, device="cuda"
 ):
     """
-    Оптимизированная версия с использованием Polars + сохранение словаря item_features_dict.pkl
+    Оптимизированная версия с использованием Polars
     """
     log_message("Построение словаря товарных признаков...")
 
@@ -1846,15 +1936,6 @@ def build_item_features_dict(
                 item_stats_dict[item_id][f"fclip_embed_{i}"] = float(embedding[i])
 
     log_message(f"Словарь товарных признаков построен. Записей: {len(item_stats_dict)}")
-
-    # 8. СОХРАНЕНИЕ В PKL
-    output_path = (
-        "/home/root6/python/e_cup/rec_system/data/processed/item_features_dict.pkl"
-    )
-    with open(output_path, "wb") as f:
-        pickle.dump(item_stats_dict, f)
-
-    log_message(f"Словарь сохранён в {output_path}")
     return item_stats_dict
 
 
@@ -2035,6 +2116,55 @@ def load_streaming_data(path_pattern: str) -> pd.DataFrame:
     return pd.concat(dfs, ignore_index=True)
 
 
+def normalize_item_features_dict(item_features_dict, embed_prefix="fclip_embed_"):
+    """
+    Приводит словарь item_features_dict к формату {item_id: np.array([...])},
+    где вектор = [обычные фичи + эмбеддинги].
+    """
+    normalized = {}
+
+    # Определим порядок ключей (фиксируем для стабильности)
+    example_dict = next(iter(item_features_dict.values()))
+    base_keys = [k for k in example_dict.keys() if not k.startswith(embed_prefix)]
+    embed_keys = sorted(
+        [k for k in example_dict.keys() if k.startswith(embed_prefix)],
+        key=lambda x: int(x.replace(embed_prefix, "")),
+    )
+
+    feature_order = base_keys + embed_keys
+
+    for item_id, feats in item_features_dict.items():
+        row = []
+        for key in feature_order:
+            val = feats.get(key, 0.0)  # если ключа нет — ставим 0
+            # Категориальные можно закодировать, пока просто оставим как есть
+            if val is None:
+                val = 0.0
+            row.append(val)
+        normalized[item_id] = np.array(row, dtype=np.float32)
+
+    return normalized, feature_order
+
+
+def normalize_item_feats(item_feats, max_emb_dim=30):
+    """
+    Приводит фичи айтема к словарю (dict).
+    Поддерживает dict и np.ndarray.
+    """
+    norm_feats = {}
+
+    if isinstance(item_feats, dict):
+        for k, v in item_feats.items():
+            if isinstance(v, (int, float, np.number)):
+                norm_feats[k] = float(v)
+    elif isinstance(item_feats, np.ndarray):
+        for i, v in enumerate(item_feats):
+            if i < max_emb_dim:
+                norm_feats[f"emb_{i}"] = float(v)
+
+    return norm_feats
+
+
 # -------------------- Основной запуск --------------------
 if __name__ == "__main__":
     start_time = time.time()
@@ -2093,6 +2223,15 @@ if __name__ == "__main__":
         stage_start = time.time()
         log_message("=== ЗАГРУЗКА ЭМБЕДДИНГОВ ===")
         embeddings_dict = load_and_process_embeddings(items_ddf)
+        save_path = (
+            "/home/root6/python/e_cup/rec_system/data/processed/embeddings_dict.pkl"
+        )
+        with open(save_path, "wb") as f:
+            pickle.dump(embeddings_dict, f)
+        log_message(
+            f"Пример ключей в embeddings_dict: {list(embeddings_dict.keys())[:5]}"
+        )
+        log_message(f"Пример значения: {next(iter(embeddings_dict.values()))[:5]}")
         stage_time = time.time() - stage_start
         log_message(
             f"Загрузка эмбеддингов завершена за {timedelta(seconds=stage_time)}"
@@ -2163,12 +2302,25 @@ if __name__ == "__main__":
 
         # Строим co-purchase map
         copurchase_map = build_copurchase_map(train_orders_df)
+        save_path = (
+            "/home/root6/python/e_cup/rec_system/data/processed/copurchase_map.pkl"
+        )
+        with open(save_path, "wb") as f:
+            pickle.dump(copurchase_map, f)
         log_message(f"Co-purchase map построен: {len(copurchase_map)} товаров")
 
         # Строим категорийные маппинги
         items_df = items_ddf.compute()
         categories_df = categories_ddf.compute()
         item_to_cat, cat_to_items = build_category_maps(items_df, categories_df)
+        save_path = "/home/root6/python/e_cup/rec_system/data/processed/item_to_cat.pkl"
+        with open(save_path, "wb") as f:
+            pickle.dump(item_to_cat, f)
+        save_path = (
+            "/home/root6/python/e_cup/rec_system/data/processed/cat_to_items.pkl"
+        )
+        with open(save_path, "wb") as f:
+            pickle.dump(cat_to_items, f)
         log_message(
             f"Категорийные маппинги построены: {len(item_to_cat)} товаров, {len(cat_to_items)} категорий"
         )
@@ -2185,6 +2337,11 @@ if __name__ == "__main__":
         # User features
         user_start = time.time()
         user_features_dict = build_user_features_dict(interactions_files, orders_ddf)
+        save_path = (
+            "/home/root6/python/e_cup/rec_system/data/processed/user_features_dict.pkl"
+        )
+        with open(save_path, "wb") as f:
+            pickle.dump(user_features_dict, f)
         user_time = time.time() - user_start
         log_message(
             f"User features построены за {timedelta(seconds=user_time)}: {len(user_features_dict)} пользователей"
@@ -2192,18 +2349,45 @@ if __name__ == "__main__":
 
         # Item features
         item_start = time.time()
-        item_features_dict = build_item_features_dict(
+        raw_item_features_dict = build_item_features_dict(
             interactions_files, items_df, orders_ddf, embeddings_dict
         )
-        item_time = time.time() - item_start
-        log_message(
-            f"Item features построены за {timedelta(seconds=item_time)}: {len(item_features_dict)} товаров"
+
+        # Преобразуем словари в np.array
+        item_features_dict, feature_order = normalize_item_features_dict(
+            raw_item_features_dict
         )
 
-        stage_time = time.time() - stage_start
+        # Логируем пример
         log_message(
-            f"Предварительный расчет признаков завершен за {timedelta(seconds=stage_time)}"
+            f"Item features: {len(item_features_dict)} товаров, размер вектора: {len(feature_order)} признаков"
         )
+        log_message(
+            f"Порядок признаков: {feature_order[:10]}{'...' if len(feature_order)>10 else ''}"
+        )
+
+        sample_items = list(item_features_dict.items())[:5]
+        for k, v in sample_items:
+            log_message(
+                f"item_features_dict[{k}] type={type(v)}, shape={v.shape}, example={v[:5]}"
+            )
+
+        # Сохраняем
+        save_path = (
+            "/home/root6/python/e_cup/rec_system/data/processed/item_features_dict.pkl"
+        )
+        with open(save_path, "wb") as f:
+            pickle.dump(item_features_dict, f)
+
+        # Отдельно сохраняем порядок признаков (важно для инференса)
+        save_path = (
+            "/home/root6/python/e_cup/rec_system/data/processed/item_feature_order.pkl"
+        )
+        with open(save_path, "wb") as f:
+            pickle.dump(feature_order, f)
+
+        item_time = time.time() - item_start
+        log_message(f"Item features построены за {timedelta(seconds=item_time)}")
 
         # === ПОДГОТОВКА ДАННЫХ ДЛЯ LightGBM ===
         stage_start = time.time()
@@ -2289,18 +2473,23 @@ if __name__ == "__main__":
         log_message("--- ПРОВЕРКА ITEM FEATURES ---")
         if item_features_dict:
             sample_item = list(item_features_dict.keys())[0]
-            item_feats = item_features_dict[sample_item]
+            raw_item_feats = item_features_dict[sample_item]
+
+            # нормализуем (превращаем np.ndarray → dict)
+            item_feats = normalize_item_feats(raw_item_feats, max_emb_dim=30)
+
             log_message(f"Пример item features для товара {sample_item}:")
             for feat, value in item_feats.items():
                 log_message(f"  {feat}: {value}")
 
             # Статистика по item features
             items_with_features = len(item_features_dict)
-            items_with_real_features = sum(
-                1
-                for feats in item_features_dict.values()
-                if any(v != 0 for v in feats.values())
-            )
+            items_with_real_features = 0
+            for feats in item_features_dict.values():
+                norm_feats = normalize_item_feats(feats, max_emb_dim=30)
+                if any(v != 0 for v in norm_feats.values()):
+                    items_with_real_features += 1
+
             log_message(f"Товаров с features: {items_with_features}")
             log_message(f"Товаров с НЕнулевыми features: {items_with_real_features}")
         else:
@@ -2358,7 +2547,26 @@ if __name__ == "__main__":
             "rec_system/data/processed/val_streaming/*.parquet"
         )
 
-        model = recommender.train(train_df, val_df)
+        # Проверяем данные
+        recommender.debug_data_info(train_df, "TRAIN")
+        recommender.debug_data_info(val_df, "VAL")
+
+        # Проверяем признаки
+        if hasattr(recommender, "feature_columns"):
+            log_message(f"Feature columns: {recommender.feature_columns}")
+        else:
+            log_message("❌ Feature columns не определены!")
+
+        if (
+            not train_data.empty
+            and hasattr(recommender, "feature_columns")
+            and recommender.feature_columns
+        ):
+            model = recommender.train(train_df, val_df)
+        else:
+            log_message("❌ Нельзя обучать: нет данных или признаков")
+
+        # model = recommender.train(train_df, val_df)
 
         stage_time = time.time() - stage_start
         log_message(f"Обучение LightGBM завершено за {timedelta(seconds=stage_time)}")
