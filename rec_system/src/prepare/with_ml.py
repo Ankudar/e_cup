@@ -485,7 +485,7 @@ def build_copurchase_map(
     min_co_items=2,
     top_n=10,
     device="cuda",
-    max_items=1000,
+    max_items=500,
     output_dir="/home/root6/python/e_cup/rec_system/data/processed/",
 ):
     """
@@ -999,21 +999,20 @@ class LightGBMRecommender:
         self, data: pd.DataFrame, train_only_data: pd.DataFrame = None
     ) -> pd.DataFrame:
         """Добавление расширенных фич с предотвращением утечки данных."""
-
         log_message("Добавление богатых признаков...")
 
         # Временные фичи
         if "timestamp" in data.columns:
             try:
-                data["is_weekend"] = data["timestamp"].dt.dayofweek >= 5
-                data["hour"] = data["timestamp"].dt.hour
+                data["is_weekend"] = (data["timestamp"].dt.dayofweek >= 5).astype(int)
+                data["hour"] = data["timestamp"].dt.hour.fillna(0)
             except Exception as e:
                 log_message(f"Не удалось преобразовать timestamp: {e}")
                 data["is_weekend"] = 0
-                data["hour"] = -1
+                data["hour"] = 0
         else:
-            data["is_weekend"] = np.nan
-            data["hour"] = np.nan
+            data["is_weekend"] = 0
+            data["hour"] = 0
 
         # Если train_only_data не передан, берём подмножество data
         if train_only_data is None or train_only_data.empty:
@@ -1027,15 +1026,10 @@ class LightGBMRecommender:
                 .rename("item_popularity")
                 .reset_index()
             )
-            # Проверяем, что item_pop не пустой
             if not item_pop.empty:
                 data = data.merge(item_pop, on="item_id", how="left")
 
-        # Создаем колонку если ее нет или заполняем нулями
-        if "item_popularity" not in data.columns:
-            data["item_popularity"] = 0
-        else:
-            data["item_popularity"] = data["item_popularity"].fillna(0)
+        data["item_popularity"] = data.get("item_popularity", 0).fillna(0)
 
         # --- Популярность категории ---
         if "category_id" in data.columns:
@@ -1048,11 +1042,7 @@ class LightGBMRecommender:
                 )
                 if not cat_pop.empty:
                     data = data.merge(cat_pop, on="category_id", how="left")
-
-            if "category_popularity" not in data.columns:
-                data["category_popularity"] = 0
-            else:
-                data["category_popularity"] = data["category_popularity"].fillna(0)
+            data["category_popularity"] = data.get("category_popularity", 0).fillna(0)
         else:
             data["category_popularity"] = 0
 
@@ -1066,11 +1056,7 @@ class LightGBMRecommender:
             )
             if not user_activity.empty:
                 data = data.merge(user_activity, on="user_id", how="left")
-
-        if "user_activity" not in data.columns:
-            data["user_activity"] = 0
-        else:
-            data["user_activity"] = data["user_activity"].fillna(0)
+        data["user_activity"] = data.get("user_activity", 0).fillna(0)
 
         # --- Средняя популярность товаров у пользователя ---
         if not train_only_data.empty and "item_popularity" in data.columns:
@@ -1079,7 +1065,6 @@ class LightGBMRecommender:
                 if not item_pop.empty
                 else train_only_data.copy()
             )
-
             if "item_popularity" in train_with_pop.columns:
                 train_with_pop["item_popularity"] = train_with_pop[
                     "item_popularity"
@@ -1092,13 +1077,9 @@ class LightGBMRecommender:
                 )
                 if not user_avg_pop.empty:
                     data = data.merge(user_avg_pop, on="user_id", how="left")
-
-        if "user_avg_item_popularity" not in data.columns:
-            data["user_avg_item_popularity"] = 0
-        else:
-            data["user_avg_item_popularity"] = data["user_avg_item_popularity"].fillna(
-                0
-            )
+        data["user_avg_item_popularity"] = data.get(
+            "user_avg_item_popularity", 0
+        ).fillna(0)
 
         # --- Ковизитация ---
         if (
@@ -1106,66 +1087,45 @@ class LightGBMRecommender:
             and self.covisitation_matrix is not None
         ):
             data["covisitation_score"] = (
-                data["item_id"]
-                .map(self.covisitation_matrix.get, na_action="ignore")
-                .fillna(0)
+                data["item_id"].map(self.covisitation_matrix.get).fillna(0)
             )
         else:
             data["covisitation_score"] = 0
 
         # --- FCLIP эмбеддинги ---
         if getattr(self, "external_embeddings_dict", None):
-            log_message("Ускоренная обработка FCLIP эмбеддингов на GPU...")
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             all_item_ids = list(self.external_embeddings_dict.keys())
             embedding_dim = len(next(iter(self.external_embeddings_dict.values())))
             n_fclip_dims = min(10, embedding_dim)
-
-            embeddings_tensor = torch.zeros(
-                len(all_item_ids), embedding_dim, device=device
+            embeddings_tensor = torch.tensor(
+                [self.external_embeddings_dict[i] for i in all_item_ids],
+                dtype=torch.float32,
+                device=device,
             )
-            for idx, item_id in enumerate(all_item_ids):
-                embeddings_tensor[idx] = torch.tensor(
-                    self.external_embeddings_dict[item_id],
-                    device=device,
-                    dtype=torch.float32,
-                )
-
             item_id_to_idx = {item_id: idx for idx, item_id in enumerate(all_item_ids)}
             batch_size = 100_000
             total_rows = len(data)
-
             for i in range(n_fclip_dims):
-                log_message(f"Обработка FCLIP измерения {i+1}/{n_fclip_dims} на GPU...")
                 data[f"fclip_embed_{i}"] = 0.0
-
                 for start_idx in range(0, total_rows, batch_size):
                     end_idx = min(start_idx + batch_size, total_rows)
-                    batch_data = data.iloc[start_idx:end_idx]
-                    batch_item_ids = batch_data["item_id"].values
+                    batch_item_ids = data.iloc[start_idx:end_idx]["item_id"].values
                     valid_mask = np.array(
-                        [item_id in item_id_to_idx for item_id in batch_item_ids]
+                        [item in item_id_to_idx for item in batch_item_ids]
                     )
                     valid_indices = np.where(valid_mask)[0]
                     valid_item_ids = batch_item_ids[valid_mask]
-
-                    if len(valid_item_ids) > 0:
+                    if len(valid_item_ids):
                         tensor_indices = torch.tensor(
-                            [item_id_to_idx[item_id] for item_id in valid_item_ids],
+                            [item_id_to_idx[item] for item in valid_item_ids],
                             device=device,
                         )
-                        batch_embeddings = (
-                            embeddings_tensor[tensor_indices, i].cpu().numpy()
-                        )
+                        batch_emb = embeddings_tensor[tensor_indices, i].cpu().numpy()
                         data.iloc[
                             start_idx + valid_indices,
                             data.columns.get_loc(f"fclip_embed_{i}"),
-                        ] = batch_embeddings
-
-                    del batch_data, batch_item_ids
-                    if start_idx % (batch_size * 5) == 0:
-                        torch.cuda.empty_cache()
-
+                        ] = batch_emb
             del embeddings_tensor, item_id_to_idx
             torch.cuda.empty_cache()
 
@@ -1193,7 +1153,6 @@ class LightGBMRecommender:
 
         return data
 
-
     def prepare_training_data(
         self,
         interactions_files,
@@ -1203,88 +1162,95 @@ class LightGBMRecommender:
         popularity_s,
         recent_items_map,
         sample_fraction=0.1,
-        negatives_per_positive=1,
-        ui_features_dir=None,
-        val_days: int = 3,
+        negatives_per_positive=3,
+        val_days: int = 7,
     ):
-
         log_message("Подготовка данных для LightGBM (streaming)...")
 
-        # Берём fraction каждой партиции
+        # --- sample fraction по партициям ---
         orders_ddf = orders_ddf.map_partitions(
             lambda df: df.sample(frac=sample_fraction, random_state=42)
         )
 
         base_dir = Path("/home/root6/python/e_cup/rec_system/data/processed/")
         base_dir.mkdir(parents=True, exist_ok=True)
-        train_path = base_dir / "train.parquet"
-        val_path = base_dir / "val.parquet"
-        interactions_parquet_path = base_dir / "interactions_streaming.parquet"
 
-        batch_size = 50_000  # регулируем по памяти
+        interactions_out_dir = base_dir / "interactions_streaming"
+        train_out_dir = base_dir / "train_streaming"
+        val_out_dir = base_dir / "val_streaming"
 
-        # --- Streaming загрузка interactions ---
-        interactions_writer = None
+        for p in [interactions_out_dir, train_out_dir, val_out_dir]:
+            p.mkdir(parents=True, exist_ok=True)
 
+        batch_size = 500_000
+        file_idx = 0
+
+        # --- streaming запись interactions ---
         def write_interactions_batch(batch_list):
-            nonlocal interactions_writer
+            nonlocal file_idx
             if not batch_list:
                 return
             batch_df = pd.DataFrame(
                 batch_list, columns=["user_id", "item_id", "timestamp", "weight"]
             )
-            table = pa.Table.from_pandas(batch_df, preserve_index=False)
-            if interactions_writer is None:
-                interactions_writer = pq.ParquetWriter(
-                    interactions_parquet_path, schema=table.schema
-                )
-            interactions_writer.write_table(table)
+            out_path = interactions_out_dir / f"part_{file_idx:05d}.parquet"
+            batch_df.to_parquet(out_path, index=False, engine="pyarrow")
+            file_idx += 1
             batch_list.clear()
 
         interactions_batch = []
         for f in tqdm(interactions_files, desc="Загрузка interactions"):
-            df = pd.read_parquet(f, columns=["user_id","item_id","timestamp","weight"])
+            df = pd.read_parquet(
+                f, columns=["user_id", "item_id", "timestamp", "weight"]
+            )
             df["user_id"] = df["user_id"].astype("int64")
             df["item_id"] = df["item_id"].astype("int64")
             df["timestamp"] = pd.to_datetime(df["timestamp"])
-            
-            # делим на батчи вручную
+
             for start in range(0, len(df), batch_size):
-                batch = df.iloc[start:start+batch_size]
+                batch = df.iloc[start : start + batch_size]
                 interactions_batch.extend(batch.values.tolist())
                 if len(interactions_batch) >= batch_size:
                     write_interactions_batch(interactions_batch)
-
         if interactions_batch:
             write_interactions_batch(interactions_batch)
-        if interactions_writer:
-            interactions_writer.close()
 
-        # --- Загружаем interactions обратно для split ---
-        interactions_df = pd.read_parquet(interactions_parquet_path)
-        max_timestamp = interactions_df["timestamp"].max()
+        # --- split_time ---
+        max_timestamp = max(
+            pd.read_parquet(f, columns=["timestamp"])["timestamp"].max()
+            for f in interactions_out_dir.glob("*.parquet")
+        )
         split_time = max_timestamp - pd.Timedelta(days=val_days)
         train_timestamp_fill = split_time - pd.Timedelta(seconds=1)
 
-        interactions_train = interactions_df[interactions_df["timestamp"] <= split_time]
-        user_interacted_items_train = {
-            uid: set(gr["item_id"].unique())
-            for uid, gr in interactions_train.groupby("user_id")
-        }
+        # --- строим user_interacted_items_train ---
+        user_interacted_items_train = {}
+        for f in tqdm(
+            sorted(interactions_out_dir.glob("*.parquet")), desc="User history build"
+        ):
+            df = pd.read_parquet(f, columns=["user_id", "item_id", "timestamp"])
+            train_df = df[df["timestamp"] <= split_time]
+            for uid, gr in train_df.groupby("user_id"):
+                user_interacted_items_train.setdefault(uid, set()).update(
+                    gr["item_id"].unique()
+                )
+            del df, train_df
+            gc.collect()
 
+        # --- подготовка для негативов ---
         all_items = np.array(list(item_map.keys()), dtype=np.int64)
         popular_items_set = set(popularity_s.nlargest(10000).index.astype(np.int64))
         all_items_tensor = torch.tensor(all_items, device="cuda")
         popular_items_tensor = torch.tensor(list(popular_items_set), device="cuda")
 
-        cols_order = ["user_id", "item_id", "timestamp", "target"]
-
-        # --- ParquetWriter для train/val ---
-        writer_train = None
-        writer_val = None
+        cols_order = ["user_id", "item_id", "timestamp", "target", "weight"]
+        train_file_idx = 0
+        val_file_idx = 0
+        train_data_batches = []
+        val_data_batches = []
 
         def write_small_batch(batch_list):
-            nonlocal writer_train, writer_val
+            nonlocal train_file_idx, val_file_idx
             if not batch_list:
                 return
             batch_df = pd.DataFrame(batch_list, columns=cols_order)
@@ -1292,18 +1258,20 @@ class LightGBMRecommender:
             val_df = batch_df[batch_df["timestamp"] > split_time]
 
             if not train_df.empty:
-                table_train = pa.Table.from_pandas(train_df, preserve_index=False)
-                if writer_train is None:
-                    writer_train = pq.ParquetWriter(train_path, schema=table_train.schema)
-                writer_train.write_table(table_train)
+                out_path = train_out_dir / f"part_{train_file_idx:05d}.parquet"
+                train_df.to_parquet(out_path, index=False, engine="pyarrow")
+                train_data_batches.append(train_df)
+                train_file_idx += 1
 
             if not val_df.empty:
-                table_val = pa.Table.from_pandas(val_df, preserve_index=False)
-                if writer_val is None:
-                    writer_val = pq.ParquetWriter(val_path, schema=table_val.schema)
-                writer_val.write_table(table_val)
+                out_path = val_out_dir / f"part_{val_file_idx:05d}.parquet"
+                val_df.to_parquet(out_path, index=False, engine="pyarrow")
+                val_data_batches.append(val_df)
+                val_file_idx += 1
 
-        # --- Генерация train/val из orders ---
+            batch_list.clear()
+
+        # --- генерация train/val ---
         small_batch = []
         for part_idx, part in enumerate(
             tqdm(orders_ddf.to_delayed(), desc="Streaming генерация партиций")
@@ -1323,129 +1291,74 @@ class LightGBMRecommender:
                 mask = ~torch.isin(all_items_tensor, excluded_tensor)
                 available_items_tensor = all_items_tensor[mask]
 
-                # Позитивы
+                # --- позитивы: берем weight из interactions ---
+                interactions_user = pd.concat(
+                    [pd.read_parquet(f) for f in interactions_out_dir.glob("*.parquet")]
+                )
+                interactions_user = interactions_user[
+                    interactions_user["user_id"] == uid
+                ]
+                interactions_user = interactions_user.set_index("item_id")[
+                    "weight"
+                ].to_dict()
+
                 for it in pos_items:
-                    small_batch.append([uid, it, train_timestamp_fill, 1])
-                # Существующие негативы
+                    w = interactions_user.get(it, 1.0)  # на всякий случай дефолт 1
+                    small_batch.append([uid, it, train_timestamp_fill, 1, w])
+
+                # существующие негативы: weight=0
                 for it in neg_items_existing:
-                    small_batch.append([uid, it, train_timestamp_fill, 0])
-                # Доп.негативы
+                    small_batch.append([uid, it, train_timestamp_fill, 0, 0.0])
+
+                # доп. негативы: weight=0
                 n_needed = max(
                     0, len(pos_items) * negatives_per_positive - len(neg_items_existing)
                 )
                 if n_needed > 0 and len(available_items_tensor) > 0:
-                    popular_mask = torch.isin(available_items_tensor, popular_items_tensor)
+                    popular_mask = torch.isin(
+                        available_items_tensor, popular_items_tensor
+                    )
                     popular_candidates = available_items_tensor[popular_mask]
                     random_candidates = available_items_tensor[~popular_mask]
 
                     n_popular = min(n_needed // 2, len(popular_candidates))
                     n_random = min(n_needed - n_popular, len(random_candidates))
                     sampled_items = []
+
                     if n_popular > 0:
                         perm = torch.randperm(len(popular_candidates), device="cuda")
-                        sampled_items.extend(popular_candidates[perm[:n_popular]].tolist())
+                        sampled_items.extend(
+                            popular_candidates[perm[:n_popular]].tolist()
+                        )
                     if n_random > 0:
                         perm = torch.randperm(len(random_candidates), device="cuda")
-                        sampled_items.extend(random_candidates[perm[:n_random]].tolist())
-                    for it in sampled_items:
-                        small_batch.append([uid, it, train_timestamp_fill, 0])
+                        sampled_items.extend(
+                            random_candidates[perm[:n_random]].tolist()
+                        )
 
-                # --- Пишем батч ---
+                    for it in sampled_items:
+                        small_batch.append([uid, it, train_timestamp_fill, 0, 0.0])
+
                 if len(small_batch) >= batch_size:
                     write_small_batch(small_batch)
-                    small_batch = []
 
-        # Остатки
         if small_batch:
             write_small_batch(small_batch)
-        if writer_train:
-            writer_train.close()
-        if writer_val:
-            writer_val.close()
-        else:
-            pd.DataFrame(columns=cols_order).to_parquet(
-                val_path, index=False, engine="pyarrow"
-            )
 
-        # --- Загружаем train/val ---
-        train_data = pd.read_parquet(train_path)
-        val_data = pd.read_parquet(val_path)
-        if len(val_data) == 0:
-            cutoff = int(len(train_data) * 0.9)
-            train_data, val_data = (
-                train_data.iloc[:cutoff].copy(),
-                train_data.iloc[cutoff:].copy(),
-            )
-
-        # --- Ковизитация и фичи ---
-        self._train_covisitation_matrix(train_data)
-        log_message("Добавление фичей для train...")
-        train_data = self._add_rich_features(train_data, train_only_data=train_data)
-        log_message("Добавление фичей для val...")
-        val_data = self._add_rich_features(val_data, train_only_data=train_data)
-
-        if ui_features_dir and os.path.exists(ui_features_dir):
-            train_data, val_data = self._add_ui_features_optimized(
-                train_data, val_data, ui_features_dir
-            )
-
-        # --- Лог ---
+        # --- логирование ---
         def log_message_dist(df, name):
             counts = df["target"].value_counts(dropna=False).to_dict()
             log_message(f"{name}: rows={len(df)}; target_counts={counts}")
 
+        train_data = pd.concat(train_data_batches, ignore_index=True)
+        val_data = pd.concat(val_data_batches, ignore_index=True)
+
         log_message_dist(train_data, "TRAIN")
         log_message_dist(val_data, "VAL")
         log_message(f"split_time = {split_time} (val_days={val_days})")
-        log_message(f"✅ Данные подготовлены: train={len(train_data)}, val={len(val_data)}")
-
-        return train_data, val_data
-
-    # Добавляем оптимизированный метод для UI фич
-    def _add_ui_features_optimized(self, train_data, val_data, ui_features_dir):
-        """Оптимизированное добавление UI фич"""
-        try:
-            # Объединяем данные для batch processing
-            all_data = pd.concat(
-                [train_data[["user_id", "item_id"]], val_data[["user_id", "item_id"]]],
-                ignore_index=True,
-            )
-
-            ui_features_batch = get_ui_features_batch(
-                all_data.to_dict("records"), ui_features_dir
-            )
-
-            if ui_features_batch:
-                ui_features_df = pd.DataFrame(ui_features_batch)
-                ui_features_df["user_id"] = ui_features_df["user_id"].astype("int64")
-                ui_features_df["item_id"] = ui_features_df["item_id"].astype("int64")
-
-                # Убираем дубликаты
-                ui_features_df = ui_features_df.drop_duplicates(
-                    subset=["user_id", "item_id"]
-                )
-
-                # Объединяем с train и val
-                train_data = train_data.merge(
-                    ui_features_df, on=["user_id", "item_id"], how="left"
-                ).fillna(0)
-                val_data = val_data.merge(
-                    ui_features_df, on=["user_id", "item_id"], how="left"
-                ).fillna(0)
-
-                # Обновляем feature_columns
-                new_features = [
-                    col
-                    for col in ui_features_df.columns
-                    if col not in ["user_id", "item_id"]
-                    and col not in self.feature_columns
-                ]
-                self.feature_columns.extend(new_features)
-
-                log_message(f"Добавлены UI признаки: {new_features}")
-
-        except Exception as e:
-            log_message(f"Ошибка загрузки UI-признаков: {e}")
+        log_message(
+            f"✅ Данные подготовлены: train={len(train_data)}, val={len(val_data)}"
+        )
 
         return train_data, val_data
 
@@ -1572,10 +1485,6 @@ def build_user_features_dict(
     """
     Оптимизированная версия с использованием Polars
     """
-    import pickle
-
-    import polars as pl
-
     log_message("Построение словаря пользовательских признаков...")
 
     # 1. АГРЕГАЦИЯ ПО ТРЕКЕРУ (взаимодействия)
@@ -1710,10 +1619,6 @@ def build_item_features_dict(
     """
     Оптимизированная версия с использованием Polars + сохранение словаря item_features_dict.pkl
     """
-    import pickle
-
-    import polars as pl
-
     log_message("Построение словаря товарных признаков...")
 
     # 1. АГРЕГАЦИЯ ПО ТРЕКЕРУ И ЗАКАЗАМ
@@ -1829,203 +1734,6 @@ def build_item_features_dict(
 
     log_message(f"Словарь сохранён в {output_path}")
     return item_stats_dict
-
-
-def get_ui_features_for_user_item(user_id, item_id, ui_features_dir):
-    """
-    Ищет UI-признаки для пары user-item по всем файлам
-    """
-    try:
-        metadata_path = os.path.join(ui_features_dir, "metadata.json")
-        if not os.path.exists(metadata_path):
-            return None
-
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
-
-        # Ищем в каждом файле
-        for ui_file in metadata["ui_feature_files"]:
-            if not os.path.exists(ui_file):
-                continue
-
-            result = (
-                pl.scan_parquet(ui_file)
-                .filter((pl.col("user_id") == user_id) & (pl.col("item_id") == item_id))
-                .collect()
-            )
-
-            if not result.is_empty():
-                return result[0].to_dict()
-
-        return None
-
-    except Exception as e:
-        log_message(f"Ошибка поиска UI-признаков: {e}")
-        return None
-
-
-def get_ui_features_batch(user_item_pairs, ui_features_dir, batch_size=1000):
-    """
-    Получает UI-признаки для батча пар из всех файлов
-    """
-    try:
-
-        metadata_path = os.path.join(ui_features_dir, "metadata.json")
-        if not os.path.exists(metadata_path):
-            return []
-
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
-
-        all_results = []
-
-        # Обрабатываем каждый файл UI-признаков
-        for ui_file in metadata["ui_feature_files"]:
-            if not os.path.exists(ui_file):
-                continue
-
-            # Создаем временный файл с парами для фильтрации
-            temp_pairs_path = "/tmp/filter_pairs.parquet"
-            pairs_df = pl.DataFrame(user_item_pairs, schema=["user_id", "item_id"])
-            pairs_df.write_parquet(temp_pairs_path)
-
-            # Ищем совпадения в текущем файле
-            results = (
-                pl.scan_parquet(ui_file)
-                .join(
-                    pl.scan_parquet(temp_pairs_path),
-                    on=["user_id", "item_id"],
-                    how="inner",
-                )
-                .collect()
-                .to_dicts()
-            )
-
-            all_results.extend(results)
-
-            # Удаляем временный файл
-            if os.path.exists(temp_pairs_path):
-                os.remove(temp_pairs_path)
-
-        return all_results
-
-    except Exception as e:
-        log_message(f"Ошибка получения батча UI-признаков: {e}")
-        return []
-
-
-def build_user_item_features_dict(
-    interactions_files,
-    output_dir="/home/root6/python/e_cup/rec_system/data/processed/ui_features",
-    cleanup=False,
-):
-    """
-    Создает отдельные файлы UI-признаков для каждого файла взаимодействий.
-    Все колонки преобразованы в числовой тип для LightGBM.
-    """
-    import json
-    import os
-    from datetime import datetime
-
-    import polars as pl
-    from tqdm import tqdm
-
-    os.makedirs(output_dir, exist_ok=True)
-    log_message("Создание UI-признаков (данные остаются на диске)")
-
-    try:
-        ui_feature_files = []
-
-        for input_file in tqdm(interactions_files, desc="Создание UI-признаков"):
-            try:
-                input_filename = os.path.basename(input_file)
-                output_file = os.path.join(output_dir, f"ui_features_{input_filename}")
-
-                # Поларс агрегирует UI-признаки
-                df = (
-                    pl.scan_parquet(input_file)
-                    .group_by(["user_id", "item_id"])
-                    .agg(
-                        [
-                            pl.col("weight").count().alias("ui_count"),
-                            pl.col("weight").sum().alias("ui_sum"),
-                            pl.col("weight").max().alias("ui_max"),
-                            pl.col("weight").min().alias("ui_min"),
-                            pl.col("timestamp").max().alias("ui_last_ts"),
-                            pl.col("timestamp").min().alias("ui_first_ts"),
-                        ]
-                    )
-                    .with_columns(
-                        [
-                            # Среднее значение
-                            (pl.col("ui_sum") / pl.col("ui_count"))
-                            .fill_nan(0)
-                            .alias("ui_mean"),
-                            # Дни с последнего взаимодействия
-                            (
-                                (
-                                    pl.lit(datetime.now()).cast(pl.Datetime)
-                                    - pl.col("ui_last_ts").cast(pl.Datetime)
-                                )
-                                .dt.total_days()  # ← ИСПРАВЛЕНО: .days() → .total_days()
-                                .cast(pl.Float64)
-                            ).alias("ui_days_since_last"),
-                            # Дни с первого взаимодействия
-                            (
-                                (
-                                    pl.lit(datetime.now()).cast(pl.Datetime)
-                                    - pl.col("ui_first_ts").cast(pl.Datetime)
-                                )
-                                .dt.total_days()  # ← ИСПРАВЛЕНО: .days() → .total_days()
-                                .cast(pl.Float64)
-                            ).alias("ui_days_since_first"),
-                        ]
-                    )
-                    .select(
-                        [
-                            "user_id",
-                            "item_id",
-                            "ui_count",
-                            "ui_sum",
-                            "ui_max",
-                            "ui_min",
-                            "ui_mean",
-                            "ui_days_since_last",
-                            "ui_days_since_first",
-                        ]
-                    )
-                    .fill_null(0)
-                )
-
-                df.sink_parquet(output_file)
-                ui_feature_files.append(output_file)
-
-            except Exception as e:
-                log_message(f"Ошибка обработки файла {input_file}: {e}")
-                continue
-
-        # Сохраняем metadata
-        metadata = {
-            "created_date": datetime.now().isoformat(),
-            "source_files": len(interactions_files),
-            "ui_feature_files": ui_feature_files,
-            "output_dir": output_dir,
-        }
-        metadata_path = os.path.join(output_dir, "metadata.json")
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f, indent=2)
-
-        log_message(
-            f"Создано {len(ui_feature_files)} файлов UI-признаков в: {output_dir}"
-        )
-        return output_dir
-
-    except Exception as e:
-        log_message(f"❌ Ошибка: {e}")
-        import traceback
-
-        traceback.log_message_exc()
-        return None
 
 
 def build_category_features_dict(category_df, items_df):
@@ -2362,31 +2070,6 @@ if __name__ == "__main__":
             f"Item features построены за {timedelta(seconds=item_time)}: {len(item_features_dict)} товаров"
         )
 
-        # User-Item features - распределенный подход
-        ui_start = time.time()
-        ui_features_dir = build_user_item_features_dict(
-            interactions_files,
-            output_dir="/home/root6/python/e_cup/rec_system/data/processed/ui_features_distributed",
-        )
-
-        if ui_features_dir is None:
-            log_message("⚠️ User-Item features не созданы, пропускаем этап.")
-        else:
-            # Проверяем что директория создана и есть файлы
-            metadata_path = os.path.join(ui_features_dir, "metadata.json")
-            if os.path.exists(metadata_path):
-                with open(metadata_path, "r") as f:
-                    metadata = json.load(f)
-                file_count = len(metadata.get("ui_feature_files", []))
-                log_message(f"User-Item features созданы в: {ui_features_dir}")
-                log_message(f"Количество файлов: {file_count}")
-            else:
-                log_message("⚠️ Метаданные UI-признаков не найдены")
-                ui_features_dir = None
-
-        ui_time = time.time() - ui_start
-        log_message(f"User-Item features построены за {timedelta(seconds=ui_time)}")
-
         stage_time = time.time() - stage_start
         log_message(
             f"Предварительный расчет признаков завершен за {timedelta(seconds=stage_time)}"
@@ -2422,7 +2105,6 @@ if __name__ == "__main__":
             recent_items_map=recent_items_map,
             sample_fraction=config["sample_fraction"],
             negatives_per_positive=3,
-            ui_features_dir=ui_features_dir,
             val_days=7,
         )
 
@@ -2487,22 +2169,6 @@ if __name__ == "__main__":
             log_message(f"Товаров с НЕнулевыми features: {items_with_real_features}")
         else:
             log_message("⚠️ item_features_dict ПУСТОЙ!")
-
-        # 3. Проверка UI features
-        log_message("--- ПРОВЕРКА UI FEATURES ---")
-        if ui_features_dir and os.path.exists(ui_features_dir):
-            metadata_path = os.path.join(ui_features_dir, "metadata.json")
-            if os.path.exists(metadata_path):
-                with open(metadata_path, "r") as f:
-                    metadata = json.load(f)
-                log_message(
-                    f"UI features files: {len(metadata.get('ui_feature_files', []))}"
-                )
-                log_message(f"UI features stats: {metadata.get('stats', {})}")
-            else:
-                log_message("⚠️ Метаданные UI features не найдены")
-        else:
-            log_message("⚠️ UI features directory не существует")
 
         # 4. Проверка эмбеддингов
         log_message("--- ПРОВЕРКА ЭМБЕДДИНГОВ ---")
@@ -2597,7 +2263,6 @@ if __name__ == "__main__":
             "popular_items": popular_items,
             "user_features_dict": user_features_dict,
             "item_features_dict": item_features_dict,
-            "ui_features_dir": ui_features_dir,
             "recent_items_map": recent_items_map,
             "copurchase_map": copurchase_map,
             "item_to_cat": item_to_cat,
