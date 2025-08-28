@@ -172,8 +172,8 @@ def prepare_features_vectorized(
     return features_matrix
 
 
-# ===== ОПТИМИЗИРОВАННАЯ СУПЕР-БЫСТРАЯ ФУНКЦИЯ =====
-def get_user_recommendations_super_fast(user_id, top_k=100, **kwargs):
+# ===== ГЕНЕРАЦИЯ РЕКОМЕНДАЦИЙ =====
+def get_user_recommendations(user_id, top_k=100, **kwargs):
     """СУПЕР-БЫСТРАЯ функция: персонализированные рекомендации с векторизацией"""
     try:
         recent_items_get = kwargs.get("recent_items_get")
@@ -193,28 +193,48 @@ def get_user_recommendations_super_fast(user_id, top_k=100, **kwargs):
         # Генерация кандидатов
         candidates = set()
 
+        N_RECENT = 5
+        N_COPURCHASE = 5
+        N_CATEGORY = 5
+        N_POPULAR = 30
+
         # 1. Недавние товары
-        candidates.update(recent_items[:20])
+        candidates.update(recent_items[:N_RECENT])
 
         # 2. Co-purchase товары
         for item in recent_items[:10]:
             co_items = copurchase_map.get(item, [])
-            candidates.update(co_items[:15])
+            candidates.update(co_items[:N_COPURCHASE])
 
         # 3. Товары из тех же категорий
         for item in recent_items[:5]:
             cat_id = item_to_cat.get(item)
             if cat_id and cat_id in cat_to_items:
-                candidates.update(cat_to_items[cat_id][:20])
+                candidates.update(cat_to_items[cat_id][:N_CATEGORY])
 
         # 4. Популярные товары как fallback
-        candidates.update(popular_items_array[:50])
+        candidates.update(popular_items_array[:N_POPULAR])
 
         # Фильтруем существующие товары
         candidates = [c for c in candidates if c in item_map]
 
         if not candidates:
             return popular_items_array[:top_k].tolist()
+
+        # === 🔥 Адаптивный cut-off кандидатов ===
+        if len(recent_items) < 3:
+            max_cands = 500  # для "новых" пользователей
+        else:
+            max_cands = 300  # для активных пользователей
+
+        if len(candidates) > max_cands:
+            # оставляем наиболее популярные среди кандидатов
+            popularity_rank = {
+                item: idx for idx, item in enumerate(popular_items_array)
+            }
+            candidates = sorted(candidates, key=lambda x: popularity_rank.get(x, 1e9))[
+                :max_cands
+            ]
 
         # Векторизированная подготовка признаков
         X_candidate = prepare_features_vectorized(
@@ -266,7 +286,7 @@ def get_user_recommendations_with_cache(user_id, top_k=100, **kwargs):
             user_recommendation_cache[user_id] = cached_recs
             return cached_recs
 
-    recs = get_user_recommendations_super_fast(user_id, top_k, **kwargs)
+    recs = get_user_recommendations(user_id, top_k, **kwargs)
     if len(user_recommendation_cache) < 10000:
         user_recommendation_cache[user_id] = recs
 
