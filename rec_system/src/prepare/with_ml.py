@@ -44,7 +44,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=5_000_000):
+def load_train_data(max_parts=0, max_rows=100_000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -1198,7 +1198,7 @@ class LightGBMRecommender:
 
         # --- user features ---
         if user_features_dict:
-            user_feats_df = pl.DataFrame(
+            user_feats_df = pl.LazyFrame(
                 [{"user_id": k, **v} for k, v in user_features_dict.items()]
             )
             user_feat_cols = [c for c in user_feats_df.columns if c != "user_id"]
@@ -1218,7 +1218,7 @@ class LightGBMRecommender:
                     emb = {f"emb_{i}": feats[i] for i in range(min(30, feats.shape[0]))}
                     emb["item_id"] = item_id
                     items_data.append(emb)
-            item_feats_df = pl.DataFrame(items_data)
+            item_feats_df = pl.LazyFrame(items_data)
             item_feat_cols = [c for c in item_feats_df.columns if c != "item_id"]
         else:
             item_feats_df = None
@@ -1227,12 +1227,35 @@ class LightGBMRecommender:
         self.feature_columns = ["copurchase_count"] + user_feat_cols + item_feat_cols
 
         # --- подвыборка orders ---
-        orders_pdf = orders_ddf.compute().sample(frac=sample_fraction)
-        orders_pl = pl.from_pandas(orders_pdf)
+        if sample_fraction < 1.0:
+            sampled = orders_ddf.sample(frac=sample_fraction, random_state=42)
+        else:
+            sampled = orders_ddf
+
+        # --- сохраняем в несколько parquet-файлов ---
+        tmp_orders_path = base_dir / "orders_sample"
+        sampled.to_parquet(
+            tmp_orders_path,
+            write_index=False,
+            row_group_size=100_000_000,  # примерно столько строк в файле
+        )
+
+        # ленивое чтение orders (подхватывает все файлы)
+        orders_pl = pl.scan_parquet(str(tmp_orders_path) + "/*.parquet")
 
         # --- базовый датасет ---
-        interactions_df = pl.read_parquet(str(interactions_all_path))
-        merged = orders_pl.join(interactions_df, on=["user_id", "item_id"], how="left")
+        interactions_lazy = pl.scan_parquet(str(interactions_all_path))
+        merged = orders_pl.join(
+            interactions_lazy, on=["user_id", "item_id"], how="left"
+        )
+
+        # --- джойним фичи ---
+        if user_feats_df is not None and len(user_feats_df.columns) > 0:
+            merged = merged.join(user_feats_df.lazy(), on="user_id", how="left")
+
+        if item_feats_df is not None and len(item_feats_df.columns) > 0:
+            merged = merged.join(item_feats_df.lazy(), on="item_id", how="left")
+
         merged = merged.with_columns(
             [
                 pl.col("timestamp").fill_null(train_timestamp_fill),
@@ -1285,13 +1308,13 @@ class LightGBMRecommender:
 
         # --- user/item фичи ---
         if user_feats_df is not None:
-            merged = merged.join(user_feats_df, on="user_id", how="left")
+            merged = merged.join(user_feats_df.lazy(), on="user_id", how="left")
         if item_feats_df is not None:
-            merged = merged.join(item_feats_df, on="item_id", how="left")
+            merged = merged.join(item_feats_df.lazy(), on="item_id", how="left")
 
         # --- copurchase_count ---
         if copurchase_map:
-            copurchase_df = pl.DataFrame(
+            copurchase_df = pl.LazyFrame(
                 [
                     {
                         "item_id": k,
@@ -1307,40 +1330,27 @@ class LightGBMRecommender:
         else:
             merged = merged.with_columns(pl.lit(0.0).alias("copurchase_count"))
 
-        # --- split train/val ---
         if split_by_time:
-            train_df = merged.filter(pl.col("timestamp") <= split_time).drop(
-                "timestamp"
+            train_lazy = (
+                merged.lazy()
+                .filter(pl.col("timestamp") <= split_time)
+                .select([c for c in merged.columns if c != "timestamp"])
             )
-            val_df = merged.filter(pl.col("timestamp") > split_time).drop("timestamp")
+            val_lazy = (
+                merged.lazy()
+                .filter(pl.col("timestamp") > split_time)
+                .select([c for c in merged.columns if c != "timestamp"])
+            )
         else:
-            idx_split = int(merged.height * (1 - split))
-            train_df, val_df = merged[:idx_split].drop("timestamp"), merged[
-                idx_split:
-            ].drop("timestamp")
+            raise ValueError("Лучше не делать random split с ленивыми данными")
 
-        # --- функция записи чанками ~1 ГБ ---
-        def write_parquet_in_chunks(
-            df: pl.DataFrame,
-            out_dir: Path,
-            prefix: str,
-            chunk_size_bytes: int = 1_000_000_000,
-        ):
-            out_dir.mkdir(parents=True, exist_ok=True)
-            total_rows = df.height
-            row_size_est = max(df.estimated_size() / total_rows, 1)
-            rows_per_chunk = max(int(chunk_size_bytes / row_size_est), 1)
-            for start in tqdm(
-                range(0, total_rows, rows_per_chunk), desc=f"Запись {prefix}"
-            ):
-                end = min(start + rows_per_chunk, total_rows)
-                df[start:end].write_parquet(
-                    out_dir / f"{prefix}_{start:09d}_{end:09d}.parquet"
-                )
-
-        # --- сохраняем ---
-        write_parquet_in_chunks(train_df, train_out_dir, "train")
-        write_parquet_in_chunks(val_df, val_out_dir, "val")
+        # --- сохраняем сразу parquet c row_group_size ---
+        train_lazy.sink_parquet(
+            str(train_out_dir / "train.parquet"), row_group_size=100_000_000
+        )
+        val_lazy.sink_parquet(
+            str(val_out_dir / "val.parquet"), row_group_size=100_000_000
+        )
 
         log_message("✅ Данные подготовлены (streaming lazy polars, векторно)")
         return train_out_dir, val_out_dir
@@ -2443,8 +2453,8 @@ if __name__ == "__main__":
         log_message(f"Пользователей: {len(user_map)}")
         log_message(f"Товаров: {len(item_map)}")
         log_message(f"Признаков: {len(recommender.feature_columns)}")
-        log_message(f"NDCG@100 train: {train_ndcg:.4f}")
-        log_message(f"NDCG@100 val: {val_ndcg:.4f}")
+        # log_message(f"NDCG@100 train: {train_ndcg:.4f}")
+        # log_message(f"NDCG@100 val: {val_ndcg:.4f}")
 
         # Информация о системе
         log_message("=== СИСТЕМНАЯ ИНФОРМАЦИЯ ===")
