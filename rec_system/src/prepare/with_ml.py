@@ -44,7 +44,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=1_000_00):
+def load_train_data(max_parts=0, max_rows=1000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -1144,7 +1144,7 @@ class LightGBMRecommender:
         user_map,
         item_map,
         popularity_s,
-        recent_items_map,
+        recent_items_map=None,
         copurchase_map=None,
         item_to_cat=None,
         cat_to_items=None,
@@ -1155,265 +1155,184 @@ class LightGBMRecommender:
         negatives_per_positive=0,
         split: float = 0.2,
     ):
-        log_message("Подготовка данных для LightGBM (streaming, polars)...")
+        log_message(
+            "Подготовка данных для LightGBM (streaming, polars lazy, векторно)..."
+        )
 
         base_dir = Path("/home/root6/python/e_cup/rec_system/data/processed/")
-        base_dir.mkdir(parents=True, exist_ok=True)
-
         interactions_out_dir = base_dir / "interactions_streaming"
         train_out_dir = base_dir / "train_streaming"
         val_out_dir = base_dir / "val_streaming"
-
         for p in [interactions_out_dir, train_out_dir, val_out_dir]:
             p.mkdir(parents=True, exist_ok=True)
 
-        batch_size = 500_000
-
-        # --- запись interactions сразу в parquet через polars ---
-        interactions_scans = [
-            pl.scan_parquet(str(f)).select(
-                ["user_id", "item_id", "timestamp", "weight"]
-            )
-            for f in interactions_files
-        ]
-        interactions_lazy = pl.concat(interactions_scans)
-        interactions_lazy.sink_parquet(
-            str(interactions_out_dir / "interactions_all.parquet"),
-            compression="zstd",
-            statistics=True,
+        # --- объединяем все interactions ---
+        interactions_lazy = pl.concat(
+            [
+                pl.scan_parquet(str(f)).select(
+                    ["user_id", "item_id", "timestamp", "weight"]
+                )
+                for f in interactions_files
+            ]
         )
+        interactions_all_path = interactions_out_dir / "interactions_all.parquet"
+        interactions_lazy.sink_parquet(str(interactions_all_path))
 
         # --- split_time ---
         ts_bounds = interactions_lazy.select(
-            pl.col("timestamp").min().alias("min_ts"),
-            pl.col("timestamp").max().alias("max_ts"),
+            [
+                pl.col("timestamp").min().alias("min_ts"),
+                pl.col("timestamp").max().alias("max_ts"),
+            ]
         ).collect()
-        min_timestamp = ts_bounds["min_ts"][0]
-        max_timestamp = ts_bounds["max_ts"][0]
-
-        if min_timestamp is None or max_timestamp is None:
-            raise ValueError("Во всех файлах interactions нет временных меток")
-
-        duration = max_timestamp - min_timestamp  # datetime.timedelta
-
-        if duration <= timedelta(0):
-            split_by_time = False
-            split_time = max_timestamp
-        else:
-            split_by_time = True
-            split_time = max_timestamp - timedelta(
-                seconds=duration.total_seconds() * split
-            )
-
+        min_timestamp, max_timestamp = ts_bounds[0, "min_ts"], ts_bounds[0, "max_ts"]
+        duration = max_timestamp - min_timestamp
+        split_by_time = duration > timedelta(0)
+        split_time = (
+            max_timestamp - timedelta(seconds=duration.total_seconds() * split)
+            if split_by_time
+            else max_timestamp
+        )
         train_timestamp_fill = split_time - timedelta(seconds=1)
 
-        log_message(
-            f"min_timestamp={min_timestamp}; max_timestamp={max_timestamp}; duration={duration}"
-        )
-        log_message(
-            f"split_time={split_time}; train_timestamp_fill={train_timestamp_fill}"
-        )
-
-        # --- user_interacted_items_train ---
-        inter_df = pl.scan_parquet(
-            str(interactions_out_dir / "interactions_all.parquet")
-        )
-        inter_train = inter_df.filter(pl.col("timestamp") <= split_time)
-        user_interacted_items_train = (
-            inter_train.group_by("user_id")
-            .agg(pl.col("item_id").unique().alias("items"))
-            .collect()
-            .to_dict(as_series=False)
-        )
-        user_interacted_items_train = {
-            uid: set(items)
-            for uid, items in zip(
-                user_interacted_items_train["user_id"],
-                user_interacted_items_train["items"],
-            )
-        }
-
-        # --- подготовка негативов ---
-        all_items = np.array(list(item_map.keys()), dtype=np.int64)
-        popular_items_set = set(popularity_s.nlargest(10000).index.astype(np.int64))
-        all_items_tensor = torch.tensor(all_items, device="cuda")
-        popular_items_tensor = torch.tensor(list(popular_items_set), device="cuda")
-
-        # --- признаки ---
-        fixed_feature_keys = ["copurchase_count"]
-        user_feature_keys, item_feature_keys = [], []
+        # --- user features ---
         if user_features_dict:
-            all_user_keys = {
-                k for feats in user_features_dict.values() for k in feats.keys()
-            }
-            user_feature_keys = [f"user_{k}" for k in sorted(all_user_keys)]
-        if item_features_dict:
-            all_item_keys = set()
-            for feats in item_features_dict.values():
-                if isinstance(feats, dict):
-                    all_item_keys.update(feats.keys())
-                elif isinstance(feats, np.ndarray):
-                    all_item_keys.update(
-                        [f"emb_{i}" for i in range(min(30, feats.shape[0]))]
-                    )
-            item_feature_keys = [f"item_{k}" for k in sorted(all_item_keys)]
+            user_feats_df = pl.DataFrame(
+                [{"user_id": k, **v} for k, v in user_features_dict.items()]
+            )
+            user_feat_cols = [c for c in user_feats_df.columns if c != "user_id"]
+        else:
+            user_feats_df = None
+            user_feat_cols = []
 
-        feature_cols = fixed_feature_keys + user_feature_keys + item_feature_keys
+        # --- item features ---
+        if item_features_dict:
+            items_data = []
+            for item_id, feats in item_features_dict.items():
+                if isinstance(feats, dict):
+                    feats_copy = feats.copy()
+                    feats_copy["item_id"] = item_id
+                    items_data.append(feats_copy)
+                elif isinstance(feats, np.ndarray):
+                    emb = {f"emb_{i}": feats[i] for i in range(min(30, feats.shape[0]))}
+                    emb["item_id"] = item_id
+                    items_data.append(emb)
+            item_feats_df = pl.DataFrame(items_data)
+            item_feat_cols = [c for c in item_feats_df.columns if c != "item_id"]
+        else:
+            item_feats_df = None
+            item_feat_cols = []
+
+        feature_cols = ["copurchase_count"] + user_feat_cols + item_feat_cols
         self.feature_columns = feature_cols
 
-        # enrich_features как есть из оригинала
-        def enrich_features(uid, item_id):
-            features = {}
-            features["copurchase_count"] = (
-                sum(x[1] for x in copurchase_map[item_id])
-                if copurchase_map and item_id in copurchase_map
-                else 0.0
+        # --- подготовка популярности ---
+        all_items = np.array(list(item_map.keys()))
+        popular_items_set = set(popularity_s.nlargest(10000).index.astype(np.int64))
+
+        # --- подвыборка orders ---
+        orders_pdf = orders_ddf.compute().sample(frac=sample_fraction)
+        orders_pl = pl.from_pandas(orders_pdf)
+
+        # --- базовый датасет ---
+        interactions_df = pl.read_parquet(str(interactions_all_path))
+        merged = orders_pl.join(interactions_df, on=["user_id", "item_id"], how="left")
+        merged = merged.with_columns(
+            [
+                pl.col("timestamp").fill_null(train_timestamp_fill),
+                pl.col("weight").fill_null(0.0),
+                pl.when(pl.col("target") == 1).then(1).otherwise(0).alias("target"),
+            ]
+        )
+
+        # --- негативные ---
+        if negatives_per_positive > 0:
+            neg_rows = []
+            user_ids = merged["user_id"].unique().to_numpy()
+            for uid in tqdm(user_ids, desc="Генерация негативов"):
+                user_data = merged.filter(pl.col("user_id") == uid)
+                user_pos_items = set(
+                    user_data.filter(pl.col("target") == 1)["item_id"].to_numpy()
+                )
+                excluded_items = set(user_data["item_id"].to_numpy())
+                available_items = np.array(
+                    [i for i in all_items if i not in excluded_items]
+                )
+                n_neg = len(user_pos_items) * negatives_per_positive
+                if n_neg == 0 or len(available_items) == 0:
+                    continue
+                sampled = np.random.choice(available_items, n_neg, replace=False)
+                neg_rows.extend(
+                    [
+                        {
+                            "user_id": int(uid),
+                            "item_id": int(i),
+                            "timestamp": train_timestamp_fill,
+                            "target": 0,
+                            "weight": 0.0,
+                        }
+                        for i in sampled
+                    ]
+                )
+            if neg_rows:
+                neg_df = pl.DataFrame(neg_rows)
+                # выравниваем колонки и типы под merged
+                for c in merged.columns:
+                    if c not in neg_df.columns:
+                        neg_df = neg_df.with_columns(pl.lit(None).alias(c))
+                for c in merged.columns:
+                    if c in neg_df.columns:
+                        neg_df = neg_df.with_columns(neg_df[c].cast(merged[c].dtype))
+                neg_df = neg_df.select(merged.columns)
+                merged = pl.concat([merged, neg_df])
+
+        # --- user/item фичи ---
+        if user_feats_df is not None:
+            merged = merged.join(user_feats_df, on="user_id", how="left")
+        if item_feats_df is not None:
+            merged = merged.join(item_feats_df, on="item_id", how="left")
+
+        # --- copurchase_count ---
+        if copurchase_map is not None:
+            copurchase_df = pl.DataFrame(
+                [
+                    {
+                        "item_id": k,
+                        "copurchase_count": float(
+                            sum(c[1] if isinstance(c, tuple) else c for c in v)
+                        ),
+                    }
+                    for k, v in copurchase_map.items()
+                ]
             )
-            user_feats = user_features_dict.get(uid, {}) if user_features_dict else {}
-            for k, v in user_feats.items():
-                features[f"user_{k}"] = v
-            raw_item_feats = (
-                item_features_dict.get(item_id, {}) if item_features_dict else {}
+            merged = merged.join(copurchase_df, on="item_id", how="left")
+            merged = merged.with_columns([pl.col("copurchase_count").fill_null(0.0)])
+        else:
+            merged = merged.with_columns([pl.lit(0.0).alias("copurchase_count")])
+
+        # --- split train/val ---
+        if split_by_time:
+            train_df = merged.filter(pl.col("timestamp") <= split_time).drop(
+                "timestamp"
             )
-            item_feats = normalize_item_feats(raw_item_feats, max_emb_dim=30)
-            for k, v in item_feats.items():
-                features[f"item_{k}"] = v
-            return features
+            val_df = merged.filter(pl.col("timestamp") > split_time).drop("timestamp")
+        else:
+            idx_split = int(merged.height * (1 - split))
+            train_df, val_df = merged[:idx_split].drop("timestamp"), merged[
+                idx_split:
+            ].drop("timestamp")
 
-        # --- основная генерация ---
-        small_batch = []
-        train_file_idx, val_file_idx = 0, 0
-        train_data_batches, val_data_batches = [], []
-
-        total_users = orders_ddf["user_id"].nunique().compute()
-
-        for part in orders_ddf.to_delayed():
-            pdf = part.compute()
-            for uid, gr in tqdm(
-                pdf.groupby("user_id"),
-                desc="Streaming генерация пользователей",
-                total=pdf["user_id"].nunique(),
-                leave=False,
+        # --- сохраняем батчами с прогресс-баром ---
+        for i, df in enumerate([train_df, val_df]):
+            out_dir = train_out_dir if i == 0 else val_out_dir
+            df_batches = df.partition_by("user_id")
+            for j, b in enumerate(
+                tqdm(df_batches, desc=f"Запись батчей {'train' if i==0 else 'val'}")
             ):
-                pos_items = set(gr[gr["target"] == 1]["item_id"])
-                neg_items_existing = set(gr[gr["target"] == 0]["item_id"])
-                interacted = user_interacted_items_train.get(uid, set())
-                excluded = pos_items | neg_items_existing | interacted
+                b.write_parquet(out_dir / f"part_{j:05d}.parquet")
 
-                excluded_tensor = (
-                    torch.tensor(list(excluded), device="cuda", dtype=torch.int32)
-                    if excluded
-                    else torch.tensor([], device="cuda", dtype=torch.int32)
-                )
-                mask = ~torch.isin(all_items_tensor, excluded_tensor)
-                available_items_tensor = all_items_tensor[mask]
-
-                # Взаимодействия пользователя быстро из polars
-                inter_user = (
-                    inter_df.filter(pl.col("user_id") == uid).collect().to_pandas()
-                )
-
-                candidate_items = list(pos_items | neg_items_existing)
-                for it in candidate_items:
-                    target = 1 if it in pos_items else 0
-                    if it in inter_user["item_id"].values:
-                        ts = inter_user.loc[
-                            inter_user["item_id"] == it, "timestamp"
-                        ].max()
-                        weight = inter_user.loc[
-                            inter_user["item_id"] == it, "weight"
-                        ].max()
-                    else:
-                        ts = train_timestamp_fill
-                        weight = 0.0
-                    feats = enrich_features(uid, it)
-                    feature_values = [feats.get(c, 0) for c in feature_cols]
-                    small_batch.append([uid, it, ts, target, weight] + feature_values)
-
-                n_needed = max(
-                    0, len(pos_items) * negatives_per_positive - len(neg_items_existing)
-                )
-                if n_needed > 0 and len(available_items_tensor) > 0:
-                    popular_mask = torch.isin(
-                        available_items_tensor, popular_items_tensor
-                    )
-                    popular_candidates = available_items_tensor[popular_mask]
-                    random_candidates = available_items_tensor[~popular_mask]
-
-                    n_popular = min(n_needed // 2, len(popular_candidates))
-                    n_random = min(n_needed - n_popular, len(random_candidates))
-                    sampled_items = []
-                    if n_popular > 0:
-                        perm = torch.randperm(len(popular_candidates), device="cuda")
-                        sampled_items.extend(
-                            popular_candidates[perm[:n_popular]].tolist()
-                        )
-                    if n_random > 0:
-                        perm = torch.randperm(len(random_candidates), device="cuda")
-                        sampled_items.extend(
-                            random_candidates[perm[:n_random]].tolist()
-                        )
-                    for it in sampled_items:
-                        feats = enrich_features(uid, it)
-                        feature_values = [feats.get(c, 0) for c in feature_cols]
-                        small_batch.append(
-                            [uid, it, train_timestamp_fill, 0, 0.0] + feature_values
-                        )
-
-                if len(small_batch) >= batch_size:
-                    cols_order = [
-                        "user_id",
-                        "item_id",
-                        "timestamp",
-                        "target",
-                        "weight",
-                    ] + feature_cols
-                    batch_df = pl.DataFrame(small_batch, schema=cols_order)
-                    if split_by_time:
-                        train_df = batch_df.filter(pl.col("timestamp") <= split_time)
-                        val_df = batch_df.filter(pl.col("timestamp") > split_time)
-                    else:
-                        idx_split = int(len(batch_df) * (1 - split))
-                        train_df, val_df = batch_df[:idx_split], batch_df[idx_split:]
-                    if len(train_df) > 0:
-                        train_df.drop("timestamp").write_parquet(
-                            train_out_dir / f"part_{train_file_idx:05d}.parquet"
-                        )
-                        train_file_idx += 1
-                    if len(val_df) > 0:
-                        val_df.drop("timestamp").write_parquet(
-                            val_out_dir / f"part_{val_file_idx:05d}.parquet"
-                        )
-                        val_file_idx += 1
-                    small_batch.clear()
-
-        # Финализация остатка
-        if small_batch:
-            cols_order = [
-                "user_id",
-                "item_id",
-                "timestamp",
-                "target",
-                "weight",
-            ] + feature_cols
-            batch_df = pl.DataFrame(small_batch, schema=cols_order)
-            if split_by_time:
-                train_df = batch_df.filter(pl.col("timestamp") <= split_time)
-                val_df = batch_df.filter(pl.col("timestamp") > split_time)
-            else:
-                idx_split = int(len(batch_df) * (1 - split))
-                train_df, val_df = batch_df[:idx_split], batch_df[idx_split:]
-            if len(train_df) > 0:
-                train_df.drop("timestamp").write_parquet(
-                    train_out_dir / f"part_{train_file_idx:05d}.parquet"
-                )
-            if len(val_df) > 0:
-                val_df.drop("timestamp").write_parquet(
-                    val_out_dir / f"part_{val_file_idx:05d}.parquet"
-                )
-
-        log_message("✅ Данные подготовлены (polars)")
-        return train_data_batches, val_data_batches
+        log_message("✅ Данные подготовлены (streaming lazy polars, векторно)")
+        return train_out_dir, val_out_dir
 
     def _get_copurchase_strength(self, item_id):
         """Получаем силу co-purchase связи"""
@@ -2305,8 +2224,21 @@ if __name__ == "__main__":
             split=0.2,
         )
 
-        log_message(f"Размер train: {len(train_data)}, validation: {len(val_data)}")
+        # --- Функция для подсчёта строк в parquet ---
+        def parquet_len(parquet_pattern: str) -> int:
+            """Считает количество строк в parquet файлах по шаблону без загрузки всего в память"""
+            return pl.scan_parquet(parquet_pattern).select(pl.count()).collect()[0, 0]
+
+        # --- Логирование размеров train/val ---
+        train_parquet_pattern = "rec_system/data/processed/train_streaming/*.parquet"
+        val_parquet_pattern = "rec_system/data/processed/val_streaming/*.parquet"
+
+        train_len = parquet_len(train_parquet_pattern)
+        val_len = parquet_len(val_parquet_pattern)
+
+        log_message(f"Размер train: {train_len}, validation: {val_len}")
         log_message(f"Признаки: {len(recommender.feature_columns)}")
+
         stage_time = time.time() - stage_start
         log_message(
             f"Подготовка данных для LightGBM завершена за {timedelta(seconds=stage_time)}"
@@ -2316,16 +2248,15 @@ if __name__ == "__main__":
         stage_start = time.time()
         log_message("=== ДЕТАЛЬНАЯ ПРОВЕРКА FEATURE GENERATION ===")
 
-        # 1. Проверка user features
+        # --- Проверки user features ---
         log_message("--- ПРОВЕРКА USER FEATURES ---")
         if user_features_dict:
-            sample_user = list(user_features_dict.keys())[0]
+            sample_user = next(iter(user_features_dict))
             user_feats = user_features_dict[sample_user]
             log_message(f"Пример user features для пользователя {sample_user}:")
             for feat, value in user_feats.items():
                 log_message(f"  {feat}: {value}")
 
-            # Статистика по user features
             users_with_features = len(user_features_dict)
             users_with_real_features = sum(
                 1
@@ -2339,20 +2270,17 @@ if __name__ == "__main__":
         else:
             log_message("⚠️ user_features_dict ПУСТОЙ!")
 
-        # 2. Проверка item features
+        # --- Проверки item features ---
         log_message("--- ПРОВЕРКА ITEM FEATURES ---")
         if item_features_dict:
-            sample_item = list(item_features_dict.keys())[0]
+            sample_item = next(iter(item_features_dict))
             raw_item_feats = item_features_dict[sample_item]
-
-            # нормализуем (превращаем np.ndarray → dict)
             item_feats = normalize_item_feats(raw_item_feats, max_emb_dim=30)
 
             log_message(f"Пример item features для товара {sample_item}:")
             for feat, value in item_feats.items():
                 log_message(f"  {feat}: {value}")
 
-            # Статистика по item features
             items_with_features = len(item_features_dict)
             items_with_real_features = 0
             for feats in item_features_dict.values():
@@ -2365,10 +2293,10 @@ if __name__ == "__main__":
         else:
             log_message("⚠️ item_features_dict ПУСТОЙ!")
 
-        # 4. Проверка эмбеддингов
+        # --- Проверка эмбеддингов ---
         log_message("--- ПРОВЕРКА ЭМБЕДДИНГОВ ---")
         if embeddings_dict:
-            sample_item = list(embeddings_dict.keys())[0]
+            sample_item = next(iter(embeddings_dict))
             embedding = embeddings_dict[sample_item]
             log_message(
                 f"Пример эмбеддинга для товара {sample_item}: shape {embedding.shape}"
@@ -2378,10 +2306,10 @@ if __name__ == "__main__":
         else:
             log_message("⚠️ embeddings_dict ПУСТОЙ!")
 
-        # 5. Проверка co-purchase map
+        # --- Проверка co-purchase map ---
         log_message("--- ПРОВЕРКА CO-PURCHASE MAP ---")
         if copurchase_map:
-            sample_item = list(copurchase_map.keys())[0]
+            sample_item = next(iter(copurchase_map))
             co_items = copurchase_map[sample_item]
             log_message(
                 f"Пример co-purchase для товара {sample_item}: {len(co_items)} товаров"
@@ -2390,10 +2318,10 @@ if __name__ == "__main__":
         else:
             log_message("⚠️ copurchase_map ПУСТОЙ!")
 
-        # 6. Проверка категорийных маппингов
+        # --- Проверка категорийных маппингов ---
         log_message("--- ПРОВЕРКА КАТЕГОРИЙНЫХ МАППИНГОВ ---")
         if item_to_cat and cat_to_items:
-            sample_item = list(item_to_cat.keys())[0]
+            sample_item = next(iter(item_to_cat))
             cat_id = item_to_cat[sample_item]
             cat_items = cat_to_items.get(cat_id, [])
             log_message(f"Товар {sample_item} -> категория {cat_id}")
@@ -2410,12 +2338,8 @@ if __name__ == "__main__":
         stage_start = time.time()
         log_message("=== ОБУЧЕНИЕ LightGBM ===")
 
-        train_df = load_streaming_data(
-            "rec_system/data/processed/train_streaming/*.parquet"
-        )
-        val_df = load_streaming_data(
-            "rec_system/data/processed/val_streaming/*.parquet"
-        )
+        train_df = load_streaming_data(train_parquet_pattern)
+        val_df = load_streaming_data(val_parquet_pattern)
 
         # Проверяем данные
         recommender.debug_data_info(train_df, "TRAIN")
