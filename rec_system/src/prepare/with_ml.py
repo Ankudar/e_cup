@@ -44,7 +44,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=10000):
+def load_train_data(max_parts=0, max_rows=1_000_00):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -1152,15 +1152,10 @@ class LightGBMRecommender:
         item_features_dict=None,
         embeddings_dict=None,
         sample_fraction=0.1,
-        negatives_per_positive=3,
-        split: float = 0.2,  # 20% хвост истории под валидацию
+        negatives_per_positive=0,
+        split: float = 0.2,
     ):
-        log_message("Подготовка данных для LightGBM (streaming)...")
-
-        # --- sample fraction по партициям ---
-        orders_ddf = orders_ddf.map_partitions(
-            lambda df: df.sample(frac=sample_fraction, random_state=42)
-        )
+        log_message("Подготовка данных для LightGBM (streaming, polars)...")
 
         base_dir = Path("/home/root6/python/e_cup/rec_system/data/processed/")
         base_dir.mkdir(parents=True, exist_ok=True)
@@ -1173,109 +1168,84 @@ class LightGBMRecommender:
             p.mkdir(parents=True, exist_ok=True)
 
         batch_size = 500_000
-        file_idx = 0
 
-        # --- streaming запись interactions ---
-        def write_interactions_batch(batch_list):
-            nonlocal file_idx
-            if not batch_list:
-                return
-            batch_df = pd.DataFrame(
-                batch_list, columns=["user_id", "item_id", "timestamp", "weight"]
+        # --- запись interactions сразу в parquet через polars ---
+        interactions_scans = [
+            pl.scan_parquet(str(f)).select(
+                ["user_id", "item_id", "timestamp", "weight"]
             )
-            out_path = interactions_out_dir / f"part_{file_idx:05d}.parquet"
-            batch_df.to_parquet(out_path, index=False, engine="pyarrow")
-            file_idx += 1
-            batch_list.clear()
-
-        interactions_batch = []
-        for f in tqdm(interactions_files, desc="Загрузка interactions"):
-            df = pd.read_parquet(
-                f, columns=["user_id", "item_id", "timestamp", "weight"]
-            )
-            df["user_id"] = df["user_id"].astype("int64")
-            df["item_id"] = df["item_id"].astype("int64")
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
-
-            for start in range(0, len(df), batch_size):
-                batch = df.iloc[start : start + batch_size]
-                interactions_batch.extend(batch.values.tolist())
-                if len(interactions_batch) >= batch_size:
-                    write_interactions_batch(interactions_batch)
-        if interactions_batch:
-            write_interactions_batch(interactions_batch)
+            for f in interactions_files
+        ]
+        interactions_lazy = pl.concat(interactions_scans)
+        interactions_lazy.sink_parquet(
+            str(interactions_out_dir / "interactions_all.parquet"),
+            compression="zstd",
+            statistics=True,
+        )
 
         # --- split_time ---
-        parquet_files = sorted(interactions_out_dir.glob("*.parquet"))
-        if not parquet_files:
-            raise ValueError("Нет файлов interactions для вычисления split_time")
+        ts_bounds = interactions_lazy.select(
+            pl.col("timestamp").min().alias("min_ts"),
+            pl.col("timestamp").max().alias("max_ts"),
+        ).collect()
+        min_timestamp = ts_bounds["min_ts"][0]
+        max_timestamp = ts_bounds["max_ts"][0]
 
-        mins, maxs = [], []
-        for f in parquet_files:
-            ts = pd.read_parquet(f, columns=["timestamp"])["timestamp"]
-            if ts.empty:
-                continue
-            mins.append(ts.min())
-            maxs.append(ts.max())
-
-        if not maxs:
+        if min_timestamp is None or max_timestamp is None:
             raise ValueError("Во всех файлах interactions нет временных меток")
 
-        min_timestamp = min(mins)
-        max_timestamp = max(maxs)
-        duration = max_timestamp - min_timestamp
+        duration = max_timestamp - min_timestamp  # datetime.timedelta
 
-        if duration <= pd.Timedelta(0):
+        if duration <= timedelta(0):
             split_by_time = False
             split_time = max_timestamp
         else:
             split_by_time = True
-            split_time = max_timestamp - duration * split
+            split_time = max_timestamp - timedelta(
+                seconds=duration.total_seconds() * split
+            )
 
-        train_timestamp_fill = split_time - pd.Timedelta(seconds=1)
+        train_timestamp_fill = split_time - timedelta(seconds=1)
 
         log_message(
             f"min_timestamp={min_timestamp}; max_timestamp={max_timestamp}; duration={duration}"
         )
         log_message(
-            f"split_time ({int(split*100)}% tail) = {split_time}; train_timestamp_fill = {train_timestamp_fill}"
+            f"split_time={split_time}; train_timestamp_fill={train_timestamp_fill}"
         )
 
         # --- user_interacted_items_train ---
-        user_interacted_items_train = {}
-        for f in tqdm(
-            sorted(interactions_out_dir.glob("*.parquet")), desc="User history build"
-        ):
-            df = pd.read_parquet(f, columns=["user_id", "item_id", "timestamp"])
-            train_df = df[df["timestamp"] <= split_time]
-            for uid, gr in train_df.groupby("user_id"):
-                user_interacted_items_train.setdefault(uid, set()).update(
-                    gr["item_id"].unique()
-                )
-            del df, train_df
-            gc.collect()
+        inter_df = pl.scan_parquet(
+            str(interactions_out_dir / "interactions_all.parquet")
+        )
+        inter_train = inter_df.filter(pl.col("timestamp") <= split_time)
+        user_interacted_items_train = (
+            inter_train.group_by("user_id")
+            .agg(pl.col("item_id").unique().alias("items"))
+            .collect()
+            .to_dict(as_series=False)
+        )
+        user_interacted_items_train = {
+            uid: set(items)
+            for uid, items in zip(
+                user_interacted_items_train["user_id"],
+                user_interacted_items_train["items"],
+            )
+        }
 
-        # --- подготовка для негативов ---
+        # --- подготовка негативов ---
         all_items = np.array(list(item_map.keys()), dtype=np.int64)
         popular_items_set = set(popularity_s.nlargest(10000).index.astype(np.int64))
         all_items_tensor = torch.tensor(all_items, device="cuda")
         popular_items_tensor = torch.tensor(list(popular_items_set), device="cuda")
 
-        train_file_idx = 0
-        val_file_idx = 0
-        train_data_batches = []
-        val_data_batches = []
-
-        # --- фиксируем признаки ---
-        fixed_feature_keys = [
-            "copurchase_count",
-        ]
-
+        # --- признаки ---
+        fixed_feature_keys = ["copurchase_count"]
         user_feature_keys, item_feature_keys = [], []
         if user_features_dict:
-            all_user_keys = set()
-            for feats in user_features_dict.values():
-                all_user_keys.update(feats.keys())
+            all_user_keys = {
+                k for feats in user_features_dict.values() for k in feats.keys()
+            }
             user_feature_keys = [f"user_{k}" for k in sorted(all_user_keys)]
         if item_features_dict:
             all_item_keys = set()
@@ -1286,21 +1256,12 @@ class LightGBMRecommender:
                     all_item_keys.update(
                         [f"emb_{i}" for i in range(min(30, feats.shape[0]))]
                     )
-                else:
-                    raise TypeError(f"Неожиданный тип признаков: {type(feats)}")
             item_feature_keys = [f"item_{k}" for k in sorted(all_item_keys)]
 
         feature_cols = fixed_feature_keys + user_feature_keys + item_feature_keys
-
-        # Сохраняем feature_columns для использования в обучении
         self.feature_columns = feature_cols
 
-        log_message(f"Определены признаки: {feature_cols}")
-        log_message(
-            f"User features: {len(user_feature_keys)}, Item features: {len(item_feature_keys)}"
-        )
-
-        # --- enrich_features ---
+        # enrich_features как есть из оригинала
         def enrich_features(uid, item_id):
             features = {}
             features["copurchase_count"] = (
@@ -1308,43 +1269,22 @@ class LightGBMRecommender:
                 if copurchase_map and item_id in copurchase_map
                 else 0.0
             )
-
-            # user features
             user_feats = user_features_dict.get(uid, {}) if user_features_dict else {}
             for k, v in user_feats.items():
                 features[f"user_{k}"] = v
-
-            # item features (унифицировано)
             raw_item_feats = (
                 item_features_dict.get(item_id, {}) if item_features_dict else {}
             )
             item_feats = normalize_item_feats(raw_item_feats, max_emb_dim=30)
-
             for k, v in item_feats.items():
-                if k.startswith("emb_"):
-                    idx = int(k.split("_")[1])
-                    if idx < 30:
-                        features[f"item_{k}"] = v
-                elif k.startswith("item_fclip_embed_"):
-                    features[f"item_{k}"] = v
-                elif k in [
-                    "item_item_count",
-                    "item_item_orders_count",
-                    "item_item_mean",
-                ]:
-                    features[f"item_{k}"] = np.log1p(v)
-                else:
-                    features[f"item_{k}"] = v
-
+                features[f"item_{k}"] = v
             return features
 
-        # --- генерация train/val ---
+        # --- основная генерация ---
         small_batch = []
+        train_file_idx, val_file_idx = 0, 0
+        train_data_batches, val_data_batches = [], []
 
-        train_file_idx = 0
-        val_file_idx = 0
-
-        # суммарное число строк для отображения прогресса (можно по пользователям, если удобнее)
         total_users = orders_ddf["user_id"].nunique().compute()
 
         for part in orders_ddf.to_delayed():
@@ -1360,7 +1300,6 @@ class LightGBMRecommender:
                 interacted = user_interacted_items_train.get(uid, set())
                 excluded = pos_items | neg_items_existing | interacted
 
-                # --- формируем маску доступных товаров на GPU ---
                 excluded_tensor = (
                     torch.tensor(list(excluded), device="cuda", dtype=torch.int32)
                     if excluded
@@ -1369,19 +1308,10 @@ class LightGBMRecommender:
                 mask = ~torch.isin(all_items_tensor, excluded_tensor)
                 available_items_tensor = all_items_tensor[mask]
 
-                # --- подгружаем взаимодействия пользователя (из всех файлов) ---
-                inter_user_list = []
-                for f in interactions_out_dir.glob("*.parquet"):
-                    d = pd.read_parquet(
-                        f, columns=["user_id", "item_id", "timestamp", "weight"]
-                    )
-                    inter_user_list.append(d[d["user_id"] == uid])
-                if inter_user_list:
-                    inter_user = pd.concat(inter_user_list)
-                else:
-                    inter_user = pd.DataFrame(
-                        columns=["item_id", "timestamp", "weight"]
-                    )
+                # Взаимодействия пользователя быстро из polars
+                inter_user = (
+                    inter_df.filter(pl.col("user_id") == uid).collect().to_pandas()
+                )
 
                 candidate_items = list(pos_items | neg_items_existing)
                 for it in candidate_items:
@@ -1400,7 +1330,6 @@ class LightGBMRecommender:
                     feature_values = [feats.get(c, 0) for c in feature_cols]
                     small_batch.append([uid, it, ts, target, weight] + feature_values)
 
-                # --- генерация негативов ---
                 n_needed = max(
                     0, len(pos_items) * negatives_per_positive - len(neg_items_existing)
                 )
@@ -1414,7 +1343,6 @@ class LightGBMRecommender:
                     n_popular = min(n_needed // 2, len(popular_candidates))
                     n_random = min(n_needed - n_popular, len(random_candidates))
                     sampled_items = []
-
                     if n_popular > 0:
                         perm = torch.randperm(len(popular_candidates), device="cuda")
                         sampled_items.extend(
@@ -1425,7 +1353,6 @@ class LightGBMRecommender:
                         sampled_items.extend(
                             random_candidates[perm[:n_random]].tolist()
                         )
-
                     for it in sampled_items:
                         feats = enrich_features(uid, it)
                         feature_values = [feats.get(c, 0) for c in feature_cols]
@@ -1433,7 +1360,6 @@ class LightGBMRecommender:
                             [uid, it, train_timestamp_fill, 0, 0.0] + feature_values
                         )
 
-                # --- запись батча ---
                 if len(small_batch) >= batch_size:
                     cols_order = [
                         "user_id",
@@ -1442,53 +1368,26 @@ class LightGBMRecommender:
                         "target",
                         "weight",
                     ] + feature_cols
-                    batch_df = pd.DataFrame(small_batch, columns=cols_order)
-
-                    # сжатие типов для экономии памяти
-                    batch_df["user_id"] = batch_df["user_id"].astype("int32")
-                    batch_df["item_id"] = batch_df["item_id"].astype("int32")
-                    batch_df["target"] = batch_df["target"].astype("int8")
-                    batch_df["weight"] = batch_df["weight"].astype("float32")
-                    for c in feature_cols:
-                        batch_df[c] = batch_df[c].astype("float32")
-
-                    # --- разделение на train/val ---
+                    batch_df = pl.DataFrame(small_batch, schema=cols_order)
                     if split_by_time:
-                        train_df = batch_df[batch_df["timestamp"] <= split_time]
-                        val_df = batch_df[batch_df["timestamp"] > split_time]
-                        if val_df.empty:
-                            idx_split = int(len(batch_df) * (1 - split))
-                            train_df = batch_df.iloc[:idx_split]
-                            val_df = batch_df.iloc[idx_split:]
+                        train_df = batch_df.filter(pl.col("timestamp") <= split_time)
+                        val_df = batch_df.filter(pl.col("timestamp") > split_time)
                     else:
                         idx_split = int(len(batch_df) * (1 - split))
-                        train_df = batch_df.iloc[:idx_split]
-                        val_df = batch_df.iloc[idx_split:]
-
-                    # --- сохранение ---
-                    if not train_df.empty:
-                        train_df = train_df.drop(columns=["timestamp"])
-                        train_df.to_parquet(
-                            train_out_dir / f"part_{train_file_idx:05d}.parquet",
-                            index=False,
-                            engine="pyarrow",
+                        train_df, val_df = batch_df[:idx_split], batch_df[idx_split:]
+                    if len(train_df) > 0:
+                        train_df.drop("timestamp").write_parquet(
+                            train_out_dir / f"part_{train_file_idx:05d}.parquet"
                         )
-                        train_data_batches.append(train_df)
                         train_file_idx += 1
-
-                    if not val_df.empty:
-                        val_df = val_df.drop(columns=["timestamp"])
-                        val_df.to_parquet(
-                            val_out_dir / f"part_{val_file_idx:05d}.parquet",
-                            index=False,
-                            engine="pyarrow",
+                    if len(val_df) > 0:
+                        val_df.drop("timestamp").write_parquet(
+                            val_out_dir / f"part_{val_file_idx:05d}.parquet"
                         )
-                        val_data_batches.append(val_df)
                         val_file_idx += 1
-
                     small_batch.clear()
 
-        # --- финализация остатка ---
+        # Финализация остатка
         if small_batch:
             cols_order = [
                 "user_id",
@@ -1497,83 +1396,24 @@ class LightGBMRecommender:
                 "target",
                 "weight",
             ] + feature_cols
-            batch_df = pd.DataFrame(small_batch, columns=cols_order)
-
-            batch_df["user_id"] = batch_df["user_id"].astype("int32")
-            batch_df["item_id"] = batch_df["item_id"].astype("int32")
-            batch_df["target"] = batch_df["target"].astype("int8")
-            batch_df["weight"] = batch_df["weight"].astype("float32")
-            for c in feature_cols:
-                batch_df[c] = batch_df[c].astype("float32")
-
+            batch_df = pl.DataFrame(small_batch, schema=cols_order)
             if split_by_time:
-                train_df = batch_df[batch_df["timestamp"] <= split_time]
-                val_df = batch_df[batch_df["timestamp"] > split_time]
-                if val_df.empty:
-                    idx_split = int(len(batch_df) * (1 - split))
-                    train_df = batch_df.iloc[:idx_split]
-                    val_df = batch_df.iloc[idx_split:]
+                train_df = batch_df.filter(pl.col("timestamp") <= split_time)
+                val_df = batch_df.filter(pl.col("timestamp") > split_time)
             else:
                 idx_split = int(len(batch_df) * (1 - split))
-                train_df = batch_df.iloc[:idx_split]
-                val_df = batch_df.iloc[idx_split:]
-
-            if not train_df.empty:
-                train_df = train_df.drop(columns=["timestamp"])
-                train_df.to_parquet(
-                    train_out_dir / f"part_{train_file_idx:05d}.parquet",
-                    index=False,
-                    engine="pyarrow",
+                train_df, val_df = batch_df[:idx_split], batch_df[idx_split:]
+            if len(train_df) > 0:
+                train_df.drop("timestamp").write_parquet(
+                    train_out_dir / f"part_{train_file_idx:05d}.parquet"
                 )
-                train_data_batches.append(train_df)
-            if not val_df.empty:
-                val_df = val_df.drop(columns=["timestamp"])
-                val_df.to_parquet(
-                    val_out_dir / f"part_{val_file_idx:05d}.parquet",
-                    index=False,
-                    engine="pyarrow",
+            if len(val_df) > 0:
+                val_df.drop("timestamp").write_parquet(
+                    val_out_dir / f"part_{val_file_idx:05d}.parquet"
                 )
-                val_data_batches.append(val_df)
 
-        # --- логирование ---
-        def log_message_dist(df, name):
-            if "target" in df.columns:
-                counts = df["target"].value_counts(dropna=False).to_dict()
-            else:
-                counts = {}
-            log_message(f"{name}: rows={len(df)}; target_counts={counts}")
-
-            # Дополнительно: проверяем наличие признаков
-            if hasattr(self, "feature_columns"):
-                missing_features = [
-                    f for f in self.feature_columns if f not in df.columns
-                ]
-                if missing_features:
-                    log_message(f"⚠️ В {name} отсутствуют признаки: {missing_features}")
-                else:
-                    log_message(
-                        f"✅ В {name} все признаки на месте: {len(self.feature_columns)} шт"
-                    )
-
-        train_data = (
-            pd.concat(train_data_batches, ignore_index=True)
-            if train_data_batches
-            else pd.DataFrame()
-        )
-        val_data = (
-            pd.concat(val_data_batches, ignore_index=True)
-            if val_data_batches
-            else pd.DataFrame()
-        )
-
-        log_message_dist(train_data, "TRAIN")
-        log_message_dist(val_data, "VAL")
-        log_message(f"split_time={split_time} split_by_time={split_by_time}")
-        log_message(
-            f"✅ Данные подготовлены: train={len(train_data)}, val={len(val_data)}"
-        )
-
-        return train_data, val_data
+        log_message("✅ Данные подготовлены (polars)")
+        return train_data_batches, val_data_batches
 
     def _get_copurchase_strength(self, item_id):
         """Получаем силу co-purchase связи"""
@@ -2465,14 +2305,7 @@ if __name__ == "__main__":
             split=0.2,
         )
 
-        # Разделяем на train/validation
-        users = train_data["user_id"].unique()
-        train_users, val_users = train_test_split(users, test_size=0.2, random_state=42)
-
-        train_df = train_data[train_data["user_id"].isin(train_users)]
-        val_df = train_data[train_data["user_id"].isin(val_users)]
-
-        log_message(f"Размер train: {len(train_df)}, validation: {len(val_df)}")
+        log_message(f"Размер train: {len(train_data)}, validation: {len(val_data)}")
         log_message(f"Признаки: {len(recommender.feature_columns)}")
         stage_time = time.time() - stage_start
         log_message(
@@ -2588,17 +2421,14 @@ if __name__ == "__main__":
         recommender.debug_data_info(train_df, "TRAIN")
         recommender.debug_data_info(val_df, "VAL")
 
-        # Проверяем признаки
+        # Логирование признаков
         if hasattr(recommender, "feature_columns"):
             log_message(f"Feature columns: {recommender.feature_columns}")
         else:
             log_message("❌ Feature columns не определены!")
 
-        if (
-            not train_data.empty
-            and hasattr(recommender, "feature_columns")
-            and recommender.feature_columns
-        ):
+        # Проверяем наличие данных и признаков перед обучением
+        if not train_df.empty and getattr(recommender, "feature_columns", None):
             model = recommender.train(train_df, val_df)
         else:
             log_message("❌ Нельзя обучать: нет данных или признаков")
