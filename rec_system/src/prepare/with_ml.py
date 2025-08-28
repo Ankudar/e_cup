@@ -44,7 +44,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=100_000_000):
+def load_train_data(max_parts=0, max_rows=500_000_000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -1477,7 +1477,7 @@ class LightGBMRecommender:
             self.model = lgb.train(
                 params,
                 train_dataset,
-                num_boost_round=10000,
+                num_boost_round=100_000,
                 valid_sets=valid_sets,
                 valid_names=valid_names,
                 callbacks=[lgb.early_stopping(50), log_every_N_iter],
