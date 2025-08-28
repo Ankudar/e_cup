@@ -2374,15 +2374,15 @@ if __name__ == "__main__":
         log_message(f"Обучение LightGBM завершено за {timedelta(seconds=stage_time)}")
 
         # === ОЦЕНКА МОДЕЛИ ===
-        stage_start = time.time()
-        log_message("=== ОЦЕНКА МОДЕЛИ ===")
-        train_ndcg = recommender.evaluate(train_df)
-        val_ndcg = recommender.evaluate(val_df)
+        # stage_start = time.time()
+        # log_message("=== ОЦЕНКА МОДЕЛИ ===")
+        # train_ndcg = recommender.evaluate(train_df)
+        # val_ndcg = recommender.evaluate(val_df)
 
-        log_message(f"NDCG@100 train: {train_ndcg:.4f}")
-        log_message(f"NDCG@100 val: {val_ndcg:.4f}")
-        stage_time = time.time() - stage_start
-        log_message(f"Оценка модели завершена за {timedelta(seconds=stage_time)}")
+        # log_message(f"NDCG@100 train: {train_ndcg:.4f}")
+        # log_message(f"NDCG@100 val: {val_ndcg:.4f}")
+        # stage_time = time.time() - stage_start
+        # log_message(f"Оценка модели завершена за {timedelta(seconds=stage_time)}")
 
         # Анализ важности признаков
         stage_start = time.time()
