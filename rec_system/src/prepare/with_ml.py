@@ -44,7 +44,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=1000):
+def load_train_data(max_parts=0, max_rows=5_000_000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -1155,6 +1155,7 @@ class LightGBMRecommender:
         negatives_per_positive=0,
         split: float = 0.2,
     ):
+
         log_message(
             "Подготовка данных для LightGBM (streaming, polars lazy, векторно)..."
         )
@@ -1166,7 +1167,7 @@ class LightGBMRecommender:
         for p in [interactions_out_dir, train_out_dir, val_out_dir]:
             p.mkdir(parents=True, exist_ok=True)
 
-        # --- объединяем все interactions ---
+        # --- объединяем interactions ---
         interactions_lazy = pl.concat(
             [
                 pl.scan_parquet(str(f)).select(
@@ -1185,13 +1186,13 @@ class LightGBMRecommender:
                 pl.col("timestamp").max().alias("max_ts"),
             ]
         ).collect()
-        min_timestamp, max_timestamp = ts_bounds[0, "min_ts"], ts_bounds[0, "max_ts"]
-        duration = max_timestamp - min_timestamp
+        min_ts, max_ts = ts_bounds[0, "min_ts"], ts_bounds[0, "max_ts"]
+        duration = max_ts - min_ts
         split_by_time = duration > timedelta(0)
         split_time = (
-            max_timestamp - timedelta(seconds=duration.total_seconds() * split)
+            max_ts - timedelta(seconds=duration.total_seconds() * split)
             if split_by_time
-            else max_timestamp
+            else max_ts
         )
         train_timestamp_fill = split_time - timedelta(seconds=1)
 
@@ -1223,12 +1224,7 @@ class LightGBMRecommender:
             item_feats_df = None
             item_feat_cols = []
 
-        feature_cols = ["copurchase_count"] + user_feat_cols + item_feat_cols
-        self.feature_columns = feature_cols
-
-        # --- подготовка популярности ---
-        all_items = np.array(list(item_map.keys()))
-        popular_items_set = set(popularity_s.nlargest(10000).index.astype(np.int64))
+        self.feature_columns = ["copurchase_count"] + user_feat_cols + item_feat_cols
 
         # --- подвыборка orders ---
         orders_pdf = orders_ddf.compute().sample(frac=sample_fraction)
@@ -1246,6 +1242,7 @@ class LightGBMRecommender:
         )
 
         # --- негативные ---
+        log_message(f"Negatives к positive: {negatives_per_positive}")
         if negatives_per_positive > 0:
             neg_rows = []
             user_ids = merged["user_id"].unique().to_numpy()
@@ -1256,7 +1253,7 @@ class LightGBMRecommender:
                 )
                 excluded_items = set(user_data["item_id"].to_numpy())
                 available_items = np.array(
-                    [i for i in all_items if i not in excluded_items]
+                    [i for i in item_map.keys() if i not in excluded_items]
                 )
                 n_neg = len(user_pos_items) * negatives_per_positive
                 if n_neg == 0 or len(available_items) == 0:
@@ -1293,7 +1290,7 @@ class LightGBMRecommender:
             merged = merged.join(item_feats_df, on="item_id", how="left")
 
         # --- copurchase_count ---
-        if copurchase_map is not None:
+        if copurchase_map:
             copurchase_df = pl.DataFrame(
                 [
                     {
@@ -1306,9 +1303,9 @@ class LightGBMRecommender:
                 ]
             )
             merged = merged.join(copurchase_df, on="item_id", how="left")
-            merged = merged.with_columns([pl.col("copurchase_count").fill_null(0.0)])
+            merged = merged.with_columns(pl.col("copurchase_count").fill_null(0.0))
         else:
-            merged = merged.with_columns([pl.lit(0.0).alias("copurchase_count")])
+            merged = merged.with_columns(pl.lit(0.0).alias("copurchase_count"))
 
         # --- split train/val ---
         if split_by_time:
@@ -1322,14 +1319,28 @@ class LightGBMRecommender:
                 idx_split:
             ].drop("timestamp")
 
-        # --- сохраняем батчами с прогресс-баром ---
-        for i, df in enumerate([train_df, val_df]):
-            out_dir = train_out_dir if i == 0 else val_out_dir
-            df_batches = df.partition_by("user_id")
-            for j, b in enumerate(
-                tqdm(df_batches, desc=f"Запись батчей {'train' if i==0 else 'val'}")
+        # --- функция записи чанками ~1 ГБ ---
+        def write_parquet_in_chunks(
+            df: pl.DataFrame,
+            out_dir: Path,
+            prefix: str,
+            chunk_size_bytes: int = 1_000_000_000,
+        ):
+            out_dir.mkdir(parents=True, exist_ok=True)
+            total_rows = df.height
+            row_size_est = max(df.estimated_size() / total_rows, 1)
+            rows_per_chunk = max(int(chunk_size_bytes / row_size_est), 1)
+            for start in tqdm(
+                range(0, total_rows, rows_per_chunk), desc=f"Запись {prefix}"
             ):
-                b.write_parquet(out_dir / f"part_{j:05d}.parquet")
+                end = min(start + rows_per_chunk, total_rows)
+                df[start:end].write_parquet(
+                    out_dir / f"{prefix}_{start:09d}_{end:09d}.parquet"
+                )
+
+        # --- сохраняем ---
+        write_parquet_in_chunks(train_df, train_out_dir, "train")
+        write_parquet_in_chunks(val_df, val_out_dir, "val")
 
         log_message("✅ Данные подготовлены (streaming lazy polars, векторно)")
         return train_out_dir, val_out_dir
@@ -1443,7 +1454,7 @@ class LightGBMRecommender:
 
         # Callback для логирования
         def log_every_N_iter(env):
-            if env.iteration % 10 == 0:
+            if env.iteration % 50 == 0:
                 metrics = ", ".join(
                     [
                         f"{name}_{metric}:{val:.4f}"
@@ -1456,7 +1467,7 @@ class LightGBMRecommender:
             self.model = lgb.train(
                 params,
                 train_dataset,
-                num_boost_round=1000,
+                num_boost_round=10000,
                 valid_sets=valid_sets,
                 valid_names=valid_names,
                 callbacks=[lgb.early_stopping(50), log_every_N_iter],
@@ -2220,7 +2231,7 @@ if __name__ == "__main__":
             item_features_dict=item_features_dict,
             embeddings_dict=embeddings_dict,
             sample_fraction=config["sample_fraction"],
-            negatives_per_positive=3,
+            negatives_per_positive=0,
             split=0.2,
         )
 
