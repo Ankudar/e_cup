@@ -8,7 +8,6 @@ from datetime import datetime, timedelta
 
 import dask.dataframe as dd
 import numpy as np
-import pandas as pd
 from tqdm import tqdm
 
 # --- ЛОГИРОВАНИЕ ---
@@ -23,212 +22,177 @@ MODEL_PATH = "/home/root6/python/e_cup/rec_system/src/models/lgbm_model_full.pkl
 TEST_USERS_PATH = "/home/root6/python/e_cup/rec_system/data/raw/test_users/*.parquet"
 OUTPUT_PATH = "/home/root6/python/e_cup/rec_system/result/submission.csv"
 TOP_K = 100
-USER_BATCH_SIZE = 1000
-CANDIDATES_PER_USER = 2000
 
-# --- загрузка модели ---
-logger.info("Загружаем модель из %s", MODEL_PATH)
+# --- Загрузка модели ---
+logger.info(f"Загружаем модель из {MODEL_PATH}")
 with open(MODEL_PATH, "rb") as f:
     model_data = pickle.load(f)
 
-# Сначала посмотрим, что на самом деле в model_data
-logger.info(f"Тип model_data: {type(model_data)}")
+# тумблеры, что используем для рекомендаций. 1 вкл, 0 выкл.
+# еще не реализованно. посмотреть какие фичи пришли с моделью, а то всякое может быть....
 
+""""
+Активность пользователя
+user_count — сколько всего заказов сделал пользователь
+user_mean — средняя цена/сумма/др.
+user_orders_count — количество уникальных заказов
+
+Характеристики товара
+item_count — количество раз, когда товар встречался
+item_orders_count — сколько раз товар покупали (популярность!)
+item_category — категория товара (числовая кодировка или one-hot)
+
+Совместные признаки
+user_item_count — сколько раз пользователь взаимодействовал именно с этим товаром
+user_item_recency — давность взаимодействия
+
+Категории
+user_category_count — сколько раз юзер покупал из этой категории
+user_category_share — доля этой категории у пользователя
+item_category_popularity — популярность категории
+"""
+
+feature_weights = {
+    # Активность пользователя
+    "user_count": 1.0,
+    "user_mean": 1.0,
+    "user_orders_count": 1.0,
+    # Характеристики товара
+    "item_count": 1.0,
+    "item_orders_count": 1.0,
+    "item_category": 1.0,
+    # Совместные признаки
+    "user_item_count": 1.0,
+    "user_item_recency": 1.0,
+    # Категории
+    "user_category_count": 1.0,
+    "user_category_share": 1.0,
+    "item_category_popularity": 1.0,
+}
+
+# --- Поиск модели и feature_columns ---
 if isinstance(model_data, dict):
-    logger.info(f"Ключи в model_data: {list(model_data.keys())}")
-    for key, value in model_data.items():
-        logger.info(f"model_data['{key}'] тип: {type(value)}")
-
-    # Попробуем найти модель и feature_columns
     model = None
     feature_columns = None
-
-    # Ищем модель
     for key, value in model_data.items():
         if hasattr(value, "predict") or "lightgbm" in str(type(value)).lower():
             model = value
-            logger.info(f"Найдена модель в ключе: {key}")
-            break
-
-    # Ищем feature_columns
-    for key, value in model_data.items():
-        if (
-            isinstance(value, (list, tuple))
-            and len(value) > 0
-            and isinstance(value[0], str)
-        ):
+        if isinstance(value, (list, tuple)) and all(isinstance(x, str) for x in value):
             feature_columns = value
-            logger.info(f"Найдены feature_columns в ключе: {key}")
-            break
 
     if model is None:
-        # Если не нашли, возможно model_data и есть модель
-        if hasattr(model_data, "predict"):
-            model = model_data
-            logger.info("model_data является моделью")
-        else:
-            raise ValueError("Не удалось найти модель в model_data")
-
+        raise ValueError("Не удалось найти модель в model_data")
     if feature_columns is None:
-        # Пробуем получить feature_columns из модели или создать список фич
-        try:
-            if hasattr(model, "feature_name_"):
-                feature_columns = model.feature_name_
-            elif hasattr(model, "feature_names"):
-                feature_columns = model.feature_names
-            else:
-                # Создаем feature_columns на основе ожидаемых фич
-                feature_columns = [
-                    "user_count",
-                    "user_mean",
-                    "user_orders_count",
-                    "item_count",
-                    "item_orders_count",
-                    "item_category",
-                ]
-                logger.warning(
-                    f"Используем дефолтные feature_columns: {feature_columns}"
-                )
-        except:
-            feature_columns = [
+        feature_columns = getattr(
+            model,
+            "feature_name_",
+            [
                 "user_count",
                 "user_mean",
                 "user_orders_count",
                 "item_count",
                 "item_orders_count",
                 "item_category",
-            ]
-            logger.warning(f"Используем дефолтные feature_columns: {feature_columns}")
-
+            ],
+        )
 else:
-    # model_data не словарь, возможно это сама модель
     if hasattr(model_data, "predict"):
         model = model_data
-        logger.info("model_data является моделью")
-        # Пробуем получить feature_columns
-        try:
-            if hasattr(model, "feature_name_"):
-                feature_columns = model.feature_name_
-            elif hasattr(model, "feature_names"):
-                feature_columns = model.feature_names
-            else:
-                feature_columns = [
-                    "user_count",
-                    "user_mean",
-                    "user_orders_count",
-                    "item_count",
-                    "item_orders_count",
-                    "item_category",
-                ]
-                logger.warning(
-                    f"Используем дефолтные feature_columns: {feature_columns}"
-                )
-        except:
-            feature_columns = [
+        feature_columns = getattr(
+            model,
+            "feature_name_",
+            [
                 "user_count",
                 "user_mean",
                 "user_orders_count",
                 "item_count",
                 "item_orders_count",
                 "item_category",
-            ]
-            logger.warning(f"Используем дефолтные feature_columns: {feature_columns}")
+            ],
+        )
     else:
         raise ValueError(f"Неизвестный тип model_data: {type(model_data)}")
 
-logger.info(f"Тип модели: {type(model)}")
-logger.info(f"Количество фич: {len(feature_columns)}")
-logger.info(f"Первые 10 фич: {feature_columns[:10]}")
+logger.info(f"Модель: {type(model)}, количество фич: {len(feature_columns)}")
 
 
-# ===== ВЕКТОРИЗИРОВАННАЯ ФУНКЦИЯ ДЛЯ ПОДГОТОВКИ ФИЧ =====
+# ===== УНИВЕРСАЛЬНАЯ ФУНКЦИЯ ВЫРАВНИВАНИЯ ВЕКТОРОВ =====
+def resize_vector(vec, target_size):
+    vec = np.asarray(vec, dtype=np.float32)
+    if len(vec) > target_size:
+        return vec[:target_size]
+    elif len(vec) < target_size:
+        return np.pad(vec, (0, target_size - len(vec)), mode="constant")
+    return vec
+
+
+# ===== ПОДГОТОВКА ФИЧ ДЛЯ КАНДИДАТОВ =====
 def prepare_features_vectorized(
-    user_id, candidates, user_features_dict, item_features_dict, feature_columns
+    user_feats_array, candidates, item_features_dict, feature_columns
 ):
-    """Векторизированная подготовка признаков для кандидатов"""
-    num_candidates = len(candidates)
+    """
+    user_feats_array: любая структура user_features_dict[uid]
+    candidates: список item_id
+    item_features_dict: dict[item_id] -> np.ndarray
+    """
+    expected_dim = len(feature_columns)
+    user_vec = get_user_vector(user_feats_array, feature_columns)
+    user_vec = resize_vector(user_vec, expected_dim)
 
-    # Создаем матрицу признаков
-    features_matrix = np.zeros((num_candidates, len(feature_columns)), dtype=np.float32)
+    item_vecs = []
+    for item_id in candidates:
+        item_vec = item_features_dict.get(item_id)
+        if item_vec is None:
+            item_vec = np.zeros(expected_dim, dtype=np.float32)
+        else:
+            item_vec = resize_vector(item_vec, expected_dim)
+        final_vec = user_vec + item_vec
+        item_vecs.append(final_vec)
 
-    # Получаем user features
-    user_feats = user_features_dict.get(user_id, {})
-
-    # Заполняем user features
-    for j, feat_name in enumerate(feature_columns):
-        if feat_name in user_feats:
-            features_matrix[:, j] = user_feats[feat_name]
-
-    # Заполняем item features
-    for j, feat_name in enumerate(feature_columns):
-        if any(
-            feat_name.startswith(prefix) for prefix in ["item_", "fclip_", "category_"]
-        ):
-            for i, item_id in enumerate(candidates):
-                item_feats = item_features_dict.get(item_id, {})
-                if feat_name in item_feats:
-                    features_matrix[i, j] = item_feats[feat_name]
-
-    return features_matrix
+    return np.array(item_vecs, dtype=np.float32)
 
 
-# ===== ГЕНЕРАЦИЯ РЕКОМЕНДАЦИЙ =====
+# ===== ГЕНЕРАЦИЯ РЕКОМЕНДАЦИЙ ДЛЯ ОДНОГО ПОЛЬЗОВАТЕЛЯ =====
 def get_user_recommendations(user_id, top_k=100, **kwargs):
-    """СУПЕР-БЫСТРАЯ функция: персонализированные рекомендации с векторизацией"""
     try:
-        recent_items_get = kwargs.get("recent_items_get")
-        popular_items_array = kwargs.get("popular_items_array")
-        model = kwargs.get("model")
-        feature_columns = kwargs.get("feature_columns")
-        copurchase_map = kwargs.get("copurchase_map")
-        item_to_cat = kwargs.get("item_to_cat")
-        cat_to_items = kwargs.get("cat_to_items")
-        item_map = kwargs.get("item_map")
-        user_features_dict = kwargs.get("user_features_dict")
-        item_features_dict = kwargs.get("item_features_dict")
+        user_features_dict = kwargs["user_features_dict"]
+        item_features_dict = kwargs["item_features_dict"]
+        model = kwargs["model"]
+        feature_columns = kwargs["feature_columns"]
+        recent_items_get = kwargs["recent_items_get"]
+        popular_items_array = kwargs["popular_items_array"]
+        copurchase_map = kwargs["copurchase_map"]
+        item_to_cat = kwargs["item_to_cat"]
+        cat_to_items = kwargs["cat_to_items"]
+        item_map = kwargs["item_map"]
 
-        # недавние товары пользователя
         recent_items = recent_items_get(user_id, [])
 
         # Генерация кандидатов
         candidates = set()
+        N_RECENT = 15  # последние N_RECENT товаров пользователя, чем больше значение тем больше персонализация (купленные не учитываеются)
+        N_COPURCHASE = 5  # что покупалось вместе с товаром, увеличение дает больше связанных товаров (что было в одной корзине)
+        N_CATEGORY = 15  # товары из той же категории что были недавно куплены
+        N_POPULAR = 20  # просто топ популярынх товаров,
 
-        N_RECENT = 5
-        N_COPURCHASE = 5
-        N_CATEGORY = 5
-        N_POPULAR = 30
-
-        # 1. Недавние товары
         candidates.update(recent_items[:N_RECENT])
-
-        # 2. Co-purchase товары
         for item in recent_items[:10]:
-            co_items = copurchase_map.get(item, [])
-            candidates.update(co_items[:N_COPURCHASE])
-
-        # 3. Товары из тех же категорий
+            candidates.update(copurchase_map.get(item, [])[:N_COPURCHASE])
         for item in recent_items[:5]:
             cat_id = item_to_cat.get(item)
             if cat_id and cat_id in cat_to_items:
                 candidates.update(cat_to_items[cat_id][:N_CATEGORY])
-
-        # 4. Популярные товары как fallback
         candidates.update(popular_items_array[:N_POPULAR])
-
-        # Фильтруем существующие товары
         candidates = [c for c in candidates if c in item_map]
 
         if not candidates:
             return popular_items_array[:top_k].tolist()
 
-        # === 🔥 Адаптивный cut-off кандидатов ===
         if len(recent_items) < 3:
-            max_cands = 500  # для "новых" пользователей
+            max_cands = 500
         else:
-            max_cands = 300  # для активных пользователей
-
+            max_cands = 300
         if len(candidates) > max_cands:
-            # оставляем наиболее популярные среди кандидатов
             popularity_rank = {
                 item: idx for idx, item in enumerate(popular_items_array)
             }
@@ -236,50 +200,40 @@ def get_user_recommendations(user_id, top_k=100, **kwargs):
                 :max_cands
             ]
 
-        # Векторизированная подготовка признаков
         X_candidate = prepare_features_vectorized(
-            user_id, candidates, user_features_dict, item_features_dict, feature_columns
+            user_features_dict[user_id], candidates, item_features_dict, feature_columns
         )
-
-        # Предсказания
         predictions = model.predict(X_candidate)
 
-        # Сортируем и получаем топ-K
         sorted_indices = np.argsort(predictions)[::-1][:top_k]
         top_recs = [candidates[i] for i in sorted_indices]
 
-        # Заполняем популярными, если не хватает
+        # Заполнение популярными
         if len(top_recs) < top_k:
-            additional_items = []
             for item in popular_items_array:
-                if item not in top_recs and item not in additional_items:
-                    additional_items.append(item)
-                if len(top_recs) + len(additional_items) >= top_k:
+                if item not in top_recs:
+                    top_recs.append(item)
+                if len(top_recs) >= top_k:
                     break
-            top_recs.extend(additional_items)
-            top_recs = top_recs[:top_k]
 
         return top_recs
 
     except Exception as e:
-        logger.error(f"Error for user {user_id}: {e}")
+        # logger.error(f"Error for user {user_id}: {e}")
         return popular_items_array[:top_k].tolist()
 
 
-# ===== КЭШ ДЛЯ ПОХОЖИХ ПОЛЬЗОВАТЕЛЕЙ =====
+# ===== КЭШ =====
 user_recommendation_cache = {}
 similar_user_threshold = 5
 
 
 def get_user_recommendations_with_cache(user_id, top_k=100, **kwargs):
-    """Рекомендации с кэшированием"""
     recent_items_get = kwargs.get("recent_items_get")
-
     if user_id in user_recommendation_cache:
         return user_recommendation_cache[user_id]
 
     recent_items = recent_items_get(user_id, [])
-
     for cached_user_id, cached_recs in user_recommendation_cache.items():
         cached_recent = recent_items_get(cached_user_id, [])
         if len(set(recent_items) & set(cached_recent)) >= similar_user_threshold:
@@ -289,11 +243,10 @@ def get_user_recommendations_with_cache(user_id, top_k=100, **kwargs):
     recs = get_user_recommendations(user_id, top_k, **kwargs)
     if len(user_recommendation_cache) < 10000:
         user_recommendation_cache[user_id] = recs
-
     return recs
 
 
-# ===== ОБРАБОТКА ВСЕХ ПОЛЬЗОВАТЕЛЕЙ =====
+# ===== ГЕНЕРАЦИЯ ДЛЯ ВСЕХ ПОЛЬЗОВАТЕЛЕЙ =====
 def generate_recommendations_for_users(
     test_users,
     model,
@@ -310,21 +263,17 @@ def generate_recommendations_for_users(
     log_message,
     output_path=None,
 ):
-    log_message("=== ГЕНЕРАЦИЯ РЕКОМЕНДАЦИЙ (super_fast + cache) ===")
     stage_start = time.time()
-
     popular_items_array = np.array(popular_items, dtype=np.int64)
     recent_items_get = recent_items_map.get
-
     recommendations = {}
     processed = 0
-    batch_size = 100  # Увеличиваем батч благодаря оптимизации
+    batch_size = 100
     header_written = False
 
     with tqdm(total=len(test_users), desc="Создание рекомендаций") as pbar:
         for i in range(0, len(test_users), batch_size):
             batch_users = test_users[i : i + batch_size]
-
             for user_id in batch_users:
                 try:
                     recommendations[user_id] = get_user_recommendations_with_cache(
@@ -361,15 +310,11 @@ def generate_recommendations_for_users(
 
     if output_path and recommendations:
         save_recommendations_to_csv(
-            recommendations,
-            output_path,
-            log_message,
-            header=not header_written,
+            recommendations, output_path, log_message, header=not header_written
         )
 
     stage_time = time.time() - stage_start
     log_message(f"Генерация завершена за {timedelta(seconds=stage_time)}")
-
     return recommendations
 
 
@@ -380,52 +325,96 @@ def save_recommendations_to_csv(recommendations, output_path, log_message, heade
         if header:
             f.write("user_id,item_id_1 item_id_2 ... item_id_100\n")
         for user_id, items in recommendations.items():
-            items_str = " ".join(str(int(item)) for item in items)
-            f.write(f"{int(user_id)},{items_str}\n")
+            f.write(f"{int(user_id)},{' '.join(map(str, map(int, items)))}\n")
 
 
+def get_user_vector(user_feat_entry, feature_columns):
+    """
+    Преобразует любую структуру user_features_dict[uid] в numpy-вектор нужной длины
+    """
+    if isinstance(user_feat_entry, np.ndarray):
+        if len(user_feat_entry) == 1 and isinstance(user_feat_entry[0], dict):
+            user_dict = user_feat_entry[0]
+            return np.array(
+                [float(user_dict.get(f, 0.0)) for f in feature_columns],
+                dtype=np.float32,
+            )
+        else:
+            return np.asarray(user_feat_entry, dtype=np.float32)
+    elif isinstance(user_feat_entry, dict):
+        return np.array(
+            [float(user_feat_entry.get(f, 0.0)) for f in feature_columns],
+            dtype=np.float32,
+        )
+    elif isinstance(user_feat_entry, (float, int, np.number)):
+        return np.full(len(feature_columns), float(user_feat_entry), dtype=np.float32)
+    else:
+        return np.zeros(len(feature_columns), dtype=np.float32)
+
+
+# ===== MAIN =====
 if __name__ == "__main__":
     start_time = time.time()
     log_file = "/home/root6/python/e_cup/rec_system/predict_log.txt"
 
-    def log_message(message: str):
+    def log_message(msg):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        msg = f"[{timestamp}] {message}"
-        print(msg)
+        full_msg = f"[{timestamp}] {msg}"
+        print(full_msg)
         with open(log_file, "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
+            f.write(full_msg + "\n")
 
     try:
         log_message("=== Запуск генерации рекомендаций ===")
-
-        # Загрузка данных
         test_df = dd.read_parquet(TEST_USERS_PATH).compute()
         test_users = test_df["user_id"].unique().tolist()
         log_message(f"Загружено {len(test_users)} пользователей")
 
-        # Загрузка вспомогательных данных
-        data_paths = {
-            "recent_items_map": "/home/root6/python/e_cup/rec_system/data/processed/recent_items_map.pkl",
-            "copurchase_map": "/home/root6/python/e_cup/rec_system/data/processed/copurchase_map.pkl",
-            "item_to_cat": "/home/root6/python/e_cup/rec_system/data/processed/item_to_cat.pkl",
-            "cat_to_items": "/home/root6/python/e_cup/rec_system/data/processed/cat_to_items.pkl",
-            "user_features_dict": "/home/root6/python/e_cup/rec_system/data/processed/user_features_dict.pkl",
-            "item_features_dict": "/home/root6/python/e_cup/rec_system/data/processed/item_features_dict.pkl",
-            "item_map": "/home/root6/python/e_cup/rec_system/data/processed/item_map.pkl",
-            "popular_items": "/home/root6/python/e_cup/rec_system/data/processed/popular_items.pkl",
+        loaded_data = {
+            "recent_items_map": model_data["recent_items_map"],
+            "copurchase_map": model_data["copurchase_map"],
+            "item_to_cat": model_data["item_to_cat"],
+            "user_features_dict": model_data["user_features_dict"],
+            "item_features_dict": model_data["item_features_dict"],
+            "item_map": model_data["item_map"],
+            "popular_items": model_data["popular_items"],
         }
 
-        loaded_data = {}
-        for name, path in data_paths.items():
-            try:
-                with open(path, "rb") as f:
-                    loaded_data[name] = pickle.load(f)
-                log_message(f"Загружен {name}")
-            except Exception as e:
-                log_message(f"Ошибка загрузки {name}: {e}")
-                raise
+        # Создаем cat_to_items
+        cat_to_items = {}
+        for item_id, cat_id in loaded_data["item_to_cat"].items():
+            cat_to_items.setdefault(cat_id, []).append(item_id)
+        loaded_data["cat_to_items"] = cat_to_items
 
-        # Генерация рекомендаций
+        # Выравнивание размерностей user/item фич
+        expected_len = len(feature_columns)
+        for uid in loaded_data["user_features_dict"]:
+            user_feat_val = loaded_data["user_features_dict"][uid]
+            if (
+                isinstance(user_feat_val, np.ndarray)
+                and len(user_feat_val) == 1
+                and isinstance(user_feat_val[0], dict)
+            ):
+                user_feat_dict = user_feat_val[0]
+                loaded_data["user_features_dict"][uid] = resize_vector(
+                    [user_feat_dict.get(feat, 0) for feat in feature_columns],
+                    expected_len,
+                )
+            elif isinstance(user_feat_val, np.ndarray):
+                loaded_data["user_features_dict"][uid] = resize_vector(
+                    user_feat_val, expected_len
+                )
+            else:
+                # на всякий случай словарь
+                loaded_data["user_features_dict"][uid] = resize_vector(
+                    [user_feat_val.get(feat, 0) for feat in feature_columns],
+                    expected_len,
+                )
+        for iid in loaded_data["item_features_dict"]:
+            loaded_data["item_features_dict"][iid] = resize_vector(
+                loaded_data["item_features_dict"][iid], expected_len
+            )
+
         recommendations = generate_recommendations_for_users(
             test_users=test_users,
             model=model,
@@ -446,9 +435,9 @@ if __name__ == "__main__":
         log_message("=== Завершено успешно ===")
 
     except Exception as e:
-        error_msg = f"Ошибка: {str(e)}"
-        log_message(error_msg)
+        log_message(f"Ошибка: {e}")
         raise
+
 
 # что сейчас учитывается
 # 1) Полный список факторов для формирования рекомендаций:
