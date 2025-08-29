@@ -1,5 +1,6 @@
 import gc
 import glob
+import glob as glob_module
 import json
 import os
 import pickle
@@ -44,7 +45,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=500_000_000):
+def load_train_data(max_parts=0, max_rows=100_000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -251,6 +252,7 @@ def prepare_interactions(
     action_weights=None,
     scale_days=5,
     output_dir="/home/root6/python/e_cup/rec_system/data/processed/prepare_interactions_batches",
+    force_recreate=False,  # Добавляем флаг для принудительного пересоздания
 ):
     log_message("Формируем матрицу взаимодействий по батчам...")
 
@@ -261,10 +263,29 @@ def prepare_interactions(
     batch_files = []
     ref_time = train_orders_df["created_timestamp"].max()
 
+    # Проверяем, есть ли уже файлы
+    existing_files = glob_module.glob(os.path.join(output_dir, "*.parquet"))
+    if existing_files and not force_recreate:
+        log_message(
+            f"✅ Найдено {len(existing_files)} существующих файлов, пропускаем создание"
+        )
+        return existing_files
+
     # ====== Orders ======
     log_message("... для orders")
     n_rows = len(train_orders_df)
+    orders_files = []
+
     for start in range(0, n_rows, batch_size):
+        batch_path = os.path.join(output_dir, f"orders_batch_{start}.parquet")
+        orders_files.append(batch_path)
+
+        # Проверяем, существует ли уже этот батч
+        if os.path.exists(batch_path) and not force_recreate:
+            log_message(f"✅ Orders батч {start} уже существует, пропускаем")
+            batch_files.append(batch_path)
+            continue
+
         batch = train_orders_df.iloc[start : start + batch_size].copy()
         days_ago = (ref_time - batch["created_timestamp"]).dt.days.clip(lower=1)
         time_factor = np.log1p(days_ago / scale_days)
@@ -274,9 +295,8 @@ def prepare_interactions(
             action_type="order",
         )[["user_id", "item_id", "weight", "timestamp", "action_type"]]
 
-        path = os.path.join(output_dir, f"orders_batch_{start}.parquet")
-        batch.to_parquet(path, index=False, engine="pyarrow")
-        batch_files.append(path)
+        batch.to_parquet(batch_path, index=False, engine="pyarrow")
+        batch_files.append(batch_path)
         del batch
         gc.collect()
         log_message(f"Сохранен orders-батч {start}-{min(start+batch_size, n_rows)}")
@@ -287,7 +307,20 @@ def prepare_interactions(
 
     # Итерируемся по партициям Dask DataFrame
     n_partitions = tracker_ddf.npartitions
+    tracker_files = []
+
     for partition_id in range(n_partitions):
+        batch_path = os.path.join(output_dir, f"tracker_part_{partition_id}.parquet")
+        tracker_files.append(batch_path)
+
+        # Проверяем, существует ли уже эта партиция
+        if os.path.exists(batch_path) and not force_recreate:
+            log_message(
+                f"✅ Tracker партиция {partition_id} уже существует, пропускаем"
+            )
+            batch_files.append(batch_path)
+            continue
+
         # Вычисляем одну партицию
         part = tracker_ddf.get_partition(partition_id).compute()
         part["timestamp"] = pd.to_datetime(part["timestamp"])
@@ -298,6 +331,11 @@ def prepare_interactions(
         part = part.loc[mask]
 
         if part.empty:
+            # Создаем пустой файл чтобы отметить, что партиция обработана
+            pd.DataFrame(
+                columns=["user_id", "item_id", "weight", "timestamp", "action_type"]
+            ).to_parquet(batch_path, index=False, engine="pyarrow")
+            batch_files.append(batch_path)
             continue
 
         aw = part["action_type"].map(action_weights).fillna(0)
@@ -307,15 +345,54 @@ def prepare_interactions(
             ["user_id", "item_id", "weight", "timestamp", "action_type"]
         ]
 
-        path = os.path.join(output_dir, f"tracker_part_{partition_id}.parquet")
-        part.to_parquet(path, index=False, engine="pyarrow")
-        batch_files.append(path)
+        part.to_parquet(batch_path, index=False, engine="pyarrow")
+        batch_files.append(batch_path)
         del part
         gc.collect()
         log_message(f"Сохранен tracker-партиция {partition_id}")
 
-    log_message("Все батчи сохранены на диск.")
+    # Проверяем целостность: все ли файлы созданы
+    expected_files = orders_files + tracker_files
+    missing_files = [f for f in expected_files if not os.path.exists(f)]
+
+    if missing_files:
+        log_message(
+            f"⚠️  Предупреждение: отсутствуют {len(missing_files)} файлов: {missing_files}"
+        )
+    else:
+        log_message("✅ Все батчи успешно созданы или уже существуют")
+
+    log_message(f"Всего файлов: {len(batch_files)}")
     return batch_files
+
+
+def check_interactions_files_complete(output_dir):
+    """Проверяет, все ли файлы взаимодействий существуют и не повреждены"""
+    import pyarrow.parquet as pq
+
+    files = glob.glob(os.path.join(output_dir, "*.parquet"))
+    if not files:
+        return False, "Нет файлов в директории"
+
+    valid_files = []
+    corrupted_files = []
+
+    for file_path in files:
+        try:
+            # Быстрая проверка: можно ли открыть файл
+            table = pq.read_table(file_path)
+            if table.num_rows > 0:
+                valid_files.append(file_path)
+            else:
+                corrupted_files.append(file_path)
+        except Exception as e:
+            corrupted_files.append(file_path)
+            log_message(f"❌ Файл {file_path} поврежден: {e}")
+
+    return (
+        len(corrupted_files) == 0,
+        f"Валидных: {len(valid_files)}, Поврежденных: {len(corrupted_files)}",
+    )
 
 
 # -------------------- Глобальная популярность --------------------
@@ -1155,7 +1232,6 @@ class LightGBMRecommender:
         negatives_per_positive=0,
         split: float = 0.2,
     ):
-
         log_message(
             "Подготовка данных для LightGBM (streaming, polars lazy, векторно)..."
         )
@@ -1167,7 +1243,7 @@ class LightGBMRecommender:
         for p in [interactions_out_dir, train_out_dir, val_out_dir]:
             p.mkdir(parents=True, exist_ok=True)
 
-        # --- объединяем interactions ---
+        # --- 1. Объединяем interactions лениво ---
         interactions_lazy = pl.concat(
             [
                 pl.scan_parquet(str(f)).select(
@@ -1179,14 +1255,26 @@ class LightGBMRecommender:
         interactions_all_path = interactions_out_dir / "interactions_all.parquet"
         interactions_lazy.sink_parquet(str(interactions_all_path))
 
-        # --- split_time ---
-        ts_bounds = interactions_lazy.select(
+        # --- 2. Обработка orders (sample + lazy) ---
+        if sample_fraction < 1.0:
+            sampled_orders = orders_ddf.sample(frac=sample_fraction, random_state=42)
+        else:
+            sampled_orders = orders_ddf
+
+        orders_tmp_dir = base_dir / "orders_sample_tmp"
+        orders_tmp_dir.mkdir(exist_ok=True)
+        sampled_orders.to_parquet(str(orders_tmp_dir), write_index=False)
+        orders_pl = pl.scan_parquet(str(orders_tmp_dir / "*.parquet"))
+
+        # --- 3. Определяем split_time на основе ORDERS ---
+        orders_ts_bounds = orders_pl.select(
             [
-                pl.col("timestamp").min().alias("min_ts"),
-                pl.col("timestamp").max().alias("max_ts"),
+                pl.col("created_timestamp").min().alias("min_ts"),
+                pl.col("created_timestamp").max().alias("max_ts"),
             ]
         ).collect()
-        min_ts, max_ts = ts_bounds[0, "min_ts"], ts_bounds[0, "max_ts"]
+
+        min_ts, max_ts = orders_ts_bounds[0, "min_ts"], orders_ts_bounds[0, "max_ts"]
         duration = max_ts - min_ts
         split_by_time = duration > timedelta(0)
         split_time = (
@@ -1196,17 +1284,18 @@ class LightGBMRecommender:
         )
         train_timestamp_fill = split_time - timedelta(seconds=1)
 
-        # --- user features ---
+        # --- 4. Подготовка фичей ---
         if user_features_dict:
-            user_feats_df = pl.LazyFrame(
+            user_feats_lazy = pl.LazyFrame(
                 [{"user_id": k, **v} for k, v in user_features_dict.items()]
             )
-            user_feat_cols = [c for c in user_feats_df.columns if c != "user_id"]
+            user_feat_cols = [
+                c for c in user_feats_lazy.collect_schema().names() if c != "user_id"
+            ]
         else:
-            user_feats_df = None
+            user_feats_lazy = None
             user_feat_cols = []
 
-        # --- item features ---
         if item_features_dict:
             items_data = []
             for item_id, feats in item_features_dict.items():
@@ -1215,48 +1304,28 @@ class LightGBMRecommender:
                     feats_copy["item_id"] = item_id
                     items_data.append(feats_copy)
                 elif isinstance(feats, np.ndarray):
-                    emb = {f"emb_{i}": feats[i] for i in range(min(30, feats.shape[0]))}
+                    emb = {
+                        f"emb_{i}": float(feats[i])
+                        for i in range(min(30, feats.shape[0]))
+                    }
                     emb["item_id"] = item_id
                     items_data.append(emb)
-            item_feats_df = pl.LazyFrame(items_data)
-            item_feat_cols = [c for c in item_feats_df.columns if c != "item_id"]
+            item_feats_lazy = pl.LazyFrame(items_data)
+            item_feat_cols = [
+                c for c in item_feats_lazy.collect_schema().names() if c != "item_id"
+            ]
         else:
-            item_feats_df = None
+            item_feats_lazy = None
             item_feat_cols = []
 
         self.feature_columns = ["copurchase_count"] + user_feat_cols + item_feat_cols
 
-        # --- подвыборка orders ---
-        if sample_fraction < 1.0:
-            sampled = orders_ddf.sample(frac=sample_fraction, random_state=42)
-        else:
-            sampled = orders_ddf
-
-        # --- сохраняем в несколько parquet-файлов ---
-        tmp_orders_path = base_dir / "orders_sample"
-        sampled.to_parquet(
-            tmp_orders_path,
-            write_index=False,
-            row_group_size=100_000_000,  # примерно столько строк в файле
-        )
-
-        # ленивое чтение orders (подхватывает все файлы)
-        orders_pl = pl.scan_parquet(str(tmp_orders_path) + "/*.parquet")
-
-        # --- базовый датасет ---
+        # --- 5. Основной мердж ---
         interactions_lazy = pl.scan_parquet(str(interactions_all_path))
+
         merged = orders_pl.join(
             interactions_lazy, on=["user_id", "item_id"], how="left"
-        )
-
-        # --- джойним фичи ---
-        if user_feats_df is not None and len(user_feats_df.columns) > 0:
-            merged = merged.join(user_feats_df.lazy(), on="user_id", how="left")
-
-        if item_feats_df is not None and len(item_feats_df.columns) > 0:
-            merged = merged.join(item_feats_df.lazy(), on="item_id", how="left")
-
-        merged = merged.with_columns(
+        ).with_columns(
             [
                 pl.col("timestamp").fill_null(train_timestamp_fill),
                 pl.col("weight").fill_null(0.0),
@@ -1264,95 +1333,115 @@ class LightGBMRecommender:
             ]
         )
 
-        # --- негативные ---
-        log_message(f"Negatives к positive: {negatives_per_positive}")
-        if negatives_per_positive > 0:
-            neg_rows = []
-            user_ids = merged["user_id"].unique().to_numpy()
-            for uid in tqdm(user_ids, desc="Генерация негативов"):
-                user_data = merged.filter(pl.col("user_id") == uid)
-                user_pos_items = set(
-                    user_data.filter(pl.col("target") == 1)["item_id"].to_numpy()
-                )
-                excluded_items = set(user_data["item_id"].to_numpy())
-                available_items = np.array(
-                    [i for i in item_map.keys() if i not in excluded_items]
-                )
-                n_neg = len(user_pos_items) * negatives_per_positive
-                if n_neg == 0 or len(available_items) == 0:
-                    continue
-                sampled = np.random.choice(available_items, n_neg, replace=False)
-                neg_rows.extend(
-                    [
-                        {
-                            "user_id": int(uid),
-                            "item_id": int(i),
-                            "timestamp": train_timestamp_fill,
-                            "target": 0,
-                            "weight": 0.0,
-                        }
-                        for i in sampled
-                    ]
-                )
-            if neg_rows:
-                neg_df = pl.DataFrame(neg_rows)
-                # выравниваем колонки и типы под merged
-                for c in merged.columns:
-                    if c not in neg_df.columns:
-                        neg_df = neg_df.with_columns(pl.lit(None).alias(c))
-                for c in merged.columns:
-                    if c in neg_df.columns:
-                        neg_df = neg_df.with_columns(neg_df[c].cast(merged[c].dtype))
-                neg_df = neg_df.select(merged.columns)
-                merged = pl.concat([merged, neg_df])
+        if user_feats_lazy is not None:
+            merged = merged.join(user_feats_lazy, on="user_id", how="left")
 
-        # --- user/item фичи ---
-        if user_feats_df is not None:
-            merged = merged.join(user_feats_df.lazy(), on="user_id", how="left")
-        if item_feats_df is not None:
-            merged = merged.join(item_feats_df.lazy(), on="item_id", how="left")
+        if item_feats_lazy is not None:
+            merged = merged.join(item_feats_lazy, on="item_id", how="left")
 
-        # --- copurchase_count ---
+        # --- 6. Copurchase count ---
         if copurchase_map:
-            copurchase_df = pl.LazyFrame(
-                [
-                    {
-                        "item_id": k,
-                        "copurchase_count": float(
-                            sum(c[1] if isinstance(c, tuple) else c for c in v)
-                        ),
-                    }
-                    for k, v in copurchase_map.items()
-                ]
-            )
-            merged = merged.join(copurchase_df, on="item_id", how="left")
+            copurchase_data = []
+            for k, v in copurchase_map.items():
+                count = sum(c[1] if isinstance(c, tuple) else c for c in v)
+                copurchase_data.append({"item_id": k, "copurchase_count": float(count)})
+
+            copurchase_lazy = pl.LazyFrame(copurchase_data)
+            merged = merged.join(copurchase_lazy, on="item_id", how="left")
             merged = merged.with_columns(pl.col("copurchase_count").fill_null(0.0))
         else:
             merged = merged.with_columns(pl.lit(0.0).alias("copurchase_count"))
 
+        # --- 7. Генерация негативов ---
+        if negatives_per_positive > 0:
+            log_message("Генерация негативов построчно...")
+
+            all_item_ids = list(item_map.keys())
+
+            def generate_negatives_for_user(user_data):
+                user_pos_items = user_data.filter(pl.col("target") == 1)[
+                    "item_id"
+                ].to_list()
+                user_all_items = user_data["item_id"].to_list()
+                if not user_pos_items:
+                    return None
+                n_neg = len(user_pos_items) * negatives_per_positive
+                available_items = [i for i in all_item_ids if i not in user_all_items]
+                if not available_items:
+                    return None
+                sampled = np.random.choice(
+                    available_items, min(n_neg, len(available_items)), replace=False
+                )
+                neg_rows = []
+                for item_id in sampled:
+                    neg_rows.append(
+                        {
+                            "user_id": user_data["user_id"][0],
+                            "item_id": item_id,
+                            "timestamp": train_timestamp_fill,
+                            "target": 0,
+                            "weight": 0.0,
+                            "copurchase_count": 0.0,
+                        }
+                    )
+                return pl.DataFrame(neg_rows)
+
+            negatives_list = []
+            user_chunks = (
+                merged.select("user_id")
+                .unique()
+                .collect()
+                .partition_by(1000, "user_id")
+            )
+            for i, user_chunk in enumerate(user_chunks):
+                user_ids = user_chunk["user_id"].to_list()
+                user_data_chunk = merged.filter(
+                    pl.col("user_id").is_in(user_ids)
+                ).collect()
+                for user_id in user_ids:
+                    user_data = user_data_chunk.filter(pl.col("user_id") == user_id)
+                    neg_df = generate_negatives_for_user(user_data)
+                    if neg_df is not None:
+                        negatives_list.append(neg_df)
+                if i % 10 == 0:
+                    log_message(f"Обработано {i * 1000} пользователей для негативов")
+
+            if negatives_list:
+                negatives_df = pl.concat(negatives_list)
+                for col in merged.columns:
+                    if col not in negatives_df.columns:
+                        negatives_df = negatives_df.with_columns(
+                            pl.lit(None).alias(col)
+                        )
+                negatives_lazy = negatives_df.lazy()
+                merged = pl.concat([merged, negatives_lazy])
+
+        # --- 8. Разделение на train/val ---
         if split_by_time:
-            train_lazy = (
-                merged.lazy()
-                .filter(pl.col("timestamp") <= split_time)
-                .select([c for c in merged.columns if c != "timestamp"])
-            )
-            val_lazy = (
-                merged.lazy()
-                .filter(pl.col("timestamp") > split_time)
-                .select([c for c in merged.columns if c != "timestamp"])
-            )
+            train_lazy = merged.filter(pl.col("timestamp") <= split_time)
+            val_lazy = merged.filter(pl.col("timestamp") > split_time)
         else:
-            raise ValueError("Лучше не делать random split с ленивыми данными")
+            train_lazy = merged.filter(
+                pl.col("user_id").hash() % 100 < int(100 * (1 - split))
+            )
+            val_lazy = merged.filter(
+                pl.col("user_id").hash() % 100 >= int(100 * (1 - split))
+            )
 
-        # --- сохраняем сразу parquet c row_group_size ---
+        train_lazy = train_lazy.drop("timestamp")
+        val_lazy = val_lazy.drop("timestamp")
+
         train_lazy.sink_parquet(
-            str(train_out_dir / "train.parquet"), row_group_size=100_000_000
+            str(train_out_dir / "train.parquet"), row_group_size=100000
         )
-        val_lazy.sink_parquet(
-            str(val_out_dir / "val.parquet"), row_group_size=100_000_000
-        )
+        val_lazy.sink_parquet(str(val_out_dir / "val.parquet"), row_group_size=100000)
 
-        log_message("✅ Данные подготовлены (streaming lazy polars, векторно)")
+        if orders_tmp_dir.exists():
+            import shutil
+
+            shutil.rmtree(orders_tmp_dir)
+
+        log_message("✅ Данные подготовлены без утечек памяти")
         return train_out_dir, val_out_dir
 
     def _get_copurchase_strength(self, item_id):
@@ -1376,19 +1465,20 @@ class LightGBMRecommender:
     def train(self, train_data, val_data=None, params=None):
         """
         Обучение LightGBM с бинарной целью, с оценкой NDCG@100 на валидации.
+        Кастомный callback: ранняя остановка и мониторинг по NDCG@100.
         """
         if params is None:
             params = {
                 "objective": "binary",
-                "metric": "binary_logloss",
-                "learning_rate": 0.02,
+                "metric": "None",  # Отключаем встроенные метрики
+                "learning_rate": 0.05,
                 "num_leaves": 63,
                 "max_depth": 10,
                 "min_data_in_leaf": 50,
                 "feature_fraction": 0.6,
                 "bagging_fraction": 0.8,
                 "bagging_freq": 1,
-                "verbosity": 1,
+                "verbosity": -1,
                 "force_row_wise": True,
                 "device": "cpu",
                 "num_threads": 8,
@@ -1396,38 +1486,27 @@ class LightGBMRecommender:
                 "boosting": "gbdt",
             }
 
-        # КРИТИЧЕСКИ ВАЖНО: Проверяем, что признаки существуют
+        # Проверка признаков
         if not hasattr(self, "feature_columns") or not self.feature_columns:
             log_message("❌ ОШИБКА: Нет признаков для обучения!")
-            log_message(
-                "Проверьте, что user_features_dict и item_features_dict не пустые"
-            )
             return None
 
-        missing_features = [
-            f for f in self.feature_columns if f not in train_data.columns
-        ]
+        missing_features = [f for f in self.feature_columns if f not in train_data.columns]
         if missing_features:
-            log_message(
-                f"❌ ОШИБКА: В train_data отсутствуют признаки: {missing_features}"
-            )
-            log_message(f"Доступные колонки: {list(train_data.columns)}")
+            log_message(f"❌ В train_data отсутствуют признаки: {missing_features}")
             return None
 
         X_train = train_data[self.feature_columns]
         y_train = train_data["target"]
+        train_users = train_data["user_id"]
 
         log_message(f"Размер train: {len(X_train)}")
-        log_message(f"Используемые признаки: {list(X_train.columns)}")
-        log_message(f"Пример данных: {X_train.iloc[0].to_dict()}")
+        log_message(f"Количество пользователей в train: {train_users.nunique()}")
 
-        # Явно указываем категориальные признаки
-        categorical_features = []
-        for col in X_train.columns:
-            if col in ["user_id", "item_id"] or col.startswith(("user_", "item_")):
-                categorical_features.append(col)
-
-        log_message(f"Категориальные признаки: {categorical_features}")
+        categorical_features = [
+            col for col in X_train.columns
+            if col in ["user_id", "item_id"] or col.startswith(("user_", "item_"))
+        ]
 
         train_dataset = lgb.Dataset(
             X_train,
@@ -1436,78 +1515,127 @@ class LightGBMRecommender:
             feature_name=list(X_train.columns),
         )
 
-        valid_sets = [train_dataset]
-        valid_names = ["train"]
-
+        X_val, y_val, val_users = None, None, None
+        val_dataset = None
         if val_data is not None:
-            # Проверяем признаки в validation
-            missing_val_features = [
-                f for f in self.feature_columns if f not in val_data.columns
-            ]
+            missing_val_features = [f for f in self.feature_columns if f not in val_data.columns]
             if missing_val_features:
-                log_message(
-                    f"❌ ОШИБКА: В val_data отсутствуют признаки: {missing_val_features}"
-                )
+                log_message(f"❌ В val_data отсутствуют признаки: {missing_val_features}")
                 return None
 
             X_val = val_data[self.feature_columns]
             y_val = val_data["target"]
+            val_users = val_data["user_id"]
+
+            log_message(f"Размер val: {len(X_val)}")
+            log_message(f"Количество пользователей в val: {val_users.nunique()}")
+
             val_dataset = lgb.Dataset(
                 X_val,
                 label=y_val,
                 categorical_feature=categorical_features,
-                reference=train_dataset,
+                feature_name=list(X_val.columns),
             )
-            valid_sets.append(val_dataset)
-            valid_names.append("valid")
-            log_message(f"Размер val: {len(X_val)}")
 
-        # Callback для логирования
-        def log_every_N_iter(env):
-            if env.iteration % 50 == 0:
-                metrics = ", ".join(
-                    [
-                        f"{name}_{metric}:{val:.4f}"
-                        for name, metric, val, _ in env.evaluation_result_list
-                    ]
-                )
-                log_message(f"[Iter {env.iteration}] {metrics}")
+        # Переменные для ранней остановки
+        best_ndcg = -float("inf")
+        best_iteration = 0
+        no_improvement_count = 0
+        early_stopping_rounds = 50
+        eval_history = {"train": [], "valid": []}
+
+        # Кастомный callback
+        def ndcg_callback(env):
+            nonlocal best_ndcg, best_iteration, no_improvement_count
+
+            iteration = env.iteration
+
+            # train NDCG
+            train_preds = env.model.predict(X_train, num_iteration=iteration)
+            train_ndcg = self._calculate_ndcg(train_data, train_preds, train_users)
+            eval_history["train"].append((iteration, train_ndcg))
+
+            if val_data is not None:
+                val_preds = env.model.predict(X_val, num_iteration=iteration)
+                valid_ndcg = self._calculate_ndcg(val_data, val_preds, val_users)
+                eval_history["valid"].append((iteration, valid_ndcg))
+
+                if iteration % 10 == 0 or iteration <= 20:
+                    log_message(
+                        f"[Iter {iteration}] train_ndcg@100: {train_ndcg:.6f}, valid_ndcg@100: {valid_ndcg:.6f}"
+                    )
+
+                if valid_ndcg > best_ndcg + 1e-6:
+                    best_ndcg = valid_ndcg
+                    best_iteration = iteration
+                    no_improvement_count = 0
+                    if iteration % 10 != 0:
+                        log_message(
+                            f"✅ [Iter {iteration}] Новый лучший valid_ndcg@100: {valid_ndcg:.6f}"
+                        )
+                else:
+                    no_improvement_count += 1
+
+                if no_improvement_count >= early_stopping_rounds:
+                    log_message(
+                        f"⏹️ Ранняя остановка на итерации {iteration}. "
+                        f"Лучший NDCG@100={best_ndcg:.6f} (iter {best_iteration})"
+                    )
+                    raise lgb.callback.EarlyStopException(best_iteration)
+            else:
+                if iteration % 10 == 0 or iteration <= 20:
+                    log_message(f"[Iter {iteration}] train_ndcg@100: {train_ndcg:.6f}")
 
         try:
+            valid_sets = [train_dataset] + ([val_dataset] if val_dataset is not None else [])
+            valid_names = ["train"] + (["valid"] if val_dataset is not None else [])
+
             self.model = lgb.train(
                 params,
                 train_dataset,
                 num_boost_round=100_000,
                 valid_sets=valid_sets,
                 valid_names=valid_names,
-                callbacks=[lgb.early_stopping(50), log_every_N_iter],
+                callbacks=[ndcg_callback],
             )
 
-            # Вычисляем NDCG@100 на валидации
+            self.eval_history = eval_history
+
             if val_data is not None:
-                ndcg_val = self.evaluate(val_data)
-                log_message(f"NDCG@100 на валидации: {ndcg_val:.4f}")
+                final_val_ndcg = self.evaluate(val_data)
+                log_message(f"🎯 Финальный NDCG@100 на валидации: {final_val_ndcg:.6f}")
+                log_message(
+                    f"📈 Лучший NDCG@100: {best_ndcg:.6f} на итерации {best_iteration}"
+                )
 
             return self.model
 
         except Exception as e:
             log_message(f"❌ ОШИБКА при обучении LightGBM: {e}")
-            log_message("Проверьте параметры и данные")
+            import traceback
+            log_message(f"Трассировка: {traceback.format_exc()}")
             return None
+
+
+    def _calculate_ndcg(self, data, predictions, user_ids):
+        """Вспомогательная функция для расчета NDCG@100"""
+        if len(data) == 0:
+            return 0.0
+        temp_df = data[["user_id", "target"]].copy()
+        temp_df["score"] = predictions
+        groups = temp_df.groupby("user_id").size().values
+        return ndcg_at_k_grouped(temp_df["score"].values, temp_df["target"].values, groups, k=100)
+
 
     def evaluate(self, data, k=100):
         """Оценка модели через NDCG@k"""
         if self.model is None or len(data) == 0:
             return 0.0
-
         data = data.copy()
         data["score"] = self.model.predict(data[self.feature_columns])
-
         groups = data.groupby("user_id").size().values
-        ndcg = ndcg_at_k_grouped(
-            data["score"].values, data["target"].values, groups, k=k
-        )
-        return ndcg
+        return ndcg_at_k_grouped(data["score"].values, data["target"].values, groups, k=k)
+
 
     def recommend(self, user_items_data, top_k=100):
         """Генерация рекомендаций для пользователей, топ-K"""
@@ -2072,7 +2200,11 @@ if __name__ == "__main__":
         stage_start = time.time()
         log_message("=== ПОДГОТОВКА ВЗАИМОДЕЙСТВИЙ ===")
         interactions_files = prepare_interactions(
-            train_orders_df, tracker_ddf, cutoff_ts_per_user, scale_days=30
+            train_orders_df,
+            tracker_ddf,
+            cutoff_ts_per_user,
+            scale_days=5,
+            force_recreate=False,
         )
         stage_time = time.time() - stage_start
         log_message(
