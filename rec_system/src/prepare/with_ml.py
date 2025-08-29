@@ -45,7 +45,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=1_000_000_000):
+def load_train_data(max_parts=0, max_rows=1000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -1470,20 +1470,21 @@ class LightGBMRecommender:
         if params is None:
             params = {
                 "objective": "binary",
-                "metric": "None",  # Отключаем встроенные метрики
-                "learning_rate": 0.05,
-                "num_leaves": 63,
-                "max_depth": 10,
-                "min_data_in_leaf": 50,
-                "feature_fraction": 0.6,
+                "metric": "None",
+                "learning_rate": 0.1,
+                "num_leaves": 127,
+                "max_depth": -1,
+                "min_data_in_leaf": 20,
+                "feature_fraction": 0.8,
                 "bagging_fraction": 0.8,
-                "bagging_freq": 1,
+                "bagging_freq": 5,
                 "verbosity": -1,
                 "force_row_wise": True,
                 "device": "cpu",
-                "num_threads": 8,
-                "max_bin": 200,
-                "boosting": "gbdt",
+                "num_threads": 6,
+                "max_bin": 255,
+                "boosting": "dart",
+                "bin_construct_sample_cnt": 200000,
             }
 
         # Проверка признаков
@@ -1518,8 +1519,7 @@ class LightGBMRecommender:
             feature_name=list(X_train.columns),
         )
 
-        X_val, y_val, val_users = None, None, None
-        val_dataset = None
+        X_val, y_val, val_users, val_dataset = None, None, None, None
         if val_data is not None:
             missing_val_features = [
                 f for f in self.feature_columns if f not in val_data.columns
@@ -1547,13 +1547,14 @@ class LightGBMRecommender:
         # Переменные для ранней остановки
         best_ndcg = -float("inf")
         best_iteration = 0
+        best_eval_result_list = None
         no_improvement_count = 0
-        early_stopping_rounds = 50
+        early_stopping_rounds = 10
         eval_history = {"train": [], "valid": []}
 
         # Кастомный callback
         def ndcg_callback(env):
-            nonlocal best_ndcg, best_iteration, no_improvement_count
+            nonlocal best_ndcg, best_iteration, best_eval_result_list, no_improvement_count
 
             iteration = env.iteration
 
@@ -1562,10 +1563,13 @@ class LightGBMRecommender:
             train_ndcg = self._calculate_ndcg(train_data, train_preds, train_users)
             eval_history["train"].append((iteration, train_ndcg))
 
+            eval_list = [("train", "ndcg@100", float(train_ndcg), True)]
+
             if val_data is not None:
                 val_preds = env.model.predict(X_val, num_iteration=iteration)
                 valid_ndcg = self._calculate_ndcg(val_data, val_preds, val_users)
                 eval_history["valid"].append((iteration, valid_ndcg))
+                eval_list.append(("valid", "ndcg@100", float(valid_ndcg), True))
 
                 if iteration % 10 == 0:
                     log_message(
@@ -1575,6 +1579,7 @@ class LightGBMRecommender:
                 if valid_ndcg > best_ndcg + 1e-6:
                     best_ndcg = valid_ndcg
                     best_iteration = iteration
+                    best_eval_result_list = list(eval_list)
                     no_improvement_count = 0
                     if iteration % 10 != 0:
                         log_message(
@@ -1583,15 +1588,20 @@ class LightGBMRecommender:
                 else:
                     no_improvement_count += 1
 
+                env.evaluation_result_list = eval_list
+
                 if no_improvement_count >= early_stopping_rounds:
                     log_message(
                         f"⏹️ Ранняя остановка на итерации {iteration}. "
                         f"Лучший NDCG@100={best_ndcg:.6f} (iter {best_iteration})"
                     )
-                    raise lgb.callback.EarlyStopException(best_iteration)
+                    raise lgb.callback.EarlyStopException(
+                        best_iteration, best_eval_result_list
+                    )
             else:
                 if iteration % 10 == 0:
                     log_message(f"[Iter {iteration}] train_ndcg@100: {train_ndcg:.6f}")
+                env.evaluation_result_list = eval_list
 
         try:
             valid_sets = [train_dataset] + (
@@ -1602,7 +1612,7 @@ class LightGBMRecommender:
             self.model = lgb.train(
                 params,
                 train_dataset,
-                num_boost_round=100_000,
+                num_boost_round=100,
                 valid_sets=valid_sets,
                 valid_names=valid_names,
                 callbacks=[ndcg_callback],
