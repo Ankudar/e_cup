@@ -45,7 +45,7 @@ tqdm.pandas()
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=100_000):
+def load_train_data(max_parts=0, max_rows=1_000_000_000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -1491,7 +1491,9 @@ class LightGBMRecommender:
             log_message("❌ ОШИБКА: Нет признаков для обучения!")
             return None
 
-        missing_features = [f for f in self.feature_columns if f not in train_data.columns]
+        missing_features = [
+            f for f in self.feature_columns if f not in train_data.columns
+        ]
         if missing_features:
             log_message(f"❌ В train_data отсутствуют признаки: {missing_features}")
             return None
@@ -1504,7 +1506,8 @@ class LightGBMRecommender:
         log_message(f"Количество пользователей в train: {train_users.nunique()}")
 
         categorical_features = [
-            col for col in X_train.columns
+            col
+            for col in X_train.columns
             if col in ["user_id", "item_id"] or col.startswith(("user_", "item_"))
         ]
 
@@ -1518,9 +1521,13 @@ class LightGBMRecommender:
         X_val, y_val, val_users = None, None, None
         val_dataset = None
         if val_data is not None:
-            missing_val_features = [f for f in self.feature_columns if f not in val_data.columns]
+            missing_val_features = [
+                f for f in self.feature_columns if f not in val_data.columns
+            ]
             if missing_val_features:
-                log_message(f"❌ В val_data отсутствуют признаки: {missing_val_features}")
+                log_message(
+                    f"❌ В val_data отсутствуют признаки: {missing_val_features}"
+                )
                 return None
 
             X_val = val_data[self.feature_columns]
@@ -1560,7 +1567,7 @@ class LightGBMRecommender:
                 valid_ndcg = self._calculate_ndcg(val_data, val_preds, val_users)
                 eval_history["valid"].append((iteration, valid_ndcg))
 
-                if iteration % 10 == 0 or iteration <= 20:
+                if iteration % 10 == 0:
                     log_message(
                         f"[Iter {iteration}] train_ndcg@100: {train_ndcg:.6f}, valid_ndcg@100: {valid_ndcg:.6f}"
                     )
@@ -1583,11 +1590,13 @@ class LightGBMRecommender:
                     )
                     raise lgb.callback.EarlyStopException(best_iteration)
             else:
-                if iteration % 10 == 0 or iteration <= 20:
+                if iteration % 10 == 0:
                     log_message(f"[Iter {iteration}] train_ndcg@100: {train_ndcg:.6f}")
 
         try:
-            valid_sets = [train_dataset] + ([val_dataset] if val_dataset is not None else [])
+            valid_sets = [train_dataset] + (
+                [val_dataset] if val_dataset is not None else []
+            )
             valid_names = ["train"] + (["valid"] if val_dataset is not None else [])
 
             self.model = lgb.train(
@@ -1613,9 +1622,9 @@ class LightGBMRecommender:
         except Exception as e:
             log_message(f"❌ ОШИБКА при обучении LightGBM: {e}")
             import traceback
+
             log_message(f"Трассировка: {traceback.format_exc()}")
             return None
-
 
     def _calculate_ndcg(self, data, predictions, user_ids):
         """Вспомогательная функция для расчета NDCG@100"""
@@ -1624,8 +1633,9 @@ class LightGBMRecommender:
         temp_df = data[["user_id", "target"]].copy()
         temp_df["score"] = predictions
         groups = temp_df.groupby("user_id").size().values
-        return ndcg_at_k_grouped(temp_df["score"].values, temp_df["target"].values, groups, k=100)
-
+        return ndcg_at_k_grouped(
+            temp_df["score"].values, temp_df["target"].values, groups, k=100
+        )
 
     def evaluate(self, data, k=100):
         """Оценка модели через NDCG@k"""
@@ -1634,8 +1644,9 @@ class LightGBMRecommender:
         data = data.copy()
         data["score"] = self.model.predict(data[self.feature_columns])
         groups = data.groupby("user_id").size().values
-        return ndcg_at_k_grouped(data["score"].values, data["target"].values, groups, k=k)
-
+        return ndcg_at_k_grouped(
+            data["score"].values, data["target"].values, groups, k=k
+        )
 
     def recommend(self, user_items_data, top_k=100):
         """Генерация рекомендаций для пользователей, топ-K"""
