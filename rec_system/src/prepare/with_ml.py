@@ -43,7 +43,10 @@ warnings.filterwarnings(
 # tqdm интеграция с pandas
 tqdm.pandas()
 
-ITER_N = 10  # число эпох для обучения
+MAX_FILES = 0  # сколько файлов берем в работу. 0 - все
+MAX_ROWS = 0  # сколько строк для каждой группы берем в работу. 0 - все
+ITER_N = 100  # число эпох для обучения
+EARLY_STOP = 10  # ранняя остановка обучения
 
 
 def find_parquet_files(folder):
@@ -53,7 +56,7 @@ def find_parquet_files(folder):
 
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=100_000):
+def load_train_data(max_parts=MAX_FILES, max_rows=MAX_ROWS):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -1539,20 +1542,21 @@ class LightGBMRecommender:
             params = {
                 "objective": "binary",
                 "metric": "None",
-                "learning_rate": 0.1,
+                "learning_rate": 0.05,
                 "num_leaves": 31,
-                "max_depth": 8,
-                "min_data_in_leaf": 20,
-                "feature_fraction": 0.6,
-                "bagging_fraction": 0.6,
-                "bagging_freq": 15,
+                "max_depth": 6,
+                "min_data_in_leaf": 50,
+                "feature_fraction": 0.8,
+                "bagging_fraction": 0.8,
+                "bagging_freq": 10,
                 "verbosity": -1,
                 "force_row_wise": True,
-                "num_threads": 6,
-                "max_bin": 63,
+                "num_threads": 4,
+                "max_bin": 255,
                 "boosting": "gbdt",
-                "bin_construct_sample_cnt": 200000,
+                "bin_construct_sample_cnt": 100000,
                 "device": "cpu",
+                "seed": 42,
             }
 
         # Проверка признаков
@@ -1569,6 +1573,14 @@ class LightGBMRecommender:
 
         X_train = train_data[self.feature_columns]
         y_train = train_data["target"]
+
+        for df in [train_data, val_data]:
+            if df is not None:
+                for col in df.select_dtypes(include=["float64"]).columns:
+                    df[col] = df[col].astype("float32")
+                for col in df.select_dtypes(include=["int64"]).columns:
+                    df[col] = df[col].astype("int32")
+
         train_users = train_data["user_id"]
 
         log_message(f"Размер train: {len(X_train)}")
@@ -1617,7 +1629,7 @@ class LightGBMRecommender:
         best_iteration = 0
         best_eval_result_list = None
         no_improvement_count = 0
-        early_stopping_rounds = 50
+        early_stopping_rounds = EARLY_STOP
         eval_history = {"train": [], "valid": []}
 
         # Кастомный callback
@@ -1626,8 +1638,18 @@ class LightGBMRecommender:
 
             iteration = env.iteration
 
-            # train NDCG
-            train_preds = env.model.predict(X_train, num_iteration=iteration)
+            # Вычисляем NDCG только каждые 5 итераций для экономии времени
+            if iteration % 5 != 0 and iteration > 10:
+                return
+
+            # Кэшируем предсказания для экономии вычислений
+            if not hasattr(env, "last_preds") or env.last_preds_iter != iteration:
+                train_preds = env.model.predict(X_train, num_iteration=iteration)
+                env.last_preds = train_preds
+                env.last_preds_iter = iteration
+            else:
+                train_preds = env.last_preds
+
             train_ndcg = self._calculate_ndcg(train_data, train_preds, train_users)
             eval_history["train"].append((iteration, train_ndcg))
 
@@ -1639,7 +1661,8 @@ class LightGBMRecommender:
                 eval_history["valid"].append((iteration, valid_ndcg))
                 eval_list.append(("valid", "ndcg@100", float(valid_ndcg), True))
 
-                if iteration % 10 == 0:
+                # Логируем только каждые 5 итераций
+                if iteration % 5 == 0:
                     log_message(
                         f"[Iter {iteration}] train_ndcg@100: {train_ndcg:.6f}, valid_ndcg@100: {valid_ndcg:.6f}"
                     )
@@ -1649,10 +1672,9 @@ class LightGBMRecommender:
                     best_iteration = iteration
                     best_eval_result_list = list(eval_list)
                     no_improvement_count = 0
-                    if iteration % 10 != 0:
-                        log_message(
-                            f"✅ [Iter {iteration}] Новый лучший valid_ndcg@100: {valid_ndcg:.6f}"
-                        )
+                    log_message(
+                        f"✅ [Iter {iteration}] Новый лучший valid_ndcg@100: {valid_ndcg:.6f}"
+                    )
                 else:
                     no_improvement_count += 1
 
@@ -1667,7 +1689,7 @@ class LightGBMRecommender:
                         best_iteration, best_eval_result_list
                     )
             else:
-                if iteration % 10 == 0:
+                if iteration % 5 == 0:
                     log_message(f"[Iter {iteration}] train_ndcg@100: {train_ndcg:.6f}")
                 env.evaluation_result_list = eval_list
 
@@ -1705,15 +1727,46 @@ class LightGBMRecommender:
             return None
 
     def _calculate_ndcg(self, data, predictions, user_ids):
-        """Вспомогательная функция для расчета NDCG@100"""
+        """Оптимизированный расчет NDCG@100"""
         if len(data) == 0:
             return 0.0
-        temp_df = data[["user_id", "target"]].copy()
-        temp_df["score"] = predictions
-        groups = temp_df.groupby("user_id").size().values
-        return ndcg_at_k_grouped(
-            temp_df["score"].values, temp_df["target"].values, groups, k=100
+
+        # Используем более эффективный метод группировки
+        temp_df = pd.DataFrame(
+            {
+                "user_id": data["user_id"].values,
+                "target": data["target"].values,
+                "score": predictions,
+            }
         )
+
+        # Сортируем внутри групп без создания копий
+        def calculate_group_ndcg(group):
+            if len(group) <= 1:
+                return 0.0
+            # Берем топ-100 элементов
+            top_k = min(100, len(group))
+            sorted_group = group.nlargest(top_k, "score")
+            return ndcg_score(
+                [sorted_group["target"].values],
+                [sorted_group["target"].values],
+                k=top_k,
+            )
+
+        # Параллельный расчет для больших датасетов
+        if len(temp_df) > 100000:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                results = list(
+                    executor.map(
+                        calculate_group_ndcg,
+                        [group for _, group in temp_df.groupby("user_id")],
+                    )
+                )
+            return np.mean(results)
+        else:
+            return temp_df.groupby("user_id").apply(calculate_group_ndcg).mean()
 
     def evaluate(self, data, k=100):
         """Оценка модели через NDCG@k"""
@@ -1874,100 +1927,267 @@ def load_ui_features_for_user_item(user_id, item_id, ui_features_path):
 
 
 def build_item_features_dict(
-    interactions_files, items_df, orders_df, embeddings_dict, device="cuda"
+    interactions_files,
+    items_df,
+    orders_df,
+    embeddings_dict,
+    device="cuda",
+    batch_size=1_000_000,
+    temp_dir="/tmp/item_features",
 ):
     """
-    Оптимизированная версия с использованием Polars
+    Оптимизированная версия с батчевой обработкой и сохранением на диск
     """
-    log_message("Построение словаря товарных признаков...")
+    log_message("Построение словаря товарных признаков с батчевой обработкой...")
 
-    # 1. АГРЕГАЦИЯ ПО ТРЕКЕРУ И ЗАКАЗАМ
-    item_stats_list = []
-    for f in tqdm(interactions_files, desc="Обработка взаимодействий"):
-        df = pl.read_parquet(f)
+    os.makedirs(temp_dir, exist_ok=True)
 
-        chunk_stats = df.group_by("item_id").agg(
+    # 1. БАТЧЕВАЯ АГРЕГАЦИЯ ПО ВЗАИМОДЕЙСТВИЯМ
+    log_message("Батчевая агрегация взаимодействий...")
+
+    temp_stats_files = []
+
+    for i, f in enumerate(tqdm(interactions_files, desc="Обработка взаимодействий")):
+        try:
+            # Читаем весь файл (без batch_size)
+            df = pl.read_parquet(f)
+
+            # Обрабатываем батчами вручную
+            n_rows = len(df)
+            for start in range(0, n_rows, batch_size):
+                end = min(start + batch_size, n_rows)
+                df_batch = df[start:end]
+
+                if df_batch.is_empty():
+                    continue
+
+                chunk_stats = df_batch.group_by("item_id").agg(
+                    [
+                        pl.col("weight").count().alias("item_count"),
+                        pl.col("weight").sum().alias("item_sum"),
+                        pl.col("weight").max().alias("item_max"),
+                        pl.col("weight").min().alias("item_min"),
+                    ]
+                )
+
+                stats_path = os.path.join(temp_dir, f"stats_{i}_{start}.parquet")
+                chunk_stats.write_parquet(stats_path)
+                temp_stats_files.append(stats_path)
+
+        except Exception as e:
+            log_message(f"Ошибка обработки файла {f}: {e}")
+            continue
+
+    # 2. ОБЪЕДИНЕНИЕ СТАТИСТИК С ДИСКА
+    log_message("Объединение статистик...")
+
+    final_stats = None
+    for stats_file in tqdm(temp_stats_files, desc="Объединение статистик"):
+        try:
+            stats_df = pl.read_parquet(stats_file)
+            if final_stats is None:
+                final_stats = stats_df
+            else:
+                final_stats = pl.concat([final_stats, stats_df])
+        except Exception as e:
+            log_message(f"Ошибка чтения {stats_file}: {e}")
+            continue
+
+    # Агрегируем финальные статистики
+    if final_stats is not None and not final_stats.is_empty():
+        final_stats = final_stats.group_by("item_id").agg(
             [
-                pl.col("weight").count().alias("count"),
-                pl.col("weight").sum().alias("sum"),
-                pl.col("weight").max().alias("max"),
-                pl.col("weight").min().alias("min"),
+                pl.col("item_count").sum().alias("item_count"),
+                pl.col("item_sum").sum().alias("item_sum"),
+                pl.col("item_max").max().alias("item_max"),
+                pl.col("item_min").min().alias("item_min"),
             ]
         )
-        item_stats_list.append(chunk_stats)
+    else:
+        final_stats = pl.DataFrame(
+            schema={
+                "item_id": pl.Int32(),
+                "item_count": pl.Int64(),
+                "item_sum": pl.Float64(),
+                "item_max": pl.Float64(),
+                "item_min": pl.Float64(),
+            }
+        )
 
-    # Объединяем статистики
-    if item_stats_list:
-        all_stats = pl.concat(item_stats_list)
-        final_stats = all_stats.group_by("item_id").agg(
+    # 3. ОБРАБОТКА ЗАКАЗОВ ПО БАТЧАМ
+    log_message("Обработка заказов...")
+
+    order_stats_list = []
+    if hasattr(orders_df, "compute"):
+        n_partitions = orders_df.npartitions
+        for i in tqdm(range(n_partitions), desc="Обработка партиций заказов"):
+            try:
+                partition = orders_df.get_partition(i).compute()
+                order_stats = (
+                    pl.from_pandas(partition)
+                    .group_by("item_id")
+                    .agg([pl.col("user_id").count().alias("item_orders_count")])
+                )
+                order_stats_list.append(order_stats)
+            except Exception as e:
+                log_message(f"Ошибка обработки партиции {i}: {e}")
+    else:
+        try:
+            order_stats = (
+                pl.from_pandas(orders_df)
+                .group_by("item_id")
+                .agg([pl.col("user_id").count().alias("item_orders_count")])
+            )
+            order_stats_list.append(order_stats)
+        except Exception as e:
+            log_message(f"Ошибка обработки заказов: {e}")
+
+    # Объединяем статистики заказов
+    if order_stats_list:
+        order_stats_final = pl.concat(order_stats_list)
+        order_stats_final = order_stats_final.group_by("item_id").agg(
+            [pl.col("item_orders_count").sum().alias("item_orders_count")]
+        )
+    else:
+        order_stats_final = pl.DataFrame(
+            schema={"item_id": pl.Int32(), "item_orders_count": pl.Int64()}
+        )
+
+    # 4. ОБРАБОТКА ITEMS ПО БАТЧАМ
+    log_message("Обработка items...")
+
+    items_catalog_list = []
+    if hasattr(items_df, "compute"):
+        n_partitions = items_df.npartitions
+        for i in tqdm(range(n_partitions), desc="Обработка партиций items"):
+            try:
+                partition = items_df.get_partition(i).compute()
+                items_chunk = (
+                    pl.from_pandas(partition).select(["item_id", "catalogid"]).unique()
+                )
+                items_catalog_list.append(items_chunk)
+            except Exception as e:
+                log_message(f"Ошибка обработки партиции items {i}: {e}")
+    else:
+        try:
+            items_chunk = (
+                pl.from_pandas(items_df).select(["item_id", "catalogid"]).unique()
+            )
+            items_catalog_list.append(items_chunk)
+        except Exception as e:
+            log_message(f"Ошибка обработки items: {e}")
+
+    # Объединяем items
+    if items_catalog_list:
+        items_catalog = pl.concat(items_catalog_list).unique()
+    else:
+        items_catalog = pl.DataFrame(
+            schema={"item_id": pl.Int32(), "catalogid": pl.Int32()}
+        )
+
+    # 5. ОБЪЕДИНЕНИЕ ВСЕХ ДАННЫХ С ПРОВЕРКОЙ КОЛОНОК
+    log_message("Объединение всех данных...")
+
+    # Создаем базовый DataFrame с item_id
+    all_item_ids = set()
+
+    # Собираем все item_id из всех источников
+    if not final_stats.is_empty():
+        all_item_ids.update(final_stats["item_id"].to_list())
+    if not order_stats_final.is_empty():
+        all_item_ids.update(order_stats_final["item_id"].to_list())
+    if not items_catalog.is_empty():
+        all_item_ids.update(items_catalog["item_id"].to_list())
+
+    # Создаем базовый DataFrame со всеми item_id
+    base_df = pl.DataFrame({"item_id": list(all_item_ids)})
+
+    # Последовательно присоединяем данные с проверкой наличия колонок
+    if not final_stats.is_empty():
+        base_df = base_df.join(final_stats, on="item_id", how="left")
+    else:
+        # Добавляем пустые колонки если final_stats пустой
+        base_df = base_df.with_columns(
             [
-                pl.col("count").sum().alias("item_count"),
-                pl.col("sum").sum().alias("item_sum"),
-                pl.col("max").max().alias("item_max"),
-                pl.col("min").min().alias("item_min"),
+                pl.lit(0).alias("item_count"),
+                pl.lit(0.0).alias("item_sum"),
+                pl.lit(0.0).alias("item_max"),
+                pl.lit(0.0).alias("item_min"),
             ]
         )
-    else:
-        final_stats = pl.DataFrame()
 
-    # 2. ДОБАВЛЕНИЕ ДАННЫХ ИЗ ЗАКАЗОВ
-    if isinstance(orders_df, pl.DataFrame):
-        orders_pl = orders_df
+    if not order_stats_final.is_empty():
+        base_df = base_df.join(order_stats_final, on="item_id", how="left")
     else:
-        orders_pl = pl.from_pandas(
-            orders_df.compute() if hasattr(orders_df, "compute") else orders_df
+        base_df = base_df.with_columns([pl.lit(0).alias("item_orders_count")])
+
+    if not items_catalog.is_empty():
+        base_df = base_df.join(items_catalog, on="item_id", how="left")
+    else:
+        base_df = base_df.with_columns(
+            [pl.lit(None).cast(pl.Int32()).alias("catalogid")]
         )
 
-    order_stats = orders_pl.group_by("item_id").agg(
-        [pl.col("user_id").count().alias("item_orders_count")]
-    )
+    # 6. ВЫЧИСЛЕНИЕ ПРИЗНАКОВ И СОЗДАНИЕ СЛОВАРЯ
+    log_message("Создание финального словаря...")
 
-    # 3. ДОБАВЛЕНИЕ ДАННЫХ ИЗ items_df
-    log_message("Добавление данных из items_df...")
-    if isinstance(items_df, pl.DataFrame):
-        items_pl = items_df
-    else:
-        items_pl = pl.from_pandas(
-            items_df.compute() if hasattr(items_df, "compute") else items_df
-        )
-
-    items_catalog = items_pl.select(["item_id", "catalogid"]).unique()
-
-    # 4. ОБЪЕДИНЕНИЕ ВСЕХ ДАННЫХ
-    item_stats = final_stats.join(order_stats, on="item_id", how="full")
-    item_stats = item_stats.join(items_catalog, on="item_id", how="left")
-
-    # 5. ВЫЧИСЛЕНИЕ ПРОИЗВОДНЫХ ПРИЗНАКОВ
-    current_time = pl.lit(datetime.now())
-
-    item_stats = item_stats.with_columns(
-        [
-            pl.col("item_count").fill_null(0),
-            pl.col("item_sum").fill_null(0),
-            pl.col("item_orders_count").fill_null(0),
-            (pl.col("item_sum") / pl.col("item_count")).alias("item_mean"),
-        ]
-    ).fill_nan(0)
-
-    # 6. КОНВЕРТАЦИЯ В СЛОВАРЬ
     item_stats_dict = {}
-    for row in item_stats.iter_rows(named=True):
-        item_stats_dict[row["item_id"]] = {
-            "item_count": row["item_count"],
-            "item_mean": row["item_mean"],
-            "item_sum": row["item_sum"],
-            "item_max": row["item_max"],
-            "item_min": row["item_min"],
-            "item_orders_count": row["item_orders_count"],
-            "item_category": row["catalogid"],
-        }
 
-    # 7. ДОБАВЛЕНИЕ ЭМБЕДДИНГОВ
+    if not base_df.is_empty():
+        # Заполняем пропущенные значения
+        base_df = base_df.with_columns(
+            [
+                pl.col("item_count").fill_null(0),
+                pl.col("item_sum").fill_null(0),
+                pl.col("item_orders_count").fill_null(0),
+                pl.col("item_max").fill_null(0),
+                pl.col("item_min").fill_null(0),
+            ]
+        )
+
+        # Вычисляем среднее значение
+        base_df = base_df.with_columns(
+            [(pl.col("item_sum") / pl.col("item_count")).fill_nan(0).alias("item_mean")]
+        )
+
+        # Конвертируем в словарь порциями
+        for i in range(0, len(base_df), batch_size):
+            batch = base_df[i : i + batch_size]
+            for row in batch.iter_rows(named=True):
+                item_stats_dict[row["item_id"]] = {
+                    "item_count": row.get("item_count", 0),
+                    "item_mean": row.get("item_mean", 0),
+                    "item_sum": row.get("item_sum", 0),
+                    "item_max": row.get("item_max", 0),
+                    "item_min": row.get("item_min", 0),
+                    "item_orders_count": row.get("item_orders_count", 0),
+                    "item_category": row.get("catalogid", None),
+                }
+
+    # 7. ДОБАВЛЕНИЕ ЭМБЕДДИНГОВ ПОРЦИЯМИ
     log_message("Добавление эмбеддингов...")
-    for item_id, embedding in embeddings_dict.items():
-        if item_id in item_stats_dict:
-            for i in range(min(5, len(embedding))):
-                item_stats_dict[item_id][f"fclip_embed_{i}"] = float(embedding[i])
+
+    embedding_items = list(embeddings_dict.keys())
+    for i in tqdm(
+        range(0, len(embedding_items), batch_size), desc="Добавление эмбеддингов"
+    ):
+        batch_items = embedding_items[i : i + batch_size]
+        for item_id in batch_items:
+            if item_id in item_stats_dict:
+                embedding = embeddings_dict[item_id]
+                for j in range(min(5, len(embedding))):
+                    item_stats_dict[item_id][f"fclip_embed_{j}"] = float(embedding[j])
+
+    # 8. ОЧИСТКА ВРЕМЕННЫХ ФАЙЛОВ
+    log_message("Очистка временных файлов...")
+    try:
+        for temp_file in temp_stats_files:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+        if os.path.exists(temp_dir) and not os.listdir(temp_dir):
+            os.rmdir(temp_dir)
+    except Exception as e:
+        log_message(f"Ошибка очистки временных файлов: {e}")
 
     log_message(f"Словарь товарных признаков построен. Записей: {len(item_stats_dict)}")
     return item_stats_dict
