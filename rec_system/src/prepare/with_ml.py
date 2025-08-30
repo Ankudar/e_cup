@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from glob import glob
 from pathlib import Path
 
+import dask
 import dask.dataframe as dd
 import lightgbm as lgb
 import numpy as np
@@ -44,7 +45,7 @@ warnings.filterwarnings(
 tqdm.pandas()
 
 MAX_FILES = 0  # сколько файлов берем в работу. 0 - все
-MAX_ROWS = 0  # сколько строк для каждой группы берем в работу. 0 - все
+MAX_ROWS = 1000  # сколько строк для каждой группы берем в работу. 0 - все
 ITER_N = 100  # число эпох для обучения
 EARLY_STOP = 10  # ранняя остановка обучения
 
@@ -223,31 +224,78 @@ def load_train_data(max_parts=MAX_FILES, max_rows=MAX_ROWS):
     )
     log_message("Данные загружены")
 
-    return orders_ddf, tracker_ddf, items_ddf, categories_ddf, test_users_ddf
+    initial_counts = (
+        orders_ddf.shape[0].compute(),
+        tracker_ddf.shape[0].compute(),
+        items_ddf.shape[0].compute(),
+    )
+
+    return (
+        orders_ddf,
+        tracker_ddf,
+        items_ddf,
+        categories_ddf,
+        test_users_ddf,
+        initial_counts,
+    )
 
 
 # -------------------- Фильтрация данных --------------------
-def filter_data(orders_ddf, tracker_ddf, items_ddf):
+# -------------------- Фильтрация данных --------------------
+def filter_data(orders_ddf, tracker_ddf, items_ddf, initial_counts=None):
     """
     Фильтруем: оставляем delivered_orders (позитив) и canceled_orders (негатив),
-    а также действия page_view, favorite, to_cart.
+    а также действия page_view, favorite, to_cart. Удаляем дубликаты.
+    Используем предварительно вычисленные размеры из load_train_data.
     """
     log_message("Фильтрация данных...")
 
-    # Заказы: оставляем только delivered и canceled
-    orders_ddf = orders_ddf[
-        orders_ddf["last_status"].isin(["delivered_orders", "canceled_orders"])
-    ].copy()
+    # Если initial_counts не переданы, вычисляем их
+    if initial_counts is None:
+        initial_orders = orders_ddf.shape[0].compute()
+        initial_tracker = tracker_ddf.shape[0].compute()
+        initial_items = items_ddf.shape[0].compute()
+    else:
+        initial_orders, initial_tracker, initial_items = initial_counts
 
-    # delivered_orders = 1, canceled_orders = 0
-    orders_ddf["target"] = orders_ddf["last_status"].apply(
-        lambda x: 1 if x == "delivered_orders" else 0, meta=("target", "int8")
+    # Основные операции фильтрации
+    orders_ddf = (
+        orders_ddf[
+            orders_ddf["last_status"].isin(["delivered_orders", "canceled_orders"])
+        ]
+        .assign(
+            target=orders_ddf["last_status"].map(
+                {"delivered_orders": 1, "canceled_orders": 0}, meta=("target", "int8")
+            )
+        )
+        .drop_duplicates(subset=["user_id", "item_id", "last_status"])
     )
 
-    # Действия
     tracker_ddf = tracker_ddf[
         tracker_ddf["action_type"].isin(["page_view", "favorite", "to_cart"])
-    ]
+    ].drop_duplicates(subset=["user_id", "item_id", "action_type", "timestamp"])
+
+    items_ddf = items_ddf.drop_duplicates(subset=["item_id"])
+
+    # Вычисляем финальные размеры по одному (без конфликтов)
+    log_message("Вычисление финальных размеров...")
+    final_orders = orders_ddf.shape[0].compute()
+    final_tracker = tracker_ddf.shape[0].compute()
+    final_items = items_ddf.shape[0].compute()
+
+    # Вывод статистики
+    log_message("=" * 50)
+    log_message("СТАТИСТИКА ФИЛЬТРАЦИИ:")
+    log_message(f"Исходное количество заказов: {initial_orders:,}")
+    log_message(f"После фильтрации заказов: {final_orders:,}")
+    log_message(f"Удалено заказов: {initial_orders - final_orders:,}")
+    log_message(f"Исходное количество действий: {initial_tracker:,}")
+    log_message(f"После фильтрации действий: {final_tracker:,}")
+    log_message(f"Удалено действий: {initial_tracker - final_tracker:,}")
+    log_message(f"Исходное количество товаров: {initial_items:,}")
+    log_message(f"После удаления дубликатов товаров: {final_items:,}")
+    log_message(f"Удалено товаров-дубликатов: {initial_items - final_items:,}")
+    log_message("=" * 50)
 
     log_message("Фильтрация завершена")
     return orders_ddf, tracker_ddf, items_ddf
@@ -2464,11 +2512,16 @@ if __name__ == "__main__":
         # === ЗАГРУЗКА ДАННЫХ ===
         stage_start = time.time()
         log_message("=== ЗАГРУЗКА ДАННЫХ ===")
-        orders_ddf, tracker_ddf, items_ddf, categories_ddf, test_users_ddf = (
-            load_train_data()
-        )
+        (
+            orders_ddf,
+            tracker_ddf,
+            items_ddf,
+            categories_ddf,
+            test_users_ddf,
+            initial_counts,
+        ) = load_train_data()
         orders_ddf, tracker_ddf, items_ddf = filter_data(
-            orders_ddf, tracker_ddf, items_ddf
+            orders_ddf, tracker_ddf, items_ddf, initial_counts
         )
         stage_time = time.time() - stage_start
         log_message(f"Загрузка данных завершена за {timedelta(seconds=stage_time)}")
