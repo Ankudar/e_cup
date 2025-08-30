@@ -43,9 +43,17 @@ warnings.filterwarnings(
 # tqdm интеграция с pandas
 tqdm.pandas()
 
+ITER_N = 10  # число эпох для обучения
+
+
+def find_parquet_files(folder):
+    files = glob(os.path.join(folder, "**", "*.parquet"), recursive=True)
+    files.sort()
+    return files
+
 
 # -------------------- Загрузка данных --------------------
-def load_train_data(max_parts=0, max_rows=1000):
+def load_train_data(max_parts=0, max_rows=100_000):
     """
     Загружаем parquet-файлы orders, tracker, items, categories_tree, test_users.
     Ищем рекурсивно по папкам все .parquet файлы. Ограничиваем общее количество строк.
@@ -94,14 +102,12 @@ def load_train_data(max_parts=0, max_rows=1000):
         "test_users": {"user_id": "int32"},
     }
 
-    def find_parquet_files(folder):
-        files = glob(os.path.join(folder, "**", "*.parquet"), recursive=True)
-        files.sort()
-        return files
-
     def read_sample(
         folder, columns=None, name="", max_parts=max_parts, max_rows=max_rows
     ):
+        """
+        Загружаем parquet-файлы с эффективным ограничением размера.
+        """
         files = find_parquet_files(folder)
         if not files:
             log_message(f"{name}: parquet файлы не найдены в {folder}")
@@ -109,70 +115,94 @@ def load_train_data(max_parts=0, max_rows=1000):
 
         current_dtypes = dtype_profiles.get(name, {})
 
+        # Ограничиваем количество файлов для чтения
+        original_file_count = len(files)
+        if max_parts > 0 and max_parts < original_file_count:
+            files = files[:max_parts]
+            used_files = max_parts
+        else:
+            used_files = original_file_count
+
+        log_message(
+            f"{name}: найдено {original_file_count} файлов, используем {used_files}"
+        )
+
         try:
-            # Читаем все файлы
+            # Читаем только необходимые колонки
             ddf = dd.read_parquet(
                 files,
                 engine="pyarrow",
                 dtype=current_dtypes,
+                columns=columns,
                 gather_statistics=False,
-                split_row_groups=True,
+                split_row_groups=False,
             )
         except Exception as e:
             log_message(f"{name}: ошибка при чтении parquet ({e}), пропускаем")
             return dd.from_pandas(pd.DataFrame(), npartitions=1)
 
-        if columns is not None:
-            available_cols = [c for c in columns if c in ddf.columns]
-            if not available_cols:
+        # Если не нужно ограничивать строки
+        if max_rows == 0:
+            try:
+                count = ddf.shape[0].compute()
+                mem_estimate = ddf.memory_usage(deep=True).sum().compute() / (1024**2)
                 log_message(
-                    f"{name}: ни одна из колонок {columns} не найдена, пропускаем"
+                    f"{name}: {count:,} строк (использовано {used_files} файлов), ~{mem_estimate:.1f} MB"
+                )
+            except Exception as e:
+                log_message(f"{name}: не удалось вычислить размер: {e}")
+            return ddf
+
+        # Если нужно ограничить строки
+        try:
+            # Вычисляем фактическое количество строк
+            actual_rows = ddf.shape[0].compute()
+
+            if actual_rows <= max_rows:
+                # Если данных меньше лимита - используем всё
+                mem_estimate = ddf.memory_usage(deep=True).sum().compute() / (1024**2)
+                log_message(
+                    f"{name}: {actual_rows:,} строк (использовано {used_files} файлов), ~{mem_estimate:.1f} MB"
+                )
+                return ddf
+            else:
+                # Если данных больше лимита - семплируем
+                fraction = max_rows / actual_rows
+                sampled_ddf = ddf.sample(frac=fraction, random_state=42)
+
+                sampled_count = sampled_ddf.shape[0].compute()
+                mem_estimate = sampled_ddf.memory_usage(deep=True).sum().compute() / (
+                    1024**2
+                )
+
+                log_message(
+                    f"{name}: ограничено {sampled_count:,} из {actual_rows:,} строк "
+                    f"(семплирование {fraction:.1%}, использовано {used_files} файлов), ~{mem_estimate:.1f} MB"
+                )
+                return sampled_ddf
+
+        except Exception as e:
+            log_message(
+                f"{name}: ошибка при ограничении строк ({e}), используем первые {max_rows} строк"
+            )
+
+            # Fallback: берем первые max_rows строк
+            try:
+                limited_ddf = ddf.head(max_rows, npartitions=-1)
+                limited_count = limited_ddf.shape[0].compute()
+                mem_estimate = limited_ddf.memory_usage(deep=True).sum().compute() / (
+                    1024**2
+                )
+
+                log_message(
+                    f"{name}: {limited_count:,} строк (взято первых {max_rows}, использовано {used_files} файлов), ~{mem_estimate:.1f} MB"
+                )
+                return limited_ddf
+            except Exception as e2:
+                log_message(
+                    f"{name}: критическая ошибка, возвращаем пустой DataFrame: {e2}"
                 )
                 return dd.from_pandas(pd.DataFrame(), npartitions=1)
-            ddf = ddf[available_cols]
-
-        total_parts = ddf.npartitions
-
-        # Ограничиваем количество партиций если нужно
-        if max_parts > 0 and max_parts < total_parts:
-            ddf = ddf.partitions[:max_parts]
-            used_parts = max_parts
-        else:
-            used_parts = total_parts
-
-        # Если не нужно ограничивать строки - возвращаем как есть
-        if max_rows == 0:
-            count = ddf.shape[0].compute()
-            mem_estimate = ddf.memory_usage(deep=True).sum().compute() / (1024**2)
-            log_message(
-                f"{name}: {count:,} строк (использовано {used_parts} из {total_parts} партиций), ~{mem_estimate:.1f} MB"
-            )
-            return ddf
-
-        # Быстрый способ ограничить количество строк - берем первые max_rows
-        # Для этого сначала вычисляем общее количество строк
-        total_rows = ddf.shape[0].compute()
-
-        if total_rows <= max_rows:
-            # Если строк меньше лимита - возвращаем всё
-            count = total_rows
-            mem_estimate = ddf.memory_usage(deep=True).sum().compute() / (1024**2)
-            log_message(
-                f"{name}: {count:,} строк (использовано {used_parts} из {total_parts} партиций), ~{mem_estimate:.1f} MB"
-            )
-            return ddf
-        else:
-            # Если строк больше - создаем новый ddf с ограничением
-            # Для скорости используем head с последующим преобразованием
-            limited_ddf = ddf.head(max_rows, compute=False)
-            count = max_rows
-            mem_estimate = limited_ddf.memory_usage(deep=True).sum().compute() / (
-                1024**2
-            )
-            log_message(
-                f"{name}: {count:,} строк (использовано {used_parts} из {total_parts} партиций), ~{mem_estimate:.1f} MB"
-            )
-            return limited_ddf
 
     log_message("Загружаем данные...")
     orders_ddf = read_sample(
@@ -248,11 +278,12 @@ def prepare_interactions(
     train_orders_df,
     tracker_ddf,
     cutoff_ts_per_user,
-    batch_size=300_000_000,
+    batch_size=1_000_000,  # Уменьшен размер батча
     action_weights=None,
     scale_days=5,
     output_dir="/home/root6/python/e_cup/rec_system/data/processed/prepare_interactions_batches",
-    force_recreate=False,  # Добавляем флаг для принудительного пересоздания
+    force_recreate=False,
+    max_tracker_files=10,  # Ограничение файлов tracker
 ):
     log_message("Формируем матрицу взаимодействий по батчам...")
 
@@ -272,7 +303,7 @@ def prepare_interactions(
         return existing_files
 
     # ====== Orders ======
-    log_message("... для orders")
+    log_message("... обработка orders")
     n_rows = len(train_orders_df)
     orders_files = []
 
@@ -280,89 +311,126 @@ def prepare_interactions(
         batch_path = os.path.join(output_dir, f"orders_batch_{start}.parquet")
         orders_files.append(batch_path)
 
-        # Проверяем, существует ли уже этот батч
         if os.path.exists(batch_path) and not force_recreate:
             log_message(f"✅ Orders батч {start} уже существует, пропускаем")
             batch_files.append(batch_path)
             continue
 
-        batch = train_orders_df.iloc[start : start + batch_size].copy()
+        end_idx = min(start + batch_size, n_rows)
+        batch = train_orders_df.iloc[start:end_idx].copy()
+
+        # Эффективное вычисление временных факторов
         days_ago = (ref_time - batch["created_timestamp"]).dt.days.clip(lower=1)
         time_factor = np.log1p(days_ago / scale_days)
-        batch = batch.assign(
-            timestamp=batch["created_timestamp"],
-            weight=5.0 * time_factor,
-            action_type="order",
-        )[["user_id", "item_id", "weight", "timestamp", "action_type"]]
 
-        batch.to_parquet(batch_path, index=False, engine="pyarrow")
+        result_batch = pd.DataFrame(
+            {
+                "user_id": batch["user_id"],
+                "item_id": batch["item_id"],
+                "weight": 5.0 * time_factor,
+                "timestamp": batch["created_timestamp"],
+                "action_type": "order",
+            }
+        )
+
+        result_batch.to_parquet(batch_path, index=False, engine="pyarrow")
         batch_files.append(batch_path)
-        del batch
+
+        log_message(f"Сохранен orders-батч {start}-{end_idx}")
+
+        # Очистка памяти
+        del batch, result_batch
         gc.collect()
-        log_message(f"Сохранен orders-батч {start}-{min(start+batch_size, n_rows)}")
 
     # ====== Tracker ======
-    log_message("... для tracker")
-    tracker_ddf = tracker_ddf[["user_id", "item_id", "timestamp", "action_type"]]
-
-    # Итерируемся по партициям Dask DataFrame
-    n_partitions = tracker_ddf.npartitions
+    log_message("... обработка tracker")
     tracker_files = []
 
-    for partition_id in range(n_partitions):
-        batch_path = os.path.join(output_dir, f"tracker_part_{partition_id}.parquet")
+    # Получаем список файлов tracker и ограничиваем их количество
+    tracker_path = "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train_final_apparel_tracker_data/"
+    all_tracker_files = find_parquet_files(tracker_path)
+
+    if max_tracker_files > 0:
+        all_tracker_files = all_tracker_files[:max_tracker_files]
+
+    log_message(f"Обрабатываем {len(all_tracker_files)} файлов tracker")
+
+    for file_idx, file_path in enumerate(all_tracker_files):
+        batch_path = os.path.join(output_dir, f"tracker_file_{file_idx}.parquet")
         tracker_files.append(batch_path)
 
-        # Проверяем, существует ли уже эта партиция
         if os.path.exists(batch_path) and not force_recreate:
-            log_message(
-                f"✅ Tracker партиция {partition_id} уже существует, пропускаем"
+            log_message(f"✅ Tracker файл {file_idx} уже обработан, пропускаем")
+            batch_files.append(batch_path)
+            continue
+
+        try:
+            # Читаем только необходимые колонки
+            part = pd.read_parquet(
+                file_path, columns=["user_id", "item_id", "timestamp", "action_type"]
             )
+
+            # Фильтрация по действиям
+            part = part[part["action_type"].isin(action_weights.keys())]
+
+            if part.empty:
+                # Создаем пустой файл
+                pd.DataFrame(
+                    columns=["user_id", "item_id", "weight", "timestamp", "action_type"]
+                ).to_parquet(batch_path, index=False)
+                batch_files.append(batch_path)
+                continue
+
+            # Преобразование времени
+            part["timestamp"] = pd.to_datetime(part["timestamp"])
+            mask = part["timestamp"] < cutoff_ts_per_user
+            part = part.loc[mask]
+
+            if part.empty:
+                pd.DataFrame(
+                    columns=["user_id", "item_id", "weight", "timestamp", "action_type"]
+                ).to_parquet(batch_path, index=False)
+                batch_files.append(batch_path)
+                continue
+
+            # Вычисление весов
+            aw = part["action_type"].map(action_weights)
+            days_ago = (ref_time - part["timestamp"]).dt.days.clip(lower=1)
+            time_factor = np.log1p(days_ago / scale_days)
+
+            result_part = pd.DataFrame(
+                {
+                    "user_id": part["user_id"],
+                    "item_id": part["item_id"],
+                    "weight": aw * time_factor,
+                    "timestamp": part["timestamp"],
+                    "action_type": part["action_type"],
+                }
+            )
+
+            result_part.to_parquet(batch_path, index=False, engine="pyarrow")
             batch_files.append(batch_path)
+
+            log_message(f"Обработан tracker файл {file_idx}: {len(part)} строк")
+
+            # Очистка памяти
+            del part, result_part
+            gc.collect()
+
+        except Exception as e:
+            log_message(f"❌ Ошибка обработки tracker файла {file_path}: {e}")
             continue
 
-        # Вычисляем одну партицию
-        part = tracker_ddf.get_partition(partition_id).compute()
-        part["timestamp"] = pd.to_datetime(part["timestamp"])
-
-        # cutoff_ts_per_user здесь один глобальный timestamp
-        cutoff_ts = cutoff_ts_per_user
-        mask = part["timestamp"] < cutoff_ts
-        part = part.loc[mask]
-
-        if part.empty:
-            # Создаем пустой файл чтобы отметить, что партиция обработана
-            pd.DataFrame(
-                columns=["user_id", "item_id", "weight", "timestamp", "action_type"]
-            ).to_parquet(batch_path, index=False, engine="pyarrow")
-            batch_files.append(batch_path)
-            continue
-
-        aw = part["action_type"].map(action_weights).fillna(0)
-        days_ago = (ref_time - part["timestamp"]).dt.days.clip(lower=1)
-        time_factor = np.log1p(days_ago / scale_days)
-        part = part.assign(weight=aw * time_factor)[
-            ["user_id", "item_id", "weight", "timestamp", "action_type"]
-        ]
-
-        part.to_parquet(batch_path, index=False, engine="pyarrow")
-        batch_files.append(batch_path)
-        del part
-        gc.collect()
-        log_message(f"Сохранен tracker-партиция {partition_id}")
-
-    # Проверяем целостность: все ли файлы созданы
+    # Проверяем целостность
     expected_files = orders_files + tracker_files
     missing_files = [f for f in expected_files if not os.path.exists(f)]
 
     if missing_files:
-        log_message(
-            f"⚠️  Предупреждение: отсутствуют {len(missing_files)} файлов: {missing_files}"
-        )
+        log_message(f"⚠️  Отсутствуют {len(missing_files)} файлов")
     else:
-        log_message("✅ Все батчи успешно созданы или уже существуют")
+        log_message("✅ Все файлы успешно созданы")
 
-    log_message(f"Всего файлов: {len(batch_files)}")
+    log_message(f"Всего файлов взаимодействий: {len(batch_files)}")
     return batch_files
 
 
@@ -457,7 +525,7 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
     log_message("Первый проход: построение маппингов...")
 
     for f in tqdm(interactions_files):
-        df = pl.read_parquet(f, columns=["user_id", "item_id"])
+        df = pl.scan_parquet(f).select(["user_id", "item_id"]).collect()
         user_set.update(df["user_id"].unique().to_list())
         item_set.update(df["item_id"].unique().to_list())
 
@@ -506,7 +574,7 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
             batch_files.append(batch_path)
 
     # 3. Постепенная загрузка и обучение
-    log_message("Постепенное обучение...")
+    log_message("Обучение als_model...")
 
     als_model = TorchALS(
         len(user_map), len(item_map), n_factors=n_factors, device=device
@@ -1472,19 +1540,19 @@ class LightGBMRecommender:
                 "objective": "binary",
                 "metric": "None",
                 "learning_rate": 0.1,
-                "num_leaves": 127,
-                "max_depth": -1,
+                "num_leaves": 31,
+                "max_depth": 8,
                 "min_data_in_leaf": 20,
-                "feature_fraction": 0.8,
-                "bagging_fraction": 0.8,
-                "bagging_freq": 5,
+                "feature_fraction": 0.6,
+                "bagging_fraction": 0.6,
+                "bagging_freq": 15,
                 "verbosity": -1,
                 "force_row_wise": True,
-                "device": "cpu",
                 "num_threads": 6,
-                "max_bin": 255,
-                "boosting": "dart",
+                "max_bin": 63,
+                "boosting": "gbdt",
                 "bin_construct_sample_cnt": 200000,
+                "device": "cpu",
             }
 
         # Проверка признаков
@@ -1549,7 +1617,7 @@ class LightGBMRecommender:
         best_iteration = 0
         best_eval_result_list = None
         no_improvement_count = 0
-        early_stopping_rounds = 10
+        early_stopping_rounds = 50
         eval_history = {"train": [], "valid": []}
 
         # Кастомный callback
@@ -1612,7 +1680,7 @@ class LightGBMRecommender:
             self.model = lgb.train(
                 params,
                 train_dataset,
-                num_boost_round=100,
+                num_boost_round=ITER_N,
                 valid_sets=valid_sets,
                 valid_names=valid_names,
                 callbacks=[ndcg_callback],
@@ -2650,7 +2718,6 @@ if __name__ == "__main__":
             log_message(
                 f"Оперативная память: {ram_total:.1f} GB всего, {ram_used:.1f} GB использовано"
             )
-            log_message(f"Частота RAM: информация требует дополнительных библиотек")
         except Exception:
             log_message("Оперативная память: информация недоступна")
 
