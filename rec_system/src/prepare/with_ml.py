@@ -45,9 +45,10 @@ warnings.filterwarnings(
 tqdm.pandas()
 
 MAX_FILES = 0  # сколько файлов берем в работу. 0 - все
-MAX_ROWS = 0  # сколько строк для каждой группы берем в работу. 0 - все
-ITER_N = 100  # число эпох для обучения
+MAX_ROWS = 1000  # сколько строк для каждой группы берем в работу. 0 - все
+ITER_N = 5  # число эпох для обучения
 EARLY_STOP = 10  # ранняя остановка обучения
+EMD_LENGHT = 100
 
 
 def find_parquet_files(folder):
@@ -1232,7 +1233,7 @@ class LightGBMRecommender:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             all_item_ids = list(self.external_embeddings_dict.keys())
             embedding_dim = len(next(iter(self.external_embeddings_dict.values())))
-            n_fclip_dims = min(10, embedding_dim)
+            n_fclip_dims = min(EMD_LENGHT, embedding_dim)
             embeddings_tensor = torch.tensor(
                 [self.external_embeddings_dict[i] for i in all_item_ids],
                 dtype=torch.float32,
@@ -2178,7 +2179,7 @@ def build_item_features_dict(
         for item_id in batch_items:
             if item_id in item_stats_dict:
                 embedding = embeddings_dict[item_id]
-                for j in range(min(5, len(embedding))):
+                for j in range(min(EMD_LENGHT, len(embedding))):
                     item_stats_dict[item_id][f"fclip_embed_{j}"] = float(embedding[j])
 
     # 8. ОЧИСТКА ВРЕМЕННЫХ ФАЙЛОВ
