@@ -19,6 +19,7 @@ from pathlib import Path
 
 import dask
 import dask.dataframe as dd
+import joblib
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
@@ -32,8 +33,10 @@ import torch.sparse
 from dask.diagnostics import ProgressBar
 from implicit.als import AlternatingLeastSquares
 from scipy.sparse import coo_matrix, csr_matrix, vstack
+from sklearn.decomposition import PCA
 from sklearn.metrics import ndcg_score
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 from torch import nn
 from tqdm import tqdm
 from tqdm.auto import tqdm
@@ -45,10 +48,10 @@ warnings.filterwarnings(
 tqdm.pandas()
 
 MAX_FILES = 0  # сколько файлов берем в работу. 0 - все
-MAX_ROWS = 100_000  # сколько строк для каждой группы берем в работу. 0 - все
-ITER_N = 5  # число эпох для обучения
+MAX_ROWS = 1000  # сколько строк для каждой группы берем в работу. 0 - все
+ITER_N = 100  # число эпох для обучения
 EARLY_STOP = 10  # ранняя остановка обучения
-EMD_LENGHT = 100
+EMD_LENGHT = 50
 
 
 def find_parquet_files(folder):
@@ -439,35 +442,6 @@ def prepare_interactions(
 
     log_message(f"Всего файлов взаимодействий: {len(batch_files)}")
     return batch_files
-
-
-def check_interactions_files_complete(output_dir):
-    """Проверяет, все ли файлы взаимодействий существуют и не повреждены"""
-    import pyarrow.parquet as pq
-
-    files = glob.glob(os.path.join(output_dir, "*.parquet"))
-    if not files:
-        return False, "Нет файлов в директории"
-
-    valid_files = []
-    corrupted_files = []
-
-    for file_path in files:
-        try:
-            # Быстрая проверка: можно ли открыть файл
-            table = pq.read_table(file_path)
-            if table.num_rows > 0:
-                valid_files.append(file_path)
-            else:
-                corrupted_files.append(file_path)
-        except Exception as e:
-            corrupted_files.append(file_path)
-            log_message(f"❌ Файл {file_path} поврежден: {e}")
-
-    return (
-        len(corrupted_files) == 0,
-        f"Валидных: {len(valid_files)}, Поврежденных: {len(corrupted_files)}",
-    )
 
 
 # -------------------- Глобальная популярность --------------------
@@ -1229,41 +1203,41 @@ class LightGBMRecommender:
             data["covisitation_score"] = 0
 
         # --- FCLIP эмбеддинги ---
-        if getattr(self, "external_embeddings_dict", None):
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            all_item_ids = list(self.external_embeddings_dict.keys())
-            embedding_dim = len(next(iter(self.external_embeddings_dict.values())))
-            n_fclip_dims = min(EMD_LENGHT, embedding_dim)
-            embeddings_tensor = torch.tensor(
-                [self.external_embeddings_dict[i] for i in all_item_ids],
-                dtype=torch.float32,
-                device=device,
-            )
-            item_id_to_idx = {item_id: idx for idx, item_id in enumerate(all_item_ids)}
-            batch_size = 100_000
-            total_rows = len(data)
-            for i in range(n_fclip_dims):
-                data[f"fclip_embed_{i}"] = 0.0
-                for start_idx in range(0, total_rows, batch_size):
-                    end_idx = min(start_idx + batch_size, total_rows)
-                    batch_item_ids = data.iloc[start_idx:end_idx]["item_id"].values
-                    valid_mask = np.array(
-                        [item in item_id_to_idx for item in batch_item_ids]
-                    )
-                    valid_indices = np.where(valid_mask)[0]
-                    valid_item_ids = batch_item_ids[valid_mask]
-                    if len(valid_item_ids):
-                        tensor_indices = torch.tensor(
-                            [item_id_to_idx[item] for item in valid_item_ids],
-                            device=device,
-                        )
-                        batch_emb = embeddings_tensor[tensor_indices, i].cpu().numpy()
-                        data.iloc[
-                            start_idx + valid_indices,
-                            data.columns.get_loc(f"fclip_embed_{i}"),
-                        ] = batch_emb
-            del embeddings_tensor, item_id_to_idx
-            torch.cuda.empty_cache()
+        # if getattr(self, "external_embeddings_dict", None):
+        #     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        #     all_item_ids = list(self.external_embeddings_dict.keys())
+        #     embedding_dim = len(next(iter(self.external_embeddings_dict.values())))
+        #     n_fclip_dims = min(EMD_LENGHT, embedding_dim)
+        #     embeddings_tensor = torch.tensor(
+        #         [self.external_embeddings_dict[i] for i in all_item_ids],
+        #         dtype=torch.float32,
+        #         device=device,
+        #     )
+        #     item_id_to_idx = {item_id: idx for idx, item_id in enumerate(all_item_ids)}
+        #     batch_size = 100_000
+        #     total_rows = len(data)
+        #     for i in range(n_fclip_dims):
+        #         data[f"fclip_embed_{i}"] = 0.0
+        #         for start_idx in range(0, total_rows, batch_size):
+        #             end_idx = min(start_idx + batch_size, total_rows)
+        #             batch_item_ids = data.iloc[start_idx:end_idx]["item_id"].values
+        #             valid_mask = np.array(
+        #                 [item in item_id_to_idx for item in batch_item_ids]
+        #             )
+        #             valid_indices = np.where(valid_mask)[0]
+        #             valid_item_ids = batch_item_ids[valid_mask]
+        #             if len(valid_item_ids):
+        #                 tensor_indices = torch.tensor(
+        #                     [item_id_to_idx[item] for item in valid_item_ids],
+        #                     device=device,
+        #                 )
+        #                 batch_emb = embeddings_tensor[tensor_indices, i].cpu().numpy()
+        #                 data.iloc[
+        #                     start_idx + valid_indices,
+        #                     data.columns.get_loc(f"fclip_embed_{i}"),
+        #                 ] = batch_emb
+        #     del embeddings_tensor, item_id_to_idx
+        #     torch.cuda.empty_cache()
 
         # --- Регистрируем новые признаки ---
         new_features = [
@@ -1275,8 +1249,8 @@ class LightGBMRecommender:
             "user_avg_item_popularity",
             "covisitation_score",
         ]
-        if getattr(self, "external_embeddings_dict", None):
-            new_features += [f"fclip_embed_{i}" for i in range(n_fclip_dims)]
+        # if getattr(self, "external_embeddings_dict", None):
+        #     new_features += [f"fclip_embed_{i}" for i in range(n_fclip_dims)]
 
         existing_features = set(getattr(self, "feature_columns", []))
         for feature in new_features:
@@ -1307,15 +1281,14 @@ class LightGBMRecommender:
         negatives_per_positive=0,
         split: float = 0.2,
     ):
-        log_message(
-            "Подготовка данных для LightGBM (streaming, polars lazy, векторно)..."
-        )
+        log_message("Подготовка данных для LightGBM (streaming, polars lazy, батчи)...")
 
         base_dir = Path("/home/root6/python/e_cup/rec_system/data/processed/")
         interactions_out_dir = base_dir / "interactions_streaming"
         train_out_dir = base_dir / "train_streaming"
         val_out_dir = base_dir / "val_streaming"
-        for p in [interactions_out_dir, train_out_dir, val_out_dir]:
+        tmp_dir = base_dir / "tmp_prepare"
+        for p in [interactions_out_dir, train_out_dir, val_out_dir, tmp_dir]:
             p.mkdir(parents=True, exist_ok=True)
 
         # --- 1. Объединяем interactions лениво ---
@@ -1330,18 +1303,18 @@ class LightGBMRecommender:
         interactions_all_path = interactions_out_dir / "interactions_all.parquet"
         interactions_lazy.sink_parquet(str(interactions_all_path))
 
-        # --- 2. Обработка orders (sample + lazy) ---
+        # --- 2. Обработка orders (sample + лениво) ---
         if sample_fraction < 1.0:
             sampled_orders = orders_ddf.sample(frac=sample_fraction, random_state=42)
         else:
             sampled_orders = orders_ddf
 
-        orders_tmp_dir = base_dir / "orders_sample_tmp"
+        orders_tmp_dir = tmp_dir / "orders_sample"
         orders_tmp_dir.mkdir(exist_ok=True)
         sampled_orders.to_parquet(str(orders_tmp_dir), write_index=False)
         orders_pl = pl.scan_parquet(str(orders_tmp_dir / "*.parquet"))
 
-        # --- 3. Определяем split_time на основе ORDERS ---
+        # --- 3. Определяем split_time ---
         orders_ts_bounds = orders_pl.select(
             [
                 pl.col("created_timestamp").min().alias("min_ts"),
@@ -1359,45 +1332,102 @@ class LightGBMRecommender:
         )
         train_timestamp_fill = split_time - timedelta(seconds=1)
 
-        # --- 4. Подготовка фичей ---
+        # --- 4. User features → parquet ---
         if user_features_dict:
-            user_feats_lazy = pl.LazyFrame(
-                [{"user_id": k, **v} for k, v in user_features_dict.items()]
-            )
+            rows, batch, part = [], 0, 0
+            user_tmp_dir = tmp_dir / "user_feats"
+            user_tmp_dir.mkdir(exist_ok=True)
+            for uid, feats in user_features_dict.items():
+                rows.append({"user_id": uid, **feats})
+                batch += 1
+                if batch >= 50_000:
+                    pl.DataFrame(rows).write_parquet(
+                        user_tmp_dir / f"user_{part}.parquet"
+                    )
+                    rows.clear()
+                    batch = 0
+                    part += 1
+            if rows:
+                pl.DataFrame(rows).write_parquet(user_tmp_dir / f"user_{part}.parquet")
+            user_feats_lazy = pl.scan_parquet(str(user_tmp_dir / "*.parquet"))
             user_feat_cols = [
                 c for c in user_feats_lazy.collect_schema().names() if c != "user_id"
             ]
         else:
-            user_feats_lazy = None
-            user_feat_cols = []
+            user_feats_lazy, user_feat_cols = None, []
 
+        # --- 5. Item features → parquet ---
         if item_features_dict:
-            items_data = []
-            for item_id, feats in item_features_dict.items():
+            rows, batch, part = [], 0, 0
+            item_tmp_dir = tmp_dir / "item_feats"
+            item_tmp_dir.mkdir(exist_ok=True)
+            for iid, feats in item_features_dict.items():
                 if isinstance(feats, dict):
-                    feats_copy = feats.copy()
-                    feats_copy["item_id"] = item_id
-                    items_data.append(feats_copy)
+                    row = {"item_id": iid, **feats}
+                    rows.append(row)
                 elif isinstance(feats, np.ndarray):
-                    emb = {
-                        f"emb_{i}": float(feats[i])
-                        for i in range(min(EMD_LENGHT, feats.shape[0]))
+                    # Временная обработка: создаем базовые фичи из numpy array
+                    row = {
+                        "item_id": iid,
+                        "item_count": float(feats[0]) if len(feats) > 0 else 0.0,
+                        "item_sum": float(feats[1]) if len(feats) > 1 else 0.0,
+                        "item_mean": float(feats[2]) if len(feats) > 2 else 0.0,
+                        "item_max": float(feats[3]) if len(feats) > 3 else 0.0,
+                        "item_min": float(feats[4]) if len(feats) > 4 else 0.0,
+                        "item_orders_count": float(feats[5]) if len(feats) > 5 else 0.0,
                     }
-                    emb["item_id"] = item_id
-                    items_data.append(emb)
-            item_feats_lazy = pl.LazyFrame(items_data)
-            item_feat_cols = [
-                c for c in item_feats_lazy.collect_schema().names() if c != "item_id"
-            ]
+                    rows.append(row)
+                batch += 1
+                if batch >= 50_000:
+                    if rows:
+                        pl.DataFrame(rows).write_parquet(
+                            item_tmp_dir / f"item_{part}.parquet"
+                        )
+                    rows.clear()
+                    batch = 0
+                    part += 1
+            if rows:
+                pl.DataFrame(rows).write_parquet(item_tmp_dir / f"item_{part}.parquet")
+            
+            item_files = list(item_tmp_dir.glob("*.parquet"))
+            if item_files:
+                item_feats_lazy = pl.scan_parquet(str(item_tmp_dir / "*.parquet"))
+                item_feat_cols = [
+                    c for c in item_feats_lazy.collect_schema().names() if c != "item_id"
+                ]
+            else:
+                item_feats_lazy, item_feat_cols = None, []
         else:
-            item_feats_lazy = None
-            item_feat_cols = []
+            item_feats_lazy, item_feat_cols = None, []
 
         self.feature_columns = ["copurchase_count"] + user_feat_cols + item_feat_cols
 
-        # --- 5. Основной мердж ---
-        interactions_lazy = pl.scan_parquet(str(interactions_all_path))
+        # --- 6. Copurchase map → parquet ---
+        if copurchase_map:
+            rows, batch, part = [], 0, 0
+            copurchase_tmp_dir = tmp_dir / "copurchase"
+            copurchase_tmp_dir.mkdir(exist_ok=True)
+            for iid, vals in copurchase_map.items():
+                count = sum(c[1] if isinstance(c, tuple) else c for c in vals)
+                rows.append({"item_id": iid, "copurchase_count": float(count)})
+                batch += 1
+                if batch >= 50_000:
+                    pl.DataFrame(rows).write_parquet(
+                        copurchase_tmp_dir / f"cop_{part}.parquet"
+                    )
+                    rows.clear()
+                    batch = 0
+                    part += 1
+            if rows:
+                pl.DataFrame(rows).write_parquet(
+                    copurchase_tmp_dir / f"cop_{part}.parquet"
+                )
+            copurchase_lazy = pl.scan_parquet(str(copurchase_tmp_dir / "*.parquet"))
+        else:
+            copurchase_lazy = None
 
+        # --- 7. Основной мердж ---
+        interactions_lazy = pl.scan_parquet(str(interactions_all_path))
         merged = orders_pl.join(
             interactions_lazy, on=["user_id", "item_id"], how="left"
         ).with_columns(
@@ -1414,84 +1444,18 @@ class LightGBMRecommender:
         if item_feats_lazy is not None:
             merged = merged.join(item_feats_lazy, on="item_id", how="left")
 
-        # --- 6. Copurchase count ---
-        if copurchase_map:
-            copurchase_data = []
-            for k, v in copurchase_map.items():
-                count = sum(c[1] if isinstance(c, tuple) else c for c in v)
-                copurchase_data.append({"item_id": k, "copurchase_count": float(count)})
-
-            copurchase_lazy = pl.LazyFrame(copurchase_data)
+        if copurchase_lazy is not None:
             merged = merged.join(copurchase_lazy, on="item_id", how="left")
-            merged = merged.with_columns(pl.col("copurchase_count").fill_null(0.0))
         else:
             merged = merged.with_columns(pl.lit(0.0).alias("copurchase_count"))
 
-        # --- 7. Генерация негативов ---
+        # --- 8. Negatives (упрощённо: без collect, построчно батчами) ---
+        # тут лучше вынести в отдельную функцию save_negatives_to_parquet как выше
+        # иначе снова collect порвёт память
         if negatives_per_positive > 0:
-            log_message("Генерация негативов построчно...")
+            log_message("⚠️ Негативы не реализованы в стриминговом виде")
 
-            all_item_ids = list(item_map.keys())
-
-            def generate_negatives_for_user(user_data):
-                user_pos_items = user_data.filter(pl.col("target") == 1)[
-                    "item_id"
-                ].to_list()
-                user_all_items = user_data["item_id"].to_list()
-                if not user_pos_items:
-                    return None
-                n_neg = len(user_pos_items) * negatives_per_positive
-                available_items = [i for i in all_item_ids if i not in user_all_items]
-                if not available_items:
-                    return None
-                sampled = np.random.choice(
-                    available_items, min(n_neg, len(available_items)), replace=False
-                )
-                neg_rows = []
-                for item_id in sampled:
-                    neg_rows.append(
-                        {
-                            "user_id": user_data["user_id"][0],
-                            "item_id": item_id,
-                            "timestamp": train_timestamp_fill,
-                            "target": 0,
-                            "weight": 0.0,
-                            "copurchase_count": 0.0,
-                        }
-                    )
-                return pl.DataFrame(neg_rows)
-
-            negatives_list = []
-            user_chunks = (
-                merged.select("user_id")
-                .unique()
-                .collect()
-                .partition_by(1000, "user_id")
-            )
-            for i, user_chunk in enumerate(user_chunks):
-                user_ids = user_chunk["user_id"].to_list()
-                user_data_chunk = merged.filter(
-                    pl.col("user_id").is_in(user_ids)
-                ).collect()
-                for user_id in user_ids:
-                    user_data = user_data_chunk.filter(pl.col("user_id") == user_id)
-                    neg_df = generate_negatives_for_user(user_data)
-                    if neg_df is not None:
-                        negatives_list.append(neg_df)
-                if i % 10 == 0:
-                    log_message(f"Обработано {i * 1000} пользователей для негативов")
-
-            if negatives_list:
-                negatives_df = pl.concat(negatives_list)
-                for col in merged.columns:
-                    if col not in negatives_df.columns:
-                        negatives_df = negatives_df.with_columns(
-                            pl.lit(None).alias(col)
-                        )
-                negatives_lazy = negatives_df.lazy()
-                merged = pl.concat([merged, negatives_lazy])
-
-        # --- 8. Разделение на train/val ---
+        # --- 9. Train/Val split ---
         if split_by_time:
             train_lazy = merged.filter(pl.col("timestamp") <= split_time)
             val_lazy = merged.filter(pl.col("timestamp") > split_time)
@@ -1507,14 +1471,14 @@ class LightGBMRecommender:
         val_lazy = val_lazy.drop("timestamp")
 
         train_lazy.sink_parquet(
-            str(train_out_dir / "train.parquet"), row_group_size=100000
+            str(train_out_dir / "train.parquet"), row_group_size=100_000
         )
-        val_lazy.sink_parquet(str(val_out_dir / "val.parquet"), row_group_size=100000)
+        val_lazy.sink_parquet(str(val_out_dir / "val.parquet"), row_group_size=100_000)
 
-        if orders_tmp_dir.exists():
-            import shutil
+        import shutil
 
-            shutil.rmtree(orders_tmp_dir)
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
 
         log_message("✅ Данные подготовлены без утечек памяти")
         return train_out_dir, val_out_dir
@@ -1912,29 +1876,11 @@ def build_user_features_dict(interactions_files, orders_df, device="cuda"):
     return user_stats_dict
 
 
-def load_ui_features_for_user_item(user_id, item_id, ui_features_path):
-    """
-    Загружает UI-признаки для конкретной пары user-item
-    """
-    if not ui_features_path or not os.path.exists(ui_features_path):
-        return None
-
-    query = pl.scan_parquet(ui_features_path).filter(
-        (pl.col("user_id") == user_id) & (pl.col("item_id") == item_id)
-    )
-    result = query.collect()
-
-    if len(result) == 0:
-        return None
-
-    return result[0].to_dict()
-
-
 def build_item_features_dict(
     interactions_files,
     items_df,
     orders_df,
-    embeddings_dict,
+    # embeddings_dict,
     device="cuda",
     batch_size=1_000_000,
     temp_dir="/tmp/item_features",
@@ -2169,18 +2115,18 @@ def build_item_features_dict(
                 }
 
     # 7. ДОБАВЛЕНИЕ ЭМБЕДДИНГОВ ПОРЦИЯМИ
-    log_message("Добавление эмбеддингов...")
+    # log_message("Добавление эмбеддингов...")
 
-    embedding_items = list(embeddings_dict.keys())
-    for i in tqdm(
-        range(0, len(embedding_items), batch_size), desc="Добавление эмбеддингов"
-    ):
-        batch_items = embedding_items[i : i + batch_size]
-        for item_id in batch_items:
-            if item_id in item_stats_dict:
-                embedding = embeddings_dict[item_id]
-                for j in range(min(EMD_LENGHT, len(embedding))):
-                    item_stats_dict[item_id][f"fclip_embed_{j}"] = float(embedding[j])
+    # embedding_items = list(embeddings_dict.keys())
+    # for i in tqdm(
+    #     range(0, len(embedding_items), batch_size), desc="Добавление эмбеддингов"
+    # ):
+    #     batch_items = embedding_items[i : i + batch_size]
+    #     for item_id in batch_items:
+    #         if item_id in item_stats_dict:
+    #             embedding = embeddings_dict[item_id]
+    #             for j in range(min(EMD_LENGHT, len(embedding))):
+    #                 item_stats_dict[item_id][f"fclip_embed_{j}"] = float(embedding[j])
 
     # 8. ОЧИСТКА ВРЕМЕННЫХ ФАЙЛОВ
     log_message("Очистка временных файлов...")
@@ -2197,137 +2143,22 @@ def build_item_features_dict(
     return item_stats_dict
 
 
-def build_category_features_dict(category_df, items_df):
-    """
-    Оптимизированная версия с использованием Polars
-    """
-    import polars as pl
-
-    log_message("Построение категорийных признаков...")
-
-    if not isinstance(category_df, pl.DataFrame):
-        category_pl = pl.from_pandas(
-            category_df.compute() if hasattr(category_df, "compute") else category_df
-        )
-    else:
-        category_pl = category_df
-
-    if not isinstance(items_df, pl.DataFrame):
-        items_pl = pl.from_pandas(
-            items_df.compute() if hasattr(items_df, "compute") else items_df
-        )
-    else:
-        items_pl = items_df
-
-    # Создаем маппинг категория -> уровень в иерархии
-    cat_levels = category_pl.with_columns(
-        [(pl.col("ids").list.lengths() - 1).alias("category_level")]
-    ).select(["catalogid", "category_level"])
-
-    # Создаем маппинг товар -> категория
-    item_categories = items_pl.select(["item_id", "catalogid"]).unique()
-
-    # Объединяем
-    category_features = item_categories.join(cat_levels, on="catalogid", how="left")
-    category_features = category_features.with_columns(
-        [pl.col("category_level").fill_null(0)]
-    )
-
-    # КОНВЕРТАЦИЯ В СЛОВАРЬ
-    category_features_dict = {}
-    for row in category_features.iter_rows(named=True):
-        category_features_dict[row["item_id"]] = {
-            "item_category": row["catalogid"],
-            "category_level": row["category_level"],
-        }
-
-    log_message(
-        f"Категорийные признаки построены. Записей: {len(category_features_dict)}"
-    )
-    return category_features_dict
-
-
-def prepare_lgbm_training_data(
-    user_features_dict,
-    item_features_dict,
-    user_item_features_dict,
-    category_features_dict,
-    test_orders_df,
-    all_items,  # список всех item_id
-    sample_fraction=0.1,
-):
-    """
-    Подготавливает данные для обучения LightGBM:
-    1 положительный пример -> 1 негативный пример.
-    """
-    log_message("Подготовка данных для обучения LightGBM...")
-
-    # Берем sample от тестовых заказов
-    test_sample = test_orders_df.sample(frac=sample_fraction, random_state=42)
-
-    train_examples = []
-
-    for _, row in test_sample.iterrows():
-        user_id = row["user_id"]
-        pos_item_id = row["item_id"]
-
-        # ---------- Положительный ----------
-        features = {}
-        if user_id in user_features_dict:
-            features.update(user_features_dict[user_id])
-        if pos_item_id in item_features_dict:
-            features.update(item_features_dict[pos_item_id])
-        if (user_id, pos_item_id) in user_item_features_dict:
-            features.update(user_item_features_dict[(user_id, pos_item_id)])
-        if pos_item_id in category_features_dict:
-            features.update(category_features_dict[pos_item_id])
-
-        features["target"] = 1
-        features["user_id"] = user_id
-        features["item_id"] = pos_item_id
-        train_examples.append(features)
-
-        # ---------- Негативный ----------
-        neg_item_id = random.choice(all_items)
-        while neg_item_id == pos_item_id:
-            neg_item_id = random.choice(all_items)
-
-        neg_features = {}
-        if user_id in user_features_dict:
-            neg_features.update(user_features_dict[user_id])
-        if neg_item_id in item_features_dict:
-            neg_features.update(item_features_dict[neg_item_id])
-        if (user_id, neg_item_id) in user_item_features_dict:
-            neg_features.update(user_item_features_dict[(user_id, neg_item_id)])
-        if neg_item_id in category_features_dict:
-            neg_features.update(category_features_dict[neg_item_id])
-
-        neg_features["target"] = 0
-        neg_features["user_id"] = user_id
-        neg_features["item_id"] = neg_item_id
-        train_examples.append(neg_features)
-
-    # Создаем DataFrame
-    train_df = pd.DataFrame(train_examples)
-
-    # Заполняем пропуски только для числовых
-    numeric_cols = train_df.select_dtypes(include=[np.number]).columns
-    train_df[numeric_cols] = train_df[numeric_cols].fillna(0)
-
-    log_message(
-        f"Данные подготовлены. Размер: {len(train_df)} (положительных: {len(test_sample)}, негативных: {len(test_sample)})"
-    )
-    return train_df
-
-
 def load_and_process_embeddings(
-    items_ddf, embedding_column="fclip_embed", device="cuda", max_items=0
+    items_ddf,
+    embedding_column="fclip_embed",
+    device="cuda",
+    max_items=0,
+    apply_pca=True,
+    pca_components=50,
 ):
     """
-    Потоковая обработка эмбеддингов для больших таблиц.
+    Потоковая обработка эмбеддингов для больших таблиц с опциональным PCA.
     Возвращает словарь item_id -> np.array
     """
-    log_message("Оптимизированная потоковая загрузка эмбеддингов...")
+    log_message(
+        "Оптимизированная потоковая загрузка эмбеддингов..."
+        + (" с PCA" if apply_pca else " без PCA")
+    )
 
     if max_items > 0:
         items_sample = items_ddf[["item_id", embedding_column]].head(
@@ -2359,8 +2190,22 @@ def load_and_process_embeddings(
                 continue
             if embedding.size > 0:
                 embeddings_dict[item_id] = embedding
-        except Exception:
+        except Exception as e:
+            log_message(f"Ошибка обработки эмбеддинга для item_id {item_id}: {e}")
             continue
+
+    # Применяем PCA если требуется
+    if apply_pca and embeddings_dict:
+        embeddings_dict, pca_model, scaler = apply_pca_to_embeddings(
+            embeddings_dict, n_components=pca_components
+        )
+
+        # Сохраняем модели PCA
+        save_pca_models(
+            pca_model,
+            scaler,
+            "/home/root6/python/e_cup/rec_system/data/processed/embeddings_pca",
+        )
 
     log_message(f"Загружено эмбеддингов для {len(embeddings_dict)} товаров")
     return embeddings_dict
@@ -2378,6 +2223,7 @@ def normalize_item_features_dict(item_features_dict, embed_prefix="fclip_embed_"
     """
     Приводит словарь item_features_dict к формату {item_id: np.array([...])},
     где вектор = [обычные фичи + эмбеддинги].
+    Обновлено для работы с PCA-редуцированными эмбеддингами.
     """
     normalized = {}
 
@@ -2425,6 +2271,349 @@ def normalize_item_feats(item_feats, max_emb_dim=30):
                 norm_feats[f"emb_{i}"] = float(v)
 
     return norm_feats
+
+
+def apply_pca_to_embeddings(embeddings_dict, n_components=50, random_state=42):
+    """
+    Применяет PCA к эмбеддингам для уменьшения размерности
+
+    Args:
+        embeddings_dict: словарь {item_id: embedding_vector}
+        n_components: количество компонент PCA
+        random_state: random state для воспроизводимости
+
+    Returns:
+        dict: словарь с уменьшенными эмбеддингами
+        PCA: обученная модель PCA
+    """
+    log_message(f"Применение PCA к эмбеддингам: {n_components} компонент")
+
+    # Собираем все эмбеддинги в матрицу
+    item_ids = list(embeddings_dict.keys())
+    embeddings_matrix = np.array([embeddings_dict[item_id] for item_id in item_ids])
+
+    # Стандартизация
+    scaler = StandardScaler()
+    embeddings_scaled = scaler.fit_transform(embeddings_matrix)
+
+    # Применяем PCA
+    pca = PCA(n_components=n_components, random_state=random_state)
+    embeddings_reduced = pca.fit_transform(embeddings_scaled)
+
+    # Создаем новый словарь с уменьшенными эмбеддингами
+    reduced_embeddings_dict = {}
+    for i, item_id in enumerate(item_ids):
+        reduced_embeddings_dict[item_id] = embeddings_reduced[i]
+
+    # Логируем информацию о PCA
+    explained_variance = np.sum(pca.explained_variance_ratio_)
+    log_message(f"PCA завершено: сохранено {explained_variance:.3%} дисперсии")
+    log_message(f"Исходная размерность: {embeddings_matrix.shape[1]}")
+    log_message(f"Новая размерность: {n_components}")
+
+    return reduced_embeddings_dict, pca, scaler
+
+
+def save_pca_models(pca_model, scaler, base_path):
+    """
+    Сохраняет модели PCA и StandardScaler
+
+    Args:
+        pca_model: обученная модель PCA
+        scaler: обученный StandardScaler
+        base_path: базовый путь для сохранения
+    """
+    pca_path = f"{base_path}_pca.pkl"
+    scaler_path = f"{base_path}_scaler.pkl"
+
+    joblib.dump(pca_model, pca_path)
+    joblib.dump(scaler, scaler_path)
+
+    log_message(f"Модель PCA сохранена: {pca_path}")
+    log_message(f"Модель Scaler сохранена: {scaler_path}")
+
+
+def load_pca_models(base_path):
+    """
+    Загружает модели PCA и StandardScaler
+
+    Args:
+        base_path: базовый путь для загрузки
+
+    Returns:
+        tuple: (pca_model, scaler)
+    """
+    pca_path = f"{base_path}_pca.pkl"
+    scaler_path = f"{base_path}_scaler.pkl"
+
+    pca_model = joblib.load(pca_path)
+    scaler = joblib.load(scaler_path)
+
+    log_message(f"Модель PCA загружена: {pca_path}")
+    log_message(f"Модель Scaler загружена: {scaler_path}")
+
+    return pca_model, scaler
+
+
+def transform_new_embeddings(new_embeddings, pca_model, scaler):
+    """
+    Трансформирует новые эмбеддинги с помощью обученных PCA и StandardScaler
+
+    Args:
+        new_embeddings: новые эмбеддинги (массив или список)
+        pca_model: обученная модель PCA
+        scaler: обученный StandardScaler
+
+    Returns:
+        array: трансформированные эмбеддинги
+    """
+    if isinstance(new_embeddings, list):
+        new_embeddings = np.array(new_embeddings)
+
+    # Стандартизация
+    new_scaled = scaler.transform(new_embeddings.reshape(1, -1))
+
+    # PCA трансформация
+    transformed = pca_model.transform(new_scaled)
+
+    return transformed[0]
+
+
+def analyze_embedding_variance(embeddings_dict, max_components=None):
+    """
+    Анализирует дисперсию эмбеддингов для выбора оптимального числа компонент PCA
+    """
+    log_message("Анализ дисперсии эмбеддингов...")
+
+    # Собираем все эмбеддинги в матрицу
+    embeddings_matrix = np.array(list(embeddings_dict.values()))
+
+    if max_components is None:
+        max_components = min(embeddings_matrix.shape[1], 100)
+
+    # Анализ дисперсии
+    pca = PCA()
+    pca.fit(StandardScaler().fit_transform(embeddings_matrix))
+
+    # Кумулятивная объясненная дисперсия
+    cumulative_variance = np.cumsum(pca.explained_variance_ratio_)
+
+    # Находим оптимальное число компонент
+    optimal_components = np.argmax(cumulative_variance >= 0.95) + 1
+    if optimal_components == 1 and cumulative_variance[0] < 0.95:
+        optimal_components = max_components
+
+    log_message(f"Оптимальное число компонент PCA: {optimal_components}")
+    log_message(
+        f"Объясненная дисперсия: {cumulative_variance[optimal_components-1]:.3%}"
+    )
+
+    return optimal_components, cumulative_variance
+
+
+def plot_pca_variance(embeddings_dict, save_path=None):
+    """
+    Строит график объясненной дисперсии для PCA
+    """
+    import matplotlib.pyplot as plt
+
+    embeddings_matrix = np.array(list(embeddings_dict.values()))
+    pca = PCA()
+    pca.fit(StandardScaler().fit_transform(embeddings_matrix))
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(np.cumsum(pca.explained_variance_ratio_))
+    plt.xlabel("Number of Components")
+    plt.ylabel("Cumulative Explained Variance")
+    plt.title("PCA Explained Variance")
+    plt.grid(True)
+
+    if save_path:
+        plt.savefig(save_path)
+        log_message(f"График PCA сохранен: {save_path}")
+
+    plt.close()
+
+
+def fit_pca_on_sample(embeddings_dict, target_dim=50, sample_size=100_000, seed=42):
+    """
+    Обучает PCA на случайной выборке эмбеддингов
+    """
+    log_message(
+        f"Обучение PCA на выборке из {min(sample_size, len(embeddings_dict))} эмбеддингов..."
+    )
+
+    rng = random.Random(seed)
+    all_ids = list(embeddings_dict.keys())
+
+    # Берём случайный сэмпл
+    sample_ids = rng.sample(all_ids, min(sample_size, len(all_ids)))
+    X_sample = np.array([embeddings_dict[i] for i in sample_ids], dtype=np.float32)
+
+    # Стандартизация
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_sample)
+
+    # Учим PCA
+    pca = PCA(n_components=target_dim, svd_solver="randomized", random_state=seed)
+    pca.fit(X_scaled)
+
+    explained = np.sum(pca.explained_variance_ratio_)
+    log_message(f"PCA: сохранено {explained:.2%} дисперсии в {target_dim} компонентах")
+
+    return pca, scaler
+
+
+def transform_embeddings_batched(embeddings_dict, pca, scaler, batch_size=10_000):
+    """
+    Применяет PCA преобразование к эмбеддингам батчами
+    """
+    log_message(f"Применение PCA ко всем {len(embeddings_dict)} эмбеддингам батчами...")
+
+    all_ids = list(embeddings_dict.keys())
+    reduced_dict = {}
+
+    for i in tqdm(range(0, len(all_ids), batch_size), desc="PCA трансформация"):
+        batch_ids = all_ids[i : i + batch_size]
+        X_batch = np.array([embeddings_dict[j] for j in batch_ids], dtype=np.float32)
+
+        # Стандартизация и PCA
+        X_scaled = scaler.transform(X_batch)
+        X_reduced = pca.transform(X_scaled)
+
+        for idx, item_id in enumerate(batch_ids):
+            reduced_dict[item_id] = X_reduced[idx]
+
+    log_message(f"PCA трансформация завершена")
+    return reduced_dict
+
+
+def apply_pca_to_embeddings_optimized(
+    embeddings_dict, n_components=50, sample_size=100000, batch_size=10000
+):
+    """
+    Оптимизированная версия применения PCA к эмбеддингам
+    """
+    # Обучаем PCA на выборке
+    pca_model, scaler = fit_pca_on_sample(
+        embeddings_dict, target_dim=n_components, sample_size=sample_size
+    )
+
+    # Применяем ко всем данным
+    reduced_embeddings = transform_embeddings_batched(
+        embeddings_dict, pca_model, scaler, batch_size=batch_size
+    )
+
+    return reduced_embeddings, pca_model, scaler
+
+
+def apply_pca_to_embeddings_streaming(
+    items_ddf, embedding_column="fclip_embed", n_components=50, sample_size=50000
+):
+    """
+    Потоковое применение PCA без загрузки всех эмбеддингов в память
+    """
+    log_message("Потоковое применение PCA к эмбеддингам...")
+
+    # Сначала получаем выборку для обучения PCA
+    sample_items = items_ddf[["item_id", embedding_column]].sample(frac=0.1).compute()
+
+    sample_embeddings = []
+    sample_ids = []
+
+    for row in tqdm(
+        sample_items.itertuples(index=False), desc="Подготовка выборки PCA"
+    ):
+        item_id = row.item_id
+        embedding_data = getattr(row, embedding_column, None)
+        if embedding_data is not None:
+            try:
+                if isinstance(embedding_data, str):
+                    embedding = np.fromstring(
+                        embedding_data.strip("[]"), sep=",", dtype=np.float32
+                    )
+                elif isinstance(embedding_data, list):
+                    embedding = np.array(embedding_data, dtype=np.float32)
+                elif isinstance(embedding_data, np.ndarray):
+                    embedding = embedding_data.astype(np.float32)
+                else:
+                    continue
+
+                if embedding.size > 0:
+                    sample_embeddings.append(embedding)
+                    sample_ids.append(item_id)
+            except Exception as e:
+                continue
+
+    # Обучаем PCA на выборке
+    scaler = StandardScaler()
+    sample_scaled = scaler.fit_transform(sample_embeddings)
+    pca = PCA(n_components=n_components)
+    pca.fit(sample_scaled)
+
+    # Теперь обрабатываем все данные потоково
+    embeddings_dict = {}
+    batch_size = 10000
+
+    for i in range(0, len(items_ddf), batch_size):
+        batch = items_ddf[i : i + batch_size].compute()
+
+        for row in batch.itertuples(index=False):
+            item_id = row.item_id
+            embedding_data = getattr(row, embedding_column, None)
+
+            if embedding_data is not None:
+                try:
+                    if isinstance(embedding_data, str):
+                        embedding = np.fromstring(
+                            embedding_data.strip("[]"), sep=",", dtype=np.float32
+                        )
+                    elif isinstance(embedding_data, list):
+                        embedding = np.array(embedding_data, dtype=np.float32)
+                    elif isinstance(embedding_data, np.ndarray):
+                        embedding = embedding_data.astype(np.float32)
+                    else:
+                        continue
+
+                    # Применяем PCA
+                    embedding_scaled = scaler.transform(embedding.reshape(1, -1))
+                    embedding_reduced = pca.transform(embedding_scaled)[0]
+
+                    embeddings_dict[item_id] = embedding_reduced
+
+                except Exception as e:
+                    continue
+
+    return embeddings_dict, pca, scaler
+
+
+def save_negatives_to_parquet(
+    interactions_df, all_items, out_dir, num_negatives=10, batch_size=50_000
+):
+    os.makedirs(out_dir, exist_ok=True)
+    rows, counter, part = [], 0, 0
+
+    for row in tqdm(interactions_df.iter_rows(named=True), desc="Saving negatives"):
+        u = row["user_id"]
+        pos_item = row["item_id"]
+        negatives = []
+        while len(negatives) < num_negatives:
+            candidate = all_items.sample(1).item()
+            if candidate != pos_item:
+                negatives.append(candidate)
+
+        for neg in negatives:
+            rows.append({"user_id": u, "item_id": neg, "label": 0})
+            counter += 1
+
+        if counter >= batch_size:
+            pl.DataFrame(rows).write_parquet(f"{out_dir}/negs_{part}.parquet")
+            rows.clear()
+            counter = 0
+            part += 1
+
+    if rows:
+        pl.DataFrame(rows).write_parquet(f"{out_dir}/negs_{part}.parquet")
 
 
 # -------------------- Основной запуск --------------------
@@ -2484,23 +2673,83 @@ if __name__ == "__main__":
         log_message(f"Загрузка данных завершена за {timedelta(seconds=stage_time)}")
 
         # === ЗАГРУЗКА ЭМБЕДДИНГОВ ===
-        stage_start = time.time()
-        log_message("=== ЗАГРУЗКА ЭМБЕДДИНГОВ ===")
-        embeddings_dict = load_and_process_embeddings(items_ddf)
-        save_path = (
-            "/home/root6/python/e_cup/rec_system/data/processed/embeddings_dict.pkl"
-        )
-        with open(save_path, "wb") as f:
-            pickle.dump(embeddings_dict, f)
-        log_message(
-            f"Пример ключей в embeddings_dict: {list(embeddings_dict.keys())[:5]}"
-        )
-        log_message(f"Пример значения: {next(iter(embeddings_dict.values()))[:5]}")
-        stage_time = time.time() - stage_start
-        log_message(
-            f"Загрузка эмбеддингов завершена за {timedelta(seconds=stage_time)}"
-        )
-        log_message(f"Загружено эмбеддингов: {len(embeddings_dict)}")
+        # stage_start = time.time()
+        # log_message("=== ЗАГРУЗКА ЭМБЕДДИНГОВ ===")
+
+        # # Сначала загружаем эмбеддинги без PCA
+        # raw_embeddings_dict = load_and_process_embeddings(
+        #     items_ddf,
+        #     apply_pca=False,  # Сначала загружаем без PCA
+        # )
+
+        # log_message(f"Загружено сырых эмбеддингов: {len(raw_embeddings_dict)}")
+        # log_message(
+        #     f"Размерность исходных эмбеддингов: {len(next(iter(raw_embeddings_dict.values())))}"
+        # )
+
+        # # Анализируем дисперсию для выбора оптимального числа компонент
+        # optimal_components, variance = analyze_embedding_variance(raw_embeddings_dict)
+        # plot_pca_variance(
+        #     raw_embeddings_dict, "/home/root6/python/e_cup/rec_system/pca_variance.png"
+        # )
+
+        # # Используем оптимальное число компонент или EMD_LENGHT, если оно меньше
+        # final_components = min(optimal_components, EMD_LENGHT)
+        # log_message(
+        #     f"Используем {final_components} компонент PCA (оптимально: {optimal_components}, лимит: {EMD_LENGHT})"
+        # )
+
+        # # Применяем PCA с выбранным числом компонент (оптимизированная версия)
+        # if len(items_ddf) > 10_000_000:  # Если больше 10 млн строк
+        #     log_message("Используем потоковый PCA для больших данных...")
+        #     embeddings_dict, pca_model, scaler = apply_pca_to_embeddings_streaming(
+        #         items_ddf,
+        #         embedding_column="fclip_embed",
+        #         n_components=final_components,
+        #         sample_size=50000,
+        #     )
+        # else:
+        #     # Для нормальных объемов используем оптимизированный вариант
+        #     embeddings_dict, pca_model, scaler = apply_pca_to_embeddings_optimized(
+        #         raw_embeddings_dict,
+        #         n_components=final_components,
+        #         sample_size=100000,
+        #         batch_size=10000,
+        #     )
+
+        # # Сохраняем уменьшенные эмбеддинги
+        # save_path = (
+        #     "/home/root6/python/e_cup/rec_system/data/processed/embeddings_dict.pkl"
+        # )
+        # with open(save_path, "wb") as f:
+        #     pickle.dump(embeddings_dict, f)
+
+        # # Сохраняем модели PCA и scaler
+        # save_pca_models(
+        #     pca_model,
+        #     scaler,
+        #     "/home/root6/python/e_cup/rec_system/data/processed/embeddings_pca",
+        # )
+
+        # log_message(
+        #     f"Пример ключей в embeddings_dict: {list(embeddings_dict.keys())[:5]}"
+        # )
+        # log_message(
+        #     f"Пример значения после PCA: {next(iter(embeddings_dict.values()))[:5]}"
+        # )
+        # log_message(
+        #     f"Размерность после PCA: {len(next(iter(embeddings_dict.values())))}"
+        # )
+
+        # stage_time = time.time() - stage_start
+        # log_message(
+        #     f"Загрузка эмбеддингов с PCA завершена за {timedelta(seconds=stage_time)}"
+        # )
+        # log_message(f"Загружено эмбеддингов: {len(embeddings_dict)}")
+
+        # # Очищаем память от сырых эмбеддингов
+        # del raw_embeddings_dict
+        # gc.collect()
 
         # === SPLIT ДАННЫХ ===
         stage_start = time.time()
@@ -2617,8 +2866,12 @@ if __name__ == "__main__":
 
         # Item features
         item_start = time.time()
+        # raw_item_features_dict = build_item_features_dict(
+        #     interactions_files, items_df, orders_ddf, embeddings_dict
+        # )
+
         raw_item_features_dict = build_item_features_dict(
-            interactions_files, items_df, orders_ddf, embeddings_dict
+            interactions_files, items_df, orders_ddf
         )
 
         # Преобразуем словари в np.array
@@ -2666,8 +2919,8 @@ if __name__ == "__main__":
             copurchase_map, item_to_cat, cat_to_items, user_map, item_map
         )
 
-        if embeddings_dict:
-            recommender.set_external_embeddings(embeddings_dict)
+        # if embeddings_dict:
+        #     recommender.set_external_embeddings(embeddings_dict)
 
         # МАСШТАБИРУЕМ данные
         if config["sample_users"]:
@@ -2690,7 +2943,7 @@ if __name__ == "__main__":
             cat_to_items=cat_to_items,
             user_features_dict=user_features_dict,
             item_features_dict=item_features_dict,
-            embeddings_dict=embeddings_dict,
+            # embeddings_dict=embeddings_dict,
             sample_fraction=config["sample_fraction"],
             negatives_per_positive=0,
             split=0.2,
@@ -2746,37 +2999,37 @@ if __name__ == "__main__":
         log_message("--- ПРОВЕРКА ITEM FEATURES ---")
         if item_features_dict:
             sample_item = next(iter(item_features_dict))
-            raw_item_feats = item_features_dict[sample_item]
-            item_feats = normalize_item_feats(raw_item_feats, max_emb_dim=EMD_LENGHT)
+            # raw_item_feats = item_features_dict[sample_item]
+            # item_feats = normalize_item_feats(raw_item_feats, max_emb_dim=EMD_LENGHT)
 
-            log_message(f"Пример item features для товара {sample_item}:")
-            for feat, value in item_feats.items():
-                log_message(f"  {feat}: {value}")
+            # log_message(f"Пример item features для товара {sample_item}:")
+            # for feat, value in item_feats.items():
+            #     log_message(f"  {feat}: {value}")
 
             items_with_features = len(item_features_dict)
-            items_with_real_features = 0
-            for feats in item_features_dict.values():
-                norm_feats = normalize_item_feats(feats, max_emb_dim=EMD_LENGHT)
-                if any(v != 0 for v in norm_feats.values()):
-                    items_with_real_features += 1
+            # items_with_real_features = 0
+            # for feats in item_features_dict.values():
+            #     norm_feats = normalize_item_feats(feats, max_emb_dim=EMD_LENGHT)
+            #     if any(v != 0 for v in norm_feats.values()):
+            #         items_with_real_features += 1
 
             log_message(f"Товаров с features: {items_with_features}")
-            log_message(f"Товаров с НЕнулевыми features: {items_with_real_features}")
+            # log_message(f"Товаров с НЕнулевыми features: {items_with_real_features}")
         else:
             log_message("⚠️ item_features_dict ПУСТОЙ!")
 
         # --- Проверка эмбеддингов ---
-        log_message("--- ПРОВЕРКА ЭМБЕДДИНГОВ ---")
-        if embeddings_dict:
-            sample_item = next(iter(embeddings_dict))
-            embedding = embeddings_dict[sample_item]
-            log_message(
-                f"Пример эмбеддинга для товара {sample_item}: shape {embedding.shape}"
-            )
-            log_message(f"Эмбеддингов загружено: {len(embeddings_dict)}")
-            log_message(f"Пример значений: {embedding[:5]}")
-        else:
-            log_message("⚠️ embeddings_dict ПУСТОЙ!")
+        # log_message("--- ПРОВЕРКА ЭМБЕДДИНГОВ ---")
+        # if embeddings_dict:
+        #     sample_item = next(iter(embeddings_dict))
+        #     embedding = embeddings_dict[sample_item]
+        #     log_message(
+        #         f"Пример эмбеддинга для товара {sample_item}: shape {embedding.shape}"
+        #     )
+        #     log_message(f"Эмбеддингов загружено: {len(embeddings_dict)}")
+        #     log_message(f"Пример значений: {embedding[:5]}")
+        # else:
+        #     log_message("⚠️ embeddings_dict ПУСТОЙ!")
 
         # --- Проверка co-purchase map ---
         log_message("--- ПРОВЕРКА CO-PURCHASE MAP ---")
