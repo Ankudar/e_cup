@@ -48,7 +48,7 @@ warnings.filterwarnings(
 tqdm.pandas()
 
 MAX_FILES = 0  # сколько файлов берем в работу. 0 - все
-MAX_ROWS = 0  # сколько строк для каждой группы берем в работу. 0 - все
+MAX_ROWS = 10000  # сколько строк для каждой группы берем в работу. 0 - все
 ITER_N = 1000  # число эпох для обучения
 EARLY_STOP = 10  # ранняя остановка обучения
 EMD_LENGHT = 50
@@ -1265,8 +1265,10 @@ class LightGBMRecommender:
 
     def prepare_training_data(
         self,
-        interactions_files,
-        orders_ddf,
+        train_interactions_files,
+        test_interactions_files,
+        train_orders_df,
+        test_orders_df,
         user_map,
         item_map,
         popularity_s,
@@ -1274,214 +1276,178 @@ class LightGBMRecommender:
         copurchase_map=None,
         item_to_cat=None,
         cat_to_items=None,
-        user_features_dict=None,
-        item_features_dict=None,
-        embeddings_dict=None,
+        # embeddings_dict=None,
         sample_fraction=0.1,
         negatives_per_positive=0,
-        split: float = 0.2,
     ):
         log_message("Подготовка данных для LightGBM (streaming, polars lazy, батчи)...")
 
         base_dir = Path("/home/root6/python/e_cup/rec_system/data/processed/")
-        interactions_out_dir = base_dir / "interactions_streaming"
         train_out_dir = base_dir / "train_streaming"
         val_out_dir = base_dir / "val_streaming"
         tmp_dir = base_dir / "tmp_prepare"
-        for p in [interactions_out_dir, train_out_dir, val_out_dir, tmp_dir]:
+        for p in [train_out_dir, val_out_dir, tmp_dir]:
             p.mkdir(parents=True, exist_ok=True)
 
-        # --- 1. Объединяем interactions лениво ---
-        interactions_lazy = pl.concat(
+        # ===== 1. ПОДГОТОВКА ТРЕНИРОВОЧНЫХ ДАННЫХ =====
+        log_message("Подготовка тренировочных данных...")
+
+        # Объединяем тренировочные interactions
+        train_interactions_lazy = pl.concat(
             [
                 pl.scan_parquet(str(f)).select(
                     ["user_id", "item_id", "timestamp", "weight"]
                 )
-                for f in interactions_files
+                for f in train_interactions_files
             ]
         )
-        interactions_all_path = interactions_out_dir / "interactions_all.parquet"
-        interactions_lazy.sink_parquet(str(interactions_all_path))
 
-        # --- 2. Обработка orders (sample + лениво) ---
-        if sample_fraction < 1.0:
-            sampled_orders = orders_ddf.sample(frac=sample_fraction, random_state=42)
-        else:
-            sampled_orders = orders_ddf
+        # Конвертируем тренировочные заказы в polars
+        train_orders_pl = pl.from_pandas(train_orders_df).lazy()
 
-        orders_tmp_dir = tmp_dir / "orders_sample"
-        orders_tmp_dir.mkdir(exist_ok=True)
-        sampled_orders.to_parquet(str(orders_tmp_dir), write_index=False)
-        orders_pl = pl.scan_parquet(str(orders_tmp_dir / "*.parquet"))
-
-        # --- 3. Определяем split_time ---
-        orders_ts_bounds = orders_pl.select(
-            [
-                pl.col("created_timestamp").min().alias("min_ts"),
-                pl.col("created_timestamp").max().alias("max_ts"),
-            ]
-        ).collect()
-
-        min_ts, max_ts = orders_ts_bounds[0, "min_ts"], orders_ts_bounds[0, "max_ts"]
-        duration = max_ts - min_ts
-        split_by_time = duration > timedelta(0)
-        split_time = (
-            max_ts - timedelta(seconds=duration.total_seconds() * split)
-            if split_by_time
-            else max_ts
-        )
-        train_timestamp_fill = split_time - timedelta(seconds=1)
-
-        # --- 4. User features → parquet ---
-        if user_features_dict:
-            rows, batch, part = [], 0, 0
-            user_tmp_dir = tmp_dir / "user_feats"
-            user_tmp_dir.mkdir(exist_ok=True)
-            for uid, feats in user_features_dict.items():
-                rows.append({"user_id": uid, **feats})
-                batch += 1
-                if batch >= 50_000:
-                    pl.DataFrame(rows).write_parquet(
-                        user_tmp_dir / f"user_{part}.parquet"
-                    )
-                    rows.clear()
-                    batch = 0
-                    part += 1
-            if rows:
-                pl.DataFrame(rows).write_parquet(user_tmp_dir / f"user_{part}.parquet")
-            user_feats_lazy = pl.scan_parquet(str(user_tmp_dir / "*.parquet"))
-            user_feat_cols = [
-                c for c in user_feats_lazy.collect_schema().names() if c != "user_id"
-            ]
-        else:
-            user_feats_lazy, user_feat_cols = None, []
-
-        # --- 5. Item features → parquet ---
-        if item_features_dict:
-            rows, batch, part = [], 0, 0
-            item_tmp_dir = tmp_dir / "item_feats"
-            item_tmp_dir.mkdir(exist_ok=True)
-            for iid, feats in item_features_dict.items():
-                if isinstance(feats, dict):
-                    row = {"item_id": iid, **feats}
-                    rows.append(row)
-                elif isinstance(feats, np.ndarray):
-                    # Временная обработка: создаем базовые фичи из numpy array
-                    row = {
-                        "item_id": iid,
-                        "item_count": float(feats[0]) if len(feats) > 0 else 0.0,
-                        "item_sum": float(feats[1]) if len(feats) > 1 else 0.0,
-                        "item_mean": float(feats[2]) if len(feats) > 2 else 0.0,
-                        "item_max": float(feats[3]) if len(feats) > 3 else 0.0,
-                        "item_min": float(feats[4]) if len(feats) > 4 else 0.0,
-                        "item_orders_count": float(feats[5]) if len(feats) > 5 else 0.0,
-                    }
-                    rows.append(row)
-                batch += 1
-                if batch >= 50_000:
-                    if rows:
-                        pl.DataFrame(rows).write_parquet(
-                            item_tmp_dir / f"item_{part}.parquet"
-                        )
-                    rows.clear()
-                    batch = 0
-                    part += 1
-            if rows:
-                pl.DataFrame(rows).write_parquet(item_tmp_dir / f"item_{part}.parquet")
-
-            item_files = list(item_tmp_dir.glob("*.parquet"))
-            if item_files:
-                item_feats_lazy = pl.scan_parquet(str(item_tmp_dir / "*.parquet"))
-                item_feat_cols = [
-                    c
-                    for c in item_feats_lazy.collect_schema().names()
-                    if c != "item_id"
-                ]
-            else:
-                item_feats_lazy, item_feat_cols = None, []
-        else:
-            item_feats_lazy, item_feat_cols = None, []
-
-        self.feature_columns = ["copurchase_count"] + user_feat_cols + item_feat_cols
-
-        # --- 6. Copurchase map → parquet ---
-        if copurchase_map:
-            rows, batch, part = [], 0, 0
-            copurchase_tmp_dir = tmp_dir / "copurchase"
-            copurchase_tmp_dir.mkdir(exist_ok=True)
-            for iid, vals in copurchase_map.items():
-                count = sum(c[1] if isinstance(c, tuple) else c for c in vals)
-                rows.append({"item_id": iid, "copurchase_count": float(count)})
-                batch += 1
-                if batch >= 50_000:
-                    pl.DataFrame(rows).write_parquet(
-                        copurchase_tmp_dir / f"cop_{part}.parquet"
-                    )
-                    rows.clear()
-                    batch = 0
-                    part += 1
-            if rows:
-                pl.DataFrame(rows).write_parquet(
-                    copurchase_tmp_dir / f"cop_{part}.parquet"
-                )
-            copurchase_lazy = pl.scan_parquet(str(copurchase_tmp_dir / "*.parquet"))
-        else:
-            copurchase_lazy = None
-
-        # --- 7. Основной мердж ---
-        interactions_lazy = pl.scan_parquet(str(interactions_all_path))
-        merged = orders_pl.join(
-            interactions_lazy, on=["user_id", "item_id"], how="left"
+        # Мердж тренировочных данных
+        train_merged = train_orders_pl.join(
+            train_interactions_lazy, on=["user_id", "item_id"], how="left"
         ).with_columns(
             [
-                pl.col("timestamp").fill_null(train_timestamp_fill),
+                pl.col("timestamp").fill_null(
+                    pl.col("created_timestamp") - pl.duration(days=1)
+                ),
                 pl.col("weight").fill_null(0.0),
-                pl.when(pl.col("target") == 1).then(1).otherwise(0).alias("target"),
+                pl.when(pl.col("last_status") == "delivered_orders")
+                .then(1)
+                .otherwise(0)
+                .alias("target"),
             ]
         )
 
-        if user_feats_lazy is not None:
-            merged = merged.join(user_feats_lazy, on="user_id", how="left")
+        # ===== 2. ГЕНЕРАЦИЯ ПРИЗНАКОВ НА ТРЕНИРОВОЧНЫХ ДАННЫХ =====
+        log_message("Генерация признаков на тренировочных данных...")
 
-        if item_feats_lazy is not None:
-            merged = merged.join(item_feats_lazy, on="item_id", how="left")
+        # User features из тренировочных данных
+        user_features_dict = build_user_features_dict(
+            train_interactions_files, train_orders_df
+        )
 
-        if copurchase_lazy is not None:
-            merged = merged.join(copurchase_lazy, on="item_id", how="left")
-            merged = merged.with_columns(pl.col("copurchase_count").fill_null(0.0))
-        else:
-            merged = merged.with_columns(pl.lit(0.0).alias("copurchase_count"))
+        # Item features из тренировочных данных
+        item_features_dict = build_item_features_dict(
+            train_interactions_files, items_df, train_orders_df
+        )
 
-        # --- 8. Negatives (упрощённо: без collect, построчно батчами) ---
-        # тут лучше вынести в отдельную функцию save_negatives_to_parquet как выше
-        # иначе снова collect порвёт память
-        if negatives_per_positive > 0:
-            log_message("⚠️ Негативы не реализованы в стриминговом виде")
+        # Сохраняем признаки для использования на тесте
+        self.user_features_dict = user_features_dict
+        self.item_features_dict = item_features_dict
 
-        # --- 9. Train/Val split ---
-        if split_by_time:
-            train_lazy = merged.filter(pl.col("timestamp") <= split_time)
-            val_lazy = merged.filter(pl.col("timestamp") > split_time)
-        else:
-            train_lazy = merged.filter(
-                pl.col("user_id").hash() % 100 < int(100 * (1 - split))
+        # ===== 3. ДОБАВЛЕНИЕ ПРИЗНАКОВ К ТРЕНИРОВОЧНЫМ ДАННЫМ =====
+        log_message("Добавление признаков к тренировочным данным...")
+
+        # Конвертируем словари в DataFrame для join
+        user_feats_df = pl.from_pandas(
+            pd.DataFrame.from_dict(user_features_dict, orient="index")
+            .reset_index()
+            .rename(columns={"index": "user_id"})
+        ).lazy()
+
+        item_feats_df = pl.from_pandas(
+            pd.DataFrame.from_dict(item_features_dict, orient="index")
+            .reset_index()
+            .rename(columns={"index": "item_id"})
+        ).lazy()
+
+        # Присоединяем признаки
+        train_with_features = train_merged.join(
+            user_feats_df, on="user_id", how="left"
+        ).join(item_feats_df, on="item_id", how="left")
+
+        # Заполняем пропуски для новых пользователей/товаров
+        train_with_features = train_with_features.with_columns(
+            [
+                *[
+                    pl.col(col).fill_null(0.0)
+                    for col in user_feats_df.columns
+                    if col != "user_id"
+                ],
+                *[
+                    pl.col(col).fill_null(0.0)
+                    for col in item_feats_df.columns
+                    if col != "item_id"
+                ],
+            ]
+        )
+
+        # ===== 4. ПОДГОТОВКА ТЕСТОВЫХ ДАННЫХ =====
+        log_message("Подготовка тестовых данных...")
+
+        if test_interactions_files and test_orders_df is not None:
+            test_interactions_lazy = pl.concat(
+                [
+                    pl.scan_parquet(str(f)).select(
+                        ["user_id", "item_id", "timestamp", "weight"]
+                    )
+                    for f in test_interactions_files
+                ]
             )
-            val_lazy = merged.filter(
-                pl.col("user_id").hash() % 100 >= int(100 * (1 - split))
+
+            test_orders_pl = pl.from_pandas(test_orders_df).lazy()
+
+            test_merged = test_orders_pl.join(
+                test_interactions_lazy, on=["user_id", "item_id"], how="left"
+            ).with_columns(
+                [
+                    pl.col("timestamp").fill_null(
+                        pl.col("created_timestamp") - pl.duration(days=1)
+                    ),
+                    pl.col("weight").fill_null(0.0),
+                    pl.when(pl.col("last_status") == "delivered_orders")
+                    .then(1)
+                    .otherwise(0)
+                    .alias("target"),
+                ]
             )
 
-        train_lazy = train_lazy.drop("timestamp")
-        val_lazy = val_lazy.drop("timestamp")
+            # Используем признаки, обученные на тренировочных данных
+            test_with_features = (
+                test_merged.join(user_feats_df, on="user_id", how="left")
+                .join(item_feats_df, on="item_id", how="left")
+                .with_columns(
+                    [
+                        *[
+                            pl.col(col).fill_null(0.0)
+                            for col in user_feats_df.columns
+                            if col != "user_id"
+                        ],
+                        *[
+                            pl.col(col).fill_null(0.0)
+                            for col in item_feats_df.columns
+                            if col != "item_id"
+                        ],
+                    ]
+                )
+            )
 
-        train_lazy.sink_parquet(
+            # Split на train/val
+            train_final = train_with_features
+            val_final = test_with_features
+
+        else:
+            # Если нет отдельных test данных, делаем split на train/val
+            train_final = train_with_features.filter(
+                pl.col("user_id").hash() % 100 < 80
+            )
+            val_final = train_with_features.filter(pl.col("user_id").hash() % 100 >= 80)
+
+        # ===== 5. СОХРАНЕНИЕ РЕЗУЛЬТАТОВ =====
+        log_message("Сохранение результатов...")
+
+        train_final.sink_parquet(
             str(train_out_dir / "train.parquet"), row_group_size=100_000
         )
-        val_lazy.sink_parquet(str(val_out_dir / "val.parquet"), row_group_size=100_000)
+        val_final.sink_parquet(str(val_out_dir / "val.parquet"), row_group_size=100_000)
 
-        import shutil
-
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
+        # Сохраняем feature_columns
+        self.feature_columns = [
+            col for col in user_feats_df.columns if col != "user_id"
+        ] + [col for col in item_feats_df.columns if col != "item_id"]
 
         log_message("✅ Данные подготовлены без утечек памяти")
         return train_out_dir, val_out_dir
@@ -1794,14 +1760,16 @@ class LightGBMRecommender:
 def build_user_features_dict(interactions_files, orders_df, device="cuda"):
     """
     Оптимизированная версия с использованием Polars
+    ТОЛЬКО для тренировочных данных!
     """
-    log_message("Построение словаря пользовательских признаков...")
+    log_message(
+        "Построение словаря пользовательских признаков из ТРЕНИРОВОЧНЫХ данных..."
+    )
 
-    # 1. АГРЕГАЦИЯ ПО ТРЕКЕРУ (взаимодействия)
+    # 1. АГРЕГАЦИЯ ПО ТРЕКЕРУ (взаимодействия из тренировочного периода)
     user_stats_list = []
-    for f in tqdm(interactions_files, desc="Обработка трекера"):
+    for f in tqdm(interactions_files, desc="Обработка трекера (train)"):
         df = pl.read_parquet(f)
-
         chunk_stats = df.group_by("user_id").agg(
             [
                 pl.col("weight").count().alias("count"),
@@ -1812,7 +1780,16 @@ def build_user_features_dict(interactions_files, orders_df, device="cuda"):
         )
         user_stats_list.append(chunk_stats)
 
-    # Объединяем все статистики
+    # 2. АГРЕГАЦИЯ ПО ЗАКАЗАМ (только тренировочные заказы)
+    log_message("Агрегация по ЗАКАЗАМ (train)...")
+    orders_pl = pl.from_pandas(orders_df)
+    order_stats = orders_pl.group_by("user_id").agg(
+        [
+            pl.col("item_id").count().alias("user_orders_count"),
+        ]
+    )
+
+    # 3. ОБЪЕДИНЕНИЕ ДАННЫХ
     if user_stats_list:
         all_stats = pl.concat(user_stats_list)
         final_stats = all_stats.group_by("user_id").agg(
@@ -1823,35 +1800,15 @@ def build_user_features_dict(interactions_files, orders_df, device="cuda"):
                 pl.col("min").min().alias("user_min"),
             ]
         )
-    else:
-        final_stats = pl.DataFrame()
 
-    # 2. АГРЕГАЦИЯ ПО ЗАКАЗАМ
-    log_message("Агрегация по заказам...")
-    if isinstance(orders_df, pl.DataFrame):
-        orders_pl = orders_df
-    else:
-        orders_pl = pl.from_pandas(
-            orders_df.compute() if hasattr(orders_df, "compute") else orders_df
-        )
-
-    order_stats = orders_pl.group_by("user_id").agg(
-        [
-            pl.col("item_id").count().alias("user_orders_count"),
-        ]
-    )
-
-    # 3. ОБЪЕДИНЕНИЕ ДАННЫХ
-    if len(final_stats) > 0 and len(order_stats) > 0:
-        user_stats = final_stats.join(order_stats, on="user_id", how="full")
-    elif len(final_stats) > 0:
-        user_stats = final_stats
+        if len(order_stats) > 0:
+            user_stats = final_stats.join(order_stats, on="user_id", how="full")
+        else:
+            user_stats = final_stats
     else:
         user_stats = order_stats
 
     # 4. ВЫЧИСЛЕНИЕ ПРОИЗВОДНЫХ ПРИЗНАКОВ
-    current_time = pl.lit(datetime.now())
-
     user_stats = user_stats.with_columns(
         [
             pl.col("user_count").fill_null(0),
@@ -1874,7 +1831,7 @@ def build_user_features_dict(interactions_files, orders_df, device="cuda"):
         }
 
     log_message(
-        f"Словарь пользовательских признаков построен и сохранён в {save_path}. Записей: {len(user_stats_dict)}"
+        f"Словарь пользовательских признаков построен. Записей: {len(user_stats_dict)}"
     )
     return user_stats_dict
 
@@ -1882,37 +1839,29 @@ def build_user_features_dict(interactions_files, orders_df, device="cuda"):
 def build_item_features_dict(
     interactions_files,
     items_df,
-    orders_df,
-    # embeddings_dict,
+    orders_df,  # ТОЛЬКО тренировочные заказы!
     device="cuda",
     batch_size=1_000_000,
     temp_dir="/tmp/item_features",
 ):
     """
     Оптимизированная версия с батчевой обработкой и сохранением на диск
+    ТОЛЬКО для тренировочных данных!
     """
-    log_message("Построение словаря товарных признаков с батчевой обработкой...")
+    log_message("Построение словаря товарных признаков из ТРЕНИРОВОЧНЫХ данных...")
 
     os.makedirs(temp_dir, exist_ok=True)
-
-    # 1. БАТЧЕВАЯ АГРЕГАЦИЯ ПО ВЗАИМОДЕЙСТВИЯМ
-    log_message("Батчевая агрегация взаимодействий...")
-
     temp_stats_files = []
 
-    for i, f in enumerate(tqdm(interactions_files, desc="Обработка взаимодействий")):
+    # 1. БАТЧЕВАЯ АГРЕГАЦИЯ ПО ВЗАИМОДЕЙСТВИЯМ (ТОЛЬКО тренировочные)
+    for i, f in enumerate(
+        tqdm(interactions_files, desc="Обработка взаимодействий (train)")
+    ):
         try:
-            # Читаем весь файл (без batch_size)
             df = pl.read_parquet(f)
-
-            # Обрабатываем батчами вручную
-            n_rows = len(df)
-            for start in range(0, n_rows, batch_size):
-                end = min(start + batch_size, n_rows)
+            for start in range(0, len(df), batch_size):
+                end = min(start + batch_size, len(df))
                 df_batch = df[start:end]
-
-                if df_batch.is_empty():
-                    continue
 
                 chunk_stats = df_batch.group_by("item_id").agg(
                     [
@@ -1932,8 +1881,6 @@ def build_item_features_dict(
             continue
 
     # 2. ОБЪЕДИНЕНИЕ СТАТИСТИК С ДИСКА
-    log_message("Объединение статистик...")
-
     final_stats = None
     for stats_file in tqdm(temp_stats_files, desc="Объединение статистик"):
         try:
@@ -1946,7 +1893,6 @@ def build_item_features_dict(
             log_message(f"Ошибка чтения {stats_file}: {e}")
             continue
 
-    # Агрегируем финальные статистики
     if final_stats is not None and not final_stats.is_empty():
         final_stats = final_stats.group_by("item_id").agg(
             [
@@ -1957,109 +1903,29 @@ def build_item_features_dict(
             ]
         )
     else:
-        final_stats = pl.DataFrame(
-            schema={
-                "item_id": pl.Int32(),
-                "item_count": pl.Int64(),
-                "item_sum": pl.Float64(),
-                "item_max": pl.Float64(),
-                "item_min": pl.Float64(),
-            }
-        )
+        final_stats = pl.DataFrame()
 
-    # 3. ОБРАБОТКА ЗАКАЗОВ ПО БАТЧАМ
-    log_message("Обработка заказов...")
+    # 3. ОБРАБОТКА ЗАКАЗОВ (ТОЛЬКО тренировочные)
+    log_message("Обработка ЗАКАЗОВ (train)...")
+    orders_pl = pl.from_pandas(orders_df)
+    order_stats = orders_pl.group_by("item_id").agg(
+        [
+            pl.col("user_id").count().alias("item_orders_count"),
+        ]
+    )
 
-    order_stats_list = []
-    if hasattr(orders_df, "compute"):
-        n_partitions = orders_df.npartitions
-        for i in tqdm(range(n_partitions), desc="Обработка партиций заказов"):
-            try:
-                partition = orders_df.get_partition(i).compute()
-                order_stats = (
-                    pl.from_pandas(partition)
-                    .group_by("item_id")
-                    .agg([pl.col("user_id").count().alias("item_orders_count")])
-                )
-                order_stats_list.append(order_stats)
-            except Exception as e:
-                log_message(f"Ошибка обработки партиции {i}: {e}")
-    else:
-        try:
-            order_stats = (
-                pl.from_pandas(orders_df)
-                .group_by("item_id")
-                .agg([pl.col("user_id").count().alias("item_orders_count")])
-            )
-            order_stats_list.append(order_stats)
-        except Exception as e:
-            log_message(f"Ошибка обработки заказов: {e}")
-
-    # Объединяем статистики заказов
-    if order_stats_list:
-        order_stats_final = pl.concat(order_stats_list)
-        order_stats_final = order_stats_final.group_by("item_id").agg(
-            [pl.col("item_orders_count").sum().alias("item_orders_count")]
-        )
-    else:
-        order_stats_final = pl.DataFrame(
-            schema={"item_id": pl.Int32(), "item_orders_count": pl.Int64()}
-        )
-
-    # 4. ОБРАБОТКА ITEMS ПО БАТЧАМ
-    log_message("Обработка items...")
-
-    items_catalog_list = []
-    if hasattr(items_df, "compute"):
-        n_partitions = items_df.npartitions
-        for i in tqdm(range(n_partitions), desc="Обработка партиций items"):
-            try:
-                partition = items_df.get_partition(i).compute()
-                items_chunk = (
-                    pl.from_pandas(partition).select(["item_id", "catalogid"]).unique()
-                )
-                items_catalog_list.append(items_chunk)
-            except Exception as e:
-                log_message(f"Ошибка обработки партиции items {i}: {e}")
-    else:
-        try:
-            items_chunk = (
-                pl.from_pandas(items_df).select(["item_id", "catalogid"]).unique()
-            )
-            items_catalog_list.append(items_chunk)
-        except Exception as e:
-            log_message(f"Ошибка обработки items: {e}")
-
-    # Объединяем items
-    if items_catalog_list:
-        items_catalog = pl.concat(items_catalog_list).unique()
-    else:
-        items_catalog = pl.DataFrame(
-            schema={"item_id": pl.Int32(), "catalogid": pl.Int32()}
-        )
-
-    # 5. ОБЪЕДИНЕНИЕ ВСЕХ ДАННЫХ С ПРОВЕРКОЙ КОЛОНОК
-    log_message("Объединение всех данных...")
-
-    # Создаем базовый DataFrame с item_id
+    # 4. ОБЪЕДИНЕНИЕ ВСЕХ ДАННЫХ
     all_item_ids = set()
-
-    # Собираем все item_id из всех источников
     if not final_stats.is_empty():
         all_item_ids.update(final_stats["item_id"].to_list())
-    if not order_stats_final.is_empty():
-        all_item_ids.update(order_stats_final["item_id"].to_list())
-    if not items_catalog.is_empty():
-        all_item_ids.update(items_catalog["item_id"].to_list())
+    if not order_stats.is_empty():
+        all_item_ids.update(order_stats["item_id"].to_list())
 
-    # Создаем базовый DataFrame со всеми item_id
     base_df = pl.DataFrame({"item_id": list(all_item_ids)})
 
-    # Последовательно присоединяем данные с проверкой наличия колонок
     if not final_stats.is_empty():
         base_df = base_df.join(final_stats, on="item_id", how="left")
     else:
-        # Добавляем пустые колонки если final_stats пустой
         base_df = base_df.with_columns(
             [
                 pl.lit(0).alias("item_count"),
@@ -2069,70 +1935,36 @@ def build_item_features_dict(
             ]
         )
 
-    if not order_stats_final.is_empty():
-        base_df = base_df.join(order_stats_final, on="item_id", how="left")
+    if not order_stats.is_empty():
+        base_df = base_df.join(order_stats, on="item_id", how="left")
     else:
         base_df = base_df.with_columns([pl.lit(0).alias("item_orders_count")])
 
-    if not items_catalog.is_empty():
-        base_df = base_df.join(items_catalog, on="item_id", how="left")
-    else:
-        base_df = base_df.with_columns(
-            [pl.lit(None).cast(pl.Int32()).alias("catalogid")]
-        )
+    # 5. ВЫЧИСЛЕНИЕ ПРИЗНАКОВ
+    base_df = base_df.with_columns(
+        [
+            pl.col("item_count").fill_null(0),
+            pl.col("item_sum").fill_null(0),
+            pl.col("item_orders_count").fill_null(0),
+            pl.col("item_max").fill_null(0),
+            pl.col("item_min").fill_null(0),
+            (pl.col("item_sum") / pl.col("item_count")).fill_nan(0).alias("item_mean"),
+        ]
+    )
 
-    # 6. ВЫЧИСЛЕНИЕ ПРИЗНАКОВ И СОЗДАНИЕ СЛОВАРЯ
-    log_message("Создание финального словаря...")
-
+    # 6. СОЗДАНИЕ СЛОВАРЯ
     item_stats_dict = {}
+    for row in base_df.iter_rows(named=True):
+        item_stats_dict[row["item_id"]] = {
+            "item_count": row["item_count"],
+            "item_mean": row["item_mean"],
+            "item_sum": row["item_sum"],
+            "item_max": row["item_max"],
+            "item_min": row["item_min"],
+            "item_orders_count": row["item_orders_count"],
+        }
 
-    if not base_df.is_empty():
-        # Заполняем пропущенные значения
-        base_df = base_df.with_columns(
-            [
-                pl.col("item_count").fill_null(0),
-                pl.col("item_sum").fill_null(0),
-                pl.col("item_orders_count").fill_null(0),
-                pl.col("item_max").fill_null(0),
-                pl.col("item_min").fill_null(0),
-            ]
-        )
-
-        # Вычисляем среднее значение
-        base_df = base_df.with_columns(
-            [(pl.col("item_sum") / pl.col("item_count")).fill_nan(0).alias("item_mean")]
-        )
-
-        # Конвертируем в словарь порциями
-        for i in range(0, len(base_df), batch_size):
-            batch = base_df[i : i + batch_size]
-            for row in batch.iter_rows(named=True):
-                item_stats_dict[row["item_id"]] = {
-                    "item_count": row.get("item_count", 0),
-                    "item_mean": row.get("item_mean", 0),
-                    "item_sum": row.get("item_sum", 0),
-                    "item_max": row.get("item_max", 0),
-                    "item_min": row.get("item_min", 0),
-                    "item_orders_count": row.get("item_orders_count", 0),
-                    "item_category": row.get("catalogid", None),
-                }
-
-    # 7. ДОБАВЛЕНИЕ ЭМБЕДДИНГОВ ПОРЦИЯМИ
-    # log_message("Добавление эмбеддингов...")
-
-    # embedding_items = list(embeddings_dict.keys())
-    # for i in tqdm(
-    #     range(0, len(embedding_items), batch_size), desc="Добавление эмбеддингов"
-    # ):
-    #     batch_items = embedding_items[i : i + batch_size]
-    #     for item_id in batch_items:
-    #         if item_id in item_stats_dict:
-    #             embedding = embeddings_dict[item_id]
-    #             for j in range(min(EMD_LENGHT, len(embedding))):
-    #                 item_stats_dict[item_id][f"fclip_embed_{j}"] = float(embedding[j])
-
-    # 8. ОЧИСТКА ВРЕМЕННЫХ ФАЙЛОВ
-    log_message("Очистка временных файлов...")
+    # 7. ОЧИСТКА
     try:
         for temp_file in temp_stats_files:
             if os.path.exists(temp_file):
@@ -2866,9 +2698,11 @@ if __name__ == "__main__":
         stage_start = time.time()
         log_message("=== ПРЕДВАРИТЕЛЬНЫЙ РАСЧЕТ ПРИЗНАКОВ ДЛЯ LGBM ===")
 
-        # User features
+        # User features - используем ТОЛЬКО тренировочные данные!
         user_start = time.time()
-        user_features_dict = build_user_features_dict(interactions_files, orders_ddf)
+        user_features_dict = build_user_features_dict(
+            interactions_files, train_orders_df
+        )  # ← ИСПРАВЛЕНО
         save_path = (
             "/home/root6/python/e_cup/rec_system/data/processed/user_features_dict.pkl"
         )
@@ -2879,14 +2713,10 @@ if __name__ == "__main__":
             f"User features построены за {timedelta(seconds=user_time)}: {len(user_features_dict)} пользователей"
         )
 
-        # Item features
+        # Item features - используем ТОЛЬКО тренировочные данные!
         item_start = time.time()
-        # raw_item_features_dict = build_item_features_dict(
-        #     interactions_files, items_df, orders_ddf, embeddings_dict
-        # )
-
         raw_item_features_dict = build_item_features_dict(
-            interactions_files, items_df, orders_ddf
+            interactions_files, items_df, train_orders_df  # ← ИСПРАВЛЕНО
         )
 
         # Преобразуем словари в np.array
@@ -2947,8 +2777,10 @@ if __name__ == "__main__":
 
         # Используем обновленный метод с UI-признаками
         train_data, val_data = recommender.prepare_training_data(
-            interactions_files=interactions_files,
-            orders_ddf=orders_ddf,
+            train_interactions_files=interactions_files,  # Все interactions считаются тренировочными
+            test_interactions_files=[],  # Пусто - используем внутренний split
+            train_orders_df=train_orders_df,  # ТОЛЬКО тренировочные заказы
+            test_orders_df=pd.DataFrame(),  # Пусто - используем внутренний split
             user_map=user_map,
             item_map=item_map,
             popularity_s=popularity_s,
@@ -2956,12 +2788,9 @@ if __name__ == "__main__":
             copurchase_map=copurchase_map,
             item_to_cat=item_to_cat,
             cat_to_items=cat_to_items,
-            user_features_dict=user_features_dict,
-            item_features_dict=item_features_dict,
             # embeddings_dict=embeddings_dict,
             sample_fraction=config["sample_fraction"],
             negatives_per_positive=0,
-            split=0.2,
         )
 
         # --- Функция для подсчёта строк в parquet ---
