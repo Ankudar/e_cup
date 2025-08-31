@@ -48,8 +48,8 @@ warnings.filterwarnings(
 tqdm.pandas()
 
 MAX_FILES = 0  # сколько файлов берем в работу. 0 - все
-MAX_ROWS = 1000  # сколько строк для каждой группы берем в работу. 0 - все
-ITER_N = 100  # число эпох для обучения
+MAX_ROWS = 0  # сколько строк для каждой группы берем в работу. 0 - все
+ITER_N = 1000  # число эпох для обучения
 EARLY_STOP = 10  # ранняя остановка обучения
 EMD_LENGHT = 50
 
@@ -608,7 +608,7 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
 
 
 def build_copurchase_map(
-    train_orders_df, min_co_items=2, top_n=10, device="cuda", max_items=500
+    train_orders_df, min_co_items=2, top_n=20, device="cuda", max_items=1000
 ):
     """
     строим словарь совместных покупок для топ-N товаров
@@ -1388,12 +1388,14 @@ class LightGBMRecommender:
                     part += 1
             if rows:
                 pl.DataFrame(rows).write_parquet(item_tmp_dir / f"item_{part}.parquet")
-            
+
             item_files = list(item_tmp_dir.glob("*.parquet"))
             if item_files:
                 item_feats_lazy = pl.scan_parquet(str(item_tmp_dir / "*.parquet"))
                 item_feat_cols = [
-                    c for c in item_feats_lazy.collect_schema().names() if c != "item_id"
+                    c
+                    for c in item_feats_lazy.collect_schema().names()
+                    if c != "item_id"
                 ]
             else:
                 item_feats_lazy, item_feat_cols = None, []
@@ -1446,6 +1448,7 @@ class LightGBMRecommender:
 
         if copurchase_lazy is not None:
             merged = merged.join(copurchase_lazy, on="item_id", how="left")
+            merged = merged.with_columns(pl.col("copurchase_count").fill_null(0.0))
         else:
             merged = merged.with_columns(pl.lit(0.0).alias("copurchase_count"))
 
@@ -1519,7 +1522,7 @@ class LightGBMRecommender:
                 "bagging_freq": 10,
                 "verbosity": -1,
                 "force_row_wise": True,
-                "num_threads": 4,
+                "num_threads": 8,
                 "max_bin": 255,
                 "boosting": "gbdt",
                 "bin_construct_sample_cnt": 100000,
@@ -2614,6 +2617,18 @@ def save_negatives_to_parquet(
 
     if rows:
         pl.DataFrame(rows).write_parquet(f"{out_dir}/negs_{part}.parquet")
+
+
+def make_timer_callback(log_every_sec=30):
+    last_log = {"time": time.time()}
+
+    def timer_callback(env):
+        now = time.time()
+        if now - last_log["time"] >= log_every_sec:
+            log_message(f"[Timer] Iter={env.iteration}")
+            last_log["time"] = now
+
+    return timer_callback
 
 
 # -------------------- Основной запуск --------------------
