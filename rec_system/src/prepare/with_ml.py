@@ -45,7 +45,7 @@ warnings.filterwarnings(
 tqdm.pandas()
 
 MAX_FILES = 0  # сколько файлов берем в работу. 0 - все
-MAX_ROWS = 1000  # сколько строк для каждой группы берем в работу. 0 - все
+MAX_ROWS = 100_000  # сколько строк для каждой группы берем в работу. 0 - все
 ITER_N = 5  # число эпох для обучения
 EARLY_STOP = 10  # ранняя остановка обучения
 EMD_LENGHT = 100
@@ -1381,7 +1381,7 @@ class LightGBMRecommender:
                 elif isinstance(feats, np.ndarray):
                     emb = {
                         f"emb_{i}": float(feats[i])
-                        for i in range(min(30, feats.shape[0]))
+                        for i in range(min(EMD_LENGHT, feats.shape[0]))
                     }
                     emb["item_id"] = item_id
                     items_data.append(emb)
@@ -2381,21 +2381,25 @@ def normalize_item_features_dict(item_features_dict, embed_prefix="fclip_embed_"
     """
     normalized = {}
 
-    # Определим порядок ключей (фиксируем для стабильности)
-    example_dict = next(iter(item_features_dict.values()))
-    base_keys = [k for k in example_dict.keys() if not k.startswith(embed_prefix)]
+    # Собираем все ключи по всем item
+    all_keys = set()
+    for feats in item_features_dict.values():
+        all_keys.update(feats.keys())
+
+    # Разделяем на обычные и эмбеддинговые
+    base_keys = [k for k in all_keys if not k.startswith(embed_prefix)]
     embed_keys = sorted(
-        [k for k in example_dict.keys() if k.startswith(embed_prefix)],
+        [k for k in all_keys if k.startswith(embed_prefix)],
         key=lambda x: int(x.replace(embed_prefix, "")),
     )
 
     feature_order = base_keys + embed_keys
 
+    # Формируем numpy-вектора
     for item_id, feats in item_features_dict.items():
         row = []
         for key in feature_order:
-            val = feats.get(key, 0.0)  # если ключа нет — ставим 0
-            # Категориальные можно закодировать, пока просто оставим как есть
+            val = feats.get(key, 0.0)
             if val is None:
                 val = 0.0
             row.append(val)
@@ -2743,7 +2747,7 @@ if __name__ == "__main__":
         if item_features_dict:
             sample_item = next(iter(item_features_dict))
             raw_item_feats = item_features_dict[sample_item]
-            item_feats = normalize_item_feats(raw_item_feats, max_emb_dim=30)
+            item_feats = normalize_item_feats(raw_item_feats, max_emb_dim=EMD_LENGHT)
 
             log_message(f"Пример item features для товара {sample_item}:")
             for feat, value in item_feats.items():
@@ -2752,7 +2756,7 @@ if __name__ == "__main__":
             items_with_features = len(item_features_dict)
             items_with_real_features = 0
             for feats in item_features_dict.values():
-                norm_feats = normalize_item_feats(feats, max_emb_dim=30)
+                norm_feats = normalize_item_feats(feats, max_emb_dim=EMD_LENGHT)
                 if any(v != 0 for v in norm_feats.values()):
                     items_with_real_features += 1
 
