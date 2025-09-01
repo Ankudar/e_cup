@@ -30,6 +30,7 @@ import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
 import torch.sparse
+from catboost import CatBoostClassifier, CatboostError, Pool
 from dask.diagnostics import ProgressBar
 from implicit.als import AlternatingLeastSquares
 from scipy.sparse import coo_matrix, csr_matrix, vstack
@@ -48,8 +49,8 @@ warnings.filterwarnings(
 tqdm.pandas()
 
 MAX_FILES = 0  # сколько файлов берем в работу. 0 - все
-MAX_ROWS = 10000  # сколько строк для каждой группы берем в работу. 0 - все
-ITER_N = 1000  # число эпох для обучения
+MAX_ROWS = 100000  # сколько строк для каждой группы берем в работу. 0 - все
+ITER_N = 5  # число эпох для обучения
 EARLY_STOP = 10  # ранняя остановка обучения
 EMD_LENGHT = 50
 
@@ -987,8 +988,9 @@ class TorchALS(nn.Module):
                 log_message(f"Partial fit epoch {epoch}, Loss: {total_loss.item():.6f}")
 
 
-class LightGBMRecommender:
+class ModelRecommender:
     def __init__(self):
+        super().__init__()
         self.model = None
         self.feature_columns = []
         self.user_embeddings = None
@@ -1263,12 +1265,42 @@ class LightGBMRecommender:
 
         return data
 
+    def debug_data_info(self, data, name="data"):
+        """Выводит детальную информацию о данных"""
+        if data is None or data.empty:
+            log_message(f"{name}: Пусто")
+            return
+
+        log_message(f"=== ДЕБАГ ИНФОРМАЦИЯ: {name} ===")
+        log_message(f"Размер: {len(data)} строк")
+        log_message(f"Колонки: {list(data.columns)}")
+
+        if hasattr(self, "feature_columns"):
+            missing = [f for f in self.feature_columns if f not in data.columns]
+            if missing:
+                log_message(f"❌ Отсутствуют признаки: {missing}")
+            else:
+                log_message(f"✅ Все признаки присутствуют")
+
+        # Статистика по целевой переменной
+        if "target" in data.columns:
+            target_counts = data["target"].value_counts()
+            log_message(f"Целевая переменная: {dict(target_counts)}")
+
+        # Пример первых нескольких строк
+        if len(data) > 0:
+            log_message("Пример первой строки:")
+            for col in data.columns:
+                if col in data.columns:
+                    log_message(f"  {col}: {data[col].iloc[0]}")
+
     def prepare_training_data(
         self,
         train_interactions_files,
         test_interactions_files,
         train_orders_df,
         test_orders_df,
+        items_df,
         user_map,
         item_map,
         popularity_s,
@@ -1472,28 +1504,28 @@ class LightGBMRecommender:
 
     def train(self, train_data, val_data=None, params=None):
         """
-        Обучение LightGBM с бинарной целью, с оценкой NDCG@100 на валидации.
-        Кастомный callback: ранняя остановка и мониторинг по NDCG@100.
+        Обучение CatBoost с кастомной метрикой NDCG@100.
+        Используется встроенный механизм кастомной метрики через класс.
         """
         if params is None:
             params = {
-                "objective": "binary",
-                "metric": "None",
+                "loss_function": "Logloss",
                 "learning_rate": 0.05,
-                "num_leaves": 31,
-                "max_depth": 6,
-                "min_data_in_leaf": 50,
-                "feature_fraction": 0.8,
-                "bagging_fraction": 0.8,
-                "bagging_freq": 10,
-                "verbosity": -1,
-                "force_row_wise": True,
-                "num_threads": 8,
-                "max_bin": 255,
-                "boosting": "gbdt",
-                "bin_construct_sample_cnt": 100000,
-                "device": "cpu",
-                "seed": 42,
+                "depth": 6,
+                "l2_leaf_reg": 3,
+                "bootstrap_type": "Bayesian",
+                "iterations": ITER_N,
+                "thread_count": 8,
+                "random_seed": 42,
+                "verbose": False,
+                "use_best_model": True,
+                "od_type": "Iter",
+                "od_wait": EARLY_STOP,
+                "train_dir": "./catboost_info",
+                "save_snapshot": True,
+                "snapshot_file": "catboost_snapshot.bkp",
+                "snapshot_interval": 600,
+                "used_ram_limit": "30gb",
             }
 
         # Проверка признаков
@@ -1508,9 +1540,7 @@ class LightGBMRecommender:
             log_message(f"❌ В train_data отсутствуют признаки: {missing_features}")
             return None
 
-        X_train = train_data[self.feature_columns]
-        y_train = train_data["target"]
-
+        # Приведение типов (float64→float32, int64→int32)
         for df in [train_data, val_data]:
             if df is not None:
                 for col in df.select_dtypes(include=["float64"]).columns:
@@ -1518,25 +1548,15 @@ class LightGBMRecommender:
                 for col in df.select_dtypes(include=["int64"]).columns:
                     df[col] = df[col].astype("int32")
 
+        # Основные данные
+        X_train = train_data[self.feature_columns].copy()
+        y_train = train_data["target"]
         train_users = train_data["user_id"]
 
         log_message(f"Размер train: {len(X_train)}")
         log_message(f"Количество пользователей в train: {train_users.nunique()}")
 
-        categorical_features = [
-            col
-            for col in X_train.columns
-            if col in ["user_id", "item_id"] or col.startswith(("user_", "item_"))
-        ]
-
-        train_dataset = lgb.Dataset(
-            X_train,
-            label=y_train,
-            categorical_feature=categorical_features,
-            feature_name=list(X_train.columns),
-        )
-
-        X_val, y_val, val_users, val_dataset = None, None, None, None
+        X_val, y_val, val_users, val_pool = None, None, None, None
         if val_data is not None:
             missing_val_features = [
                 f for f in self.feature_columns if f not in val_data.columns
@@ -1547,117 +1567,86 @@ class LightGBMRecommender:
                 )
                 return None
 
-            X_val = val_data[self.feature_columns]
+            X_val = val_data[self.feature_columns].copy()
             y_val = val_data["target"]
             val_users = val_data["user_id"]
 
             log_message(f"Размер val: {len(X_val)}")
             log_message(f"Количество пользователей в val: {val_users.nunique()}")
 
-            val_dataset = lgb.Dataset(
-                X_val,
-                label=y_val,
-                categorical_feature=categorical_features,
-                feature_name=list(X_val.columns),
-            )
+        # Определение категориальных признаков
+        log_message(f"Определение категориальных признаков")
+        categorical_features = [
+            col
+            for col in self.feature_columns
+            if col in ["user_id", "item_id"] or col.startswith(("user_", "item_"))
+        ]
 
-        # Переменные для ранней остановки
-        best_ndcg = -float("inf")
-        best_iteration = 0
-        best_eval_result_list = None
-        no_improvement_count = 0
-        early_stopping_rounds = EARLY_STOP
-        eval_history = {"train": [], "valid": []}
+        # Приведение категориальных фич к строкам
+        log_message(f"Приведение категориальных фич к строкам")
+        for col in categorical_features:
+            X_train[col] = X_train[col].astype(str)
+            if X_val is not None:
+                X_val[col] = X_val[col].astype(str)
 
-        # Кастомный callback
-        def ndcg_callback(env):
-            nonlocal best_ndcg, best_iteration, best_eval_result_list, no_improvement_count
+        # Создание пулов
+        log_message(f"Создание пулов")
+        log_message(f"train_pool")
+        train_pool = Pool(X_train, label=y_train, cat_features=categorical_features)
+        if X_val is not None:
+            log_message(f"val_pool")
+            val_pool = Pool(X_val, label=y_val, cat_features=categorical_features)
+        log_message(f"Создание пулов завершено")
 
-            iteration = env.iteration
+        # Кастомная метрика NDCG@100
+        class NDCG100:
+            def get_final_error(self, error, weight):
+                return error
 
-            # Вычисляем NDCG только каждые 5 итераций для экономии времени
-            if iteration % 5 != 0 and iteration > 10:
-                return
+            def is_max_optimal(self):
+                return True
 
-            # Кэшируем предсказания для экономии вычислений
-            if not hasattr(env, "last_preds") or env.last_preds_iter != iteration:
-                train_preds = env.model.predict(X_train, num_iteration=iteration)
-                env.last_preds = train_preds
-                env.last_preds_iter = iteration
-            else:
-                train_preds = env.last_preds
+            def evaluate(self, approxes, target, weight):
+                preds = approxes[0]
+                preds = list(preds)
+                target = list(target)
+                df = (
+                    val_data
+                    if (y_val is not None and len(preds) == len(y_val))
+                    else train_data
+                )
+                users = (
+                    val_users
+                    if (y_val is not None and len(preds) == len(y_val))
+                    else train_users
+                )
+                ndcg = self_outer._calculate_ndcg(df, preds, users)
+                return ndcg, 1
 
-            train_ndcg = self._calculate_ndcg(train_data, train_preds, train_users)
-            eval_history["train"].append((iteration, train_ndcg))
-
-            eval_list = [("train", "ndcg@100", float(train_ndcg), True)]
-
-            if val_data is not None:
-                val_preds = env.model.predict(X_val, num_iteration=iteration)
-                valid_ndcg = self._calculate_ndcg(val_data, val_preds, val_users)
-                eval_history["valid"].append((iteration, valid_ndcg))
-                eval_list.append(("valid", "ndcg@100", float(valid_ndcg), True))
-
-                # Логируем только каждые 5 итераций
-                if iteration % 5 == 0:
-                    log_message(
-                        f"[Iter {iteration}] train_ndcg@100: {train_ndcg:.6f}, valid_ndcg@100: {valid_ndcg:.6f}"
-                    )
-
-                if valid_ndcg > best_ndcg + 1e-6:
-                    best_ndcg = valid_ndcg
-                    best_iteration = iteration
-                    best_eval_result_list = list(eval_list)
-                    no_improvement_count = 0
-                    log_message(
-                        f"✅ [Iter {iteration}] Новый лучший valid_ndcg@100: {valid_ndcg:.6f}"
-                    )
-                else:
-                    no_improvement_count += 1
-
-                env.evaluation_result_list = eval_list
-
-                if no_improvement_count >= early_stopping_rounds:
-                    log_message(
-                        f"⏹️ Ранняя остановка на итерации {iteration}. "
-                        f"Лучший NDCG@100={best_ndcg:.6f} (iter {best_iteration})"
-                    )
-                    raise lgb.callback.EarlyStopException(
-                        best_iteration, best_eval_result_list
-                    )
-            else:
-                if iteration % 5 == 0:
-                    log_message(f"[Iter {iteration}] train_ndcg@100: {train_ndcg:.6f}")
-                env.evaluation_result_list = eval_list
+        # сохраняем ссылку на self для метрики
+        self_outer = self
 
         try:
-            valid_sets = [train_dataset] + (
-                [val_dataset] if val_dataset is not None else []
-            )
-            valid_names = ["train"] + (["valid"] if val_dataset is not None else [])
-
-            self.model = lgb.train(
-                params,
-                train_dataset,
-                num_boost_round=ITER_N,
-                valid_sets=valid_sets,
-                valid_names=valid_names,
-                callbacks=[ndcg_callback],
+            self.model = CatBoostClassifier(**params)
+            self.model.fit(
+                train_pool,
+                eval_set=val_pool if val_pool else None,
+                verbose=50,
             )
 
-            self.eval_history = eval_history
+            self.model.save_model("src/models/catboost_model.cbm")
 
             if val_data is not None:
-                final_val_ndcg = self.evaluate(val_data)
-                log_message(f"🎯 Финальный NDCG@100 на валидации: {final_val_ndcg:.6f}")
+                preds = self.model.predict_proba(X_val)[:, 1]
+                final_val_ndcg = self._calculate_ndcg(val_data, preds, val_users)
                 log_message(
-                    f"📈 Лучший NDCG@100: {best_ndcg:.6f} на итерации {best_iteration}"
+                    f"🎯 Финальный кастомный NDCG@100 на валидации: {final_val_ndcg:.6f}"
                 )
 
             return self.model
 
-        except Exception as e:
-            log_message(f"❌ ОШИБКА при обучении LightGBM: {e}")
+        except CatboostError as e:
+            log_message(f"❌ ОШИБКА при обучении CatBoost: {e}")
             import traceback
 
             log_message(f"Трассировка: {traceback.format_exc()}")
@@ -1726,35 +1715,6 @@ class LightGBMRecommender:
             for user_id, group in data.groupby("user_id")
         }
         return recommendations
-
-    def debug_data_info(self, data, name="data"):
-        """Выводит детальную информацию о данных"""
-        if data is None or data.empty:
-            log_message(f"{name}: Пусто")
-            return
-
-        log_message(f"=== ДЕБАГ ИНФОРМАЦИЯ: {name} ===")
-        log_message(f"Размер: {len(data)} строк")
-        log_message(f"Колонки: {list(data.columns)}")
-
-        if hasattr(self, "feature_columns"):
-            missing = [f for f in self.feature_columns if f not in data.columns]
-            if missing:
-                log_message(f"❌ Отсутствуют признаки: {missing}")
-            else:
-                log_message(f"✅ Все признаки присутствуют")
-
-        # Статистика по целевой переменной
-        if "target" in data.columns:
-            target_counts = data["target"].value_counts()
-            log_message(f"Целевая переменная: {dict(target_counts)}")
-
-        # Пример первых нескольких строк
-        if len(data) > 0:
-            log_message("Пример первой строки:")
-            for col in data.columns:
-                if col in data.columns:
-                    log_message(f"  {col}: {data[col].iloc[0]}")
 
 
 def build_user_features_dict(interactions_files, orders_df, device="cuda"):
@@ -2758,7 +2718,7 @@ if __name__ == "__main__":
         # === ПОДГОТОВКА ДАННЫХ ДЛЯ LightGBM ===
         stage_start = time.time()
         log_message("=== ПОДГОТОВКА ДАННЫХ ДЛЯ LightGBM ===")
-        recommender = LightGBMRecommender()
+        recommender = ModelRecommender()
         recommender.set_als_embeddings(model)
         recommender.set_additional_data(
             copurchase_map, item_to_cat, cat_to_items, user_map, item_map
@@ -2777,10 +2737,11 @@ if __name__ == "__main__":
 
         # Используем обновленный метод с UI-признаками
         train_data, val_data = recommender.prepare_training_data(
-            train_interactions_files=interactions_files,  # Все interactions считаются тренировочными
-            test_interactions_files=[],  # Пусто - используем внутренний split
-            train_orders_df=train_orders_df,  # ТОЛЬКО тренировочные заказы
-            test_orders_df=pd.DataFrame(),  # Пусто - используем внутренний split
+            train_interactions_files=interactions_files,
+            test_interactions_files=[],
+            train_orders_df=train_orders_df,
+            test_orders_df=pd.DataFrame(),
+            items_df=items_df,
             user_map=user_map,
             item_map=item_map,
             popularity_s=popularity_s,
@@ -2788,7 +2749,6 @@ if __name__ == "__main__":
             copurchase_map=copurchase_map,
             item_to_cat=item_to_cat,
             cat_to_items=cat_to_items,
-            # embeddings_dict=embeddings_dict,
             sample_fraction=config["sample_fraction"],
             negatives_per_positive=0,
         )
@@ -2943,25 +2903,25 @@ if __name__ == "__main__":
         # log_message(f"Оценка модели завершена за {timedelta(seconds=stage_time)}")
 
         # Анализ важности признаков
-        stage_start = time.time()
-        log_message("=== ВАЖНОСТЬ ПРИЗНАКОВ ===")
-        feature_importance = pd.DataFrame(
-            {
-                "feature": recommender.feature_columns,
-                "importance": recommender.model.feature_importance(),
-            }
-        )
-        feature_importance = feature_importance.sort_values(
-            "importance", ascending=False
-        )
-        top_features = feature_importance.head(20)
-        log_message("Топ-20 важных признаков:")
-        for i, row in top_features.iterrows():
-            log_message(f"  {row['feature']}: {row['importance']}")
-        stage_time = time.time() - stage_start
-        log_message(
-            f"Анализ важности признаков завершен за {timedelta(seconds=stage_time)}"
-        )
+        # stage_start = time.time()
+        # log_message("=== ВАЖНОСТЬ ПРИЗНАКОВ ===")
+        # feature_importance = pd.DataFrame(
+        #     {
+        #         "feature": recommender.feature_columns,
+        #         "importance": recommender.model.feature_importance(),
+        #     }
+        # )
+        # feature_importance = feature_importance.sort_values(
+        #     "importance", ascending=False
+        # )
+        # top_features = feature_importance.head(20)
+        # log_message("Топ-20 важных признаков:")
+        # for i, row in top_features.iterrows():
+        #     log_message(f"  {row['feature']}: {row['importance']}")
+        # stage_time = time.time() - stage_start
+        # log_message(
+        #     f"Анализ важности признаков завершен за {timedelta(seconds=stage_time)}"
+        # )
 
         # === СОХРАНЕНИЕ МОДЕЛИ И ВАЖНЫХ ДАННЫХ ===
         stage_start = time.time()
@@ -2981,9 +2941,7 @@ if __name__ == "__main__":
             "item_to_cat": item_to_cat,
         }
 
-        model_path = (
-            "/home/root6/python/e_cup/rec_system/src/models/lgbm_model_full.pkl"
-        )
+        model_path = "/home/root6/python/e_cup/rec_system/src/models/model.pkl"
         with open(model_path, "wb") as f:
             pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
