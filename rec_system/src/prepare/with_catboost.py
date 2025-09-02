@@ -52,9 +52,10 @@ tqdm.pandas()
 
 MAX_FILES = 0  # сколько файлов берем в работу. 0 - все
 MAX_ROWS = 0  # сколько строк для каждой группы берем в работу. 0 - все
-ITER_N = 10_000  # число эпох для обучения
-EARLY_STOP = 50  # ранняя остановка обучения
-EMB_LENGHT = 10
+ITER_N = 2_000  # число эпох для обучения
+EARLY_STOP = 10  # ранняя остановка обучения
+EMB_LENGHT = 50  # сколько частей от исходного эмбединга брать
+VERBOSE_N = 50  # как часть выводить сведения об обучении
 
 
 def find_parquet_files(folder):
@@ -1720,7 +1721,7 @@ class ModelRecommender:
             self.model.fit(
                 train_pool,
                 eval_set=val_pool if val_pool else None,
-                verbose=50,
+                verbose=VERBOSE_N,
             )
 
             os.makedirs("/home/root6/python/e_cup/rec_system/src/models", exist_ok=True)
