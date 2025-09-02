@@ -1,4 +1,4 @@
-# predict_catboost.py
+# predict_xgboost.py
 import gc
 import logging
 import os
@@ -11,11 +11,11 @@ from pathlib import Path
 import dask.dataframe as dd
 import numpy as np
 import pandas as pd
-from catboost import CatBoostClassifier, Pool
+import xgboost as xgb
 from tqdm import tqdm
 
 # ===== ПУТИ / КОНСТАНТЫ =====
-MODEL_PATH = "/home/root6/python/e_cup/rec_system/src/models/catboost_model.cbm"
+MODEL_PATH = "/home/root6/python/e_cup/rec_system/src/models/model.json"
 ARTIFACTS_PATH = "/home/root6/python/e_cup/rec_system/src/models/model.pkl"
 TEST_USERS_PATH = "/home/root6/python/e_cup/rec_system/data/raw/test_users/*.parquet"
 OUTPUT_PATH = "/home/root6/python/e_cup/rec_system/result/submission.csv"
@@ -28,7 +28,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("predict_catboost")
+logger = logging.getLogger("predict_xgboost")
 
 
 def log_message(msg: str):
@@ -112,12 +112,14 @@ def make_candidate_frame_for_user(
     # На случай если в feature_columns есть что-то ещё — приведём к нужному порядку/составу
     df = df.reindex(columns=feature_columns, fill_value=0.0)
 
-    # приведение типов
+    # Обработка категориальных признаков для XGBoost
     for col in df.columns:
         if col in cat_features:
-            df[col] = df[col].fillna("nan").astype(str)
+            # XGBoost требует числовые значения, преобразуем категории в коды
+            df[col] = pd.factorize(df[col].fillna("nan"))[0].astype(np.int32)
         else:
             df[col] = df[col].astype("float32")
+
     return df
 
 
@@ -134,8 +136,8 @@ def build_candidates_for_user(
     recent = recent_items_get(user_id, [])
 
     N_RECENT = 30
-    N_COPURCHASE = 15
-    N_CATEGORY = 15
+    N_COPURCHASE = 10
+    N_CATEGORY = 10
     N_POPULAR = 5
 
     cands = set()
@@ -144,7 +146,7 @@ def build_candidates_for_user(
     for it in recent[:10]:
         cands.update(copurchase_map.get(it, [])[:N_COPURCHASE])
 
-    for it in recent[:5]:
+    for it in recent[:10]:
         cat = item_to_cat.get(it)
         if cat is not None and cat in cat_to_items:
             cands.update(cat_to_items[cat][:N_CATEGORY])
@@ -170,7 +172,7 @@ def build_candidates_for_user(
 # ===== ОСНОВНОЙ ИНФЕРЕНС =====
 def main():
     start_time = time.time()
-    log_message("=== Старт инференса CatBoost ===")
+    log_message("=== Старт инференса XGBoost ===")
 
     # --- Загрузка пользователей
     test_df = dd.read_parquet(TEST_USERS_PATH).compute()
@@ -179,24 +181,24 @@ def main():
 
     # --- Загрузка модели и артефактов
     log_message(f"Загружаем модель из {MODEL_PATH}")
-    model = CatBoostClassifier()
+    model = xgb.Booster()
     model.load_model(MODEL_PATH)
 
-    # вытаскиваем список признаков и категориальных из модели
-    feature_columns = model.feature_names_
-    cat_feature_indices = model.get_cat_feature_indices()
-    cat_features = [feature_columns[i] for i in cat_feature_indices]
+    # Загружаем информацию о признаках из артефактов
+    log_message(f"Загружаем артефакты из {ARTIFACTS_PATH}")
+    with open(ARTIFACTS_PATH, "rb") as f:
+        artifacts = pickle.load(f)
+
+    # Получаем информацию о признаках из артефактов
+    feature_columns = artifacts.get("feature_columns", [])
+    cat_features = artifacts.get("cat_features", [])
 
     log_message(
         f"Загружено {len(feature_columns)} признаков, "
         f"{len(cat_features)} категориальных"
     )
 
-    # --- артефакты (только мапы и словари, без feature_columns/cat_features)
-    log_message(f"Загружаем артефакты из {ARTIFACTS_PATH}")
-    with open(ARTIFACTS_PATH, "rb") as f:
-        artifacts = pickle.load(f)
-
+    # --- артефакты
     recent_items_map = artifacts["recent_items_map"]
     copurchase_map = artifacts["copurchase_map"]
     item_to_cat = artifacts["item_to_cat"]
@@ -245,17 +247,11 @@ def main():
                             cat_features=cat_features,
                         )
 
-                        # приведение категориальных к строке
-                        for col in cat_features:
-                            if col in X.columns:
-                                X[col] = X[col].fillna("nan").astype(str)
+                        # Преобразуем в DMatrix для XGBoost
+                        dmatrix = xgb.DMatrix(X)
 
-                        # предикт
-                        pool = Pool(
-                            X,
-                            cat_features=[c for c in cat_features if c in X.columns],
-                        )
-                        probs = model.predict_proba(pool)[:, 1]
+                        # Получаем предсказания
+                        probs = model.predict(dmatrix)
 
                         order = np.argsort(probs)[::-1]
                         top = [int(cands[j]) for j in order[:TOP_K]]
