@@ -64,4 +64,4 @@ bac/processed/ui_features_distributed/ui_features_tracker_part_0.parquet
 bac/processed/ui_features_distributed/ui_features_tracker_part_0.parquet:Zone.Identifier
 catboost_info/
 rec_system/src/models/catboost_model.cbm
-rec_system/src/models/model.pkl
+rec_system/src/models/

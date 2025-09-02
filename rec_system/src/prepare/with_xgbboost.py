@@ -31,7 +31,7 @@ import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
 import torch.sparse
-from catboost import CatBoostClassifier, CatboostError, Pool
+import xgboost as xgb
 from dask.diagnostics import ProgressBar
 from implicit.als import AlternatingLeastSquares
 from polars import LazyFrame, concat
@@ -52,10 +52,13 @@ tqdm.pandas()
 
 MAX_FILES = 0  # сколько файлов берем в работу. 0 - все
 MAX_ROWS = 0  # сколько строк для каждой группы берем в работу. 0 - все
-ITER_N = 2_000  # число эпох для обучения
-EARLY_STOP = 10  # ранняя остановка обучения
-EMB_LENGHT = 50  # сколько частей от исходного эмбединга брать
-VERBOSE_N = 50  # как часть выводить сведения об обучении
+EMB_LENGHT = 30  # сколько частей от исходного эмбединга брать
+
+# обучение
+ITER_N = 10  # число эпох для обучения
+EARLY_STOP = 5  # ранняя остановка обучения
+VERBOSE_N = 1  # как часть выводить сведения об обучении
+CHUNK_SIZE = 100_000_000  # Размер чанка для инкрементального обучения
 
 
 def find_parquet_files(folder):
@@ -1592,233 +1595,151 @@ class ModelRecommender:
         # Временная реализация - возвращаем общую силу
         return self._get_copurchase_strength(item_id)
 
-    def train(self, train_data, val_data=None, params=None):
+    def train(self, train_data, val_data=None, params=None, chunk_size=1_000_000):
         """
-        Обучение CatBoost с кастомной метрикой NDCG@100.
-        Используется встроенный механизм кастомной метрики через класс.
+        Инкрементальное обучение с обработкой данных чанками
         """
+        MODEL_PATH = "/home/root6/python/e_cup/rec_system/src/models/model.json"
+
         if params is None:
             params = {
-                "loss_function": "Logloss",
+                "objective": "binary:logistic",
+                "eval_metric": "logloss",
                 "learning_rate": 0.05,
-                "depth": 6,
-                "l2_leaf_reg": 3,
-                "bootstrap_type": "Bayesian",
-                "iterations": ITER_N,
-                "thread_count": 8,
-                "random_seed": 42,
-                "verbose": 5,
-                "use_best_model": True,
-                "od_type": "Iter",
-                "od_wait": EARLY_STOP,
-                "train_dir": "./catboost_info",
-                "save_snapshot": False,
-                "snapshot_file": "catboost_snapshot.bkp",
-                "snapshot_interval": 600,
-                "used_ram_limit": "30gb",
+                "max_depth": 6,
+                "lambda": 3,
+                "subsample": 0.8,
+                "colsample_bytree": 0.8,
+                "tree_method": "hist",  # быстрее и меньше памяти
+                "random_state": 42,
+                "nthread": 8,
             }
 
-        # Проверка признаков
         if not hasattr(self, "feature_columns") or not self.feature_columns:
             log_message("❌ ОШИБКА: Нет признаков для обучения!")
             return None
 
-        missing_features = [
-            f for f in self.feature_columns if f not in train_data.columns
-        ]
-        if missing_features:
-            log_message(f"❌ В train_data отсутствуют признаки: {missing_features}")
-            return None
+        total_samples = len(train_data)
+        log_message(f"📊 Всего данных для обработки: {total_samples} строк")
 
-        # Приведение типов (float64→float32, int64→int32)
-        for df in [train_data, val_data]:
-            if df is not None:
-                for col in df.select_dtypes(include=["float64"]).columns:
-                    df[col] = df[col].astype("float32")
-                for col in df.select_dtypes(include=["int64"]).columns:
-                    df[col] = df[col].astype("int32")
+        num_chunks = (total_samples + chunk_size - 1) // chunk_size
 
-        # Основные данные
-        X_train = train_data[self.feature_columns].copy()
-        y_train = train_data["target"]
-        train_users = train_data["user_id"]
+        booster = None
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * chunk_size
+            end_idx = min((chunk_idx + 1) * chunk_size, total_samples)
+            chunk_data = train_data.iloc[start_idx:end_idx].copy()
+            log_message(f"📦 Чанк {chunk_idx+1}/{num_chunks} ({len(chunk_data)} строк)")
 
-        log_message(f"Размер train: {len(X_train)}")
-        log_message(f"Количество пользователей в train: {train_users.nunique()}")
-
-        X_val, y_val, val_users, val_pool = None, None, None, None
-        if val_data is not None:
-            missing_val_features = [
-                f for f in self.feature_columns if f not in val_data.columns
-            ]
-            if missing_val_features:
-                log_message(
-                    f"❌ В val_data отсутствуют признаки: {missing_val_features}"
-                )
+            success, booster = self._process_chunk(
+                chunk_data, params, booster, MODEL_PATH, val_data
+            )
+            if not success:
+                log_message("❌ Ошибка при обработке чанка, прерываем обучение")
                 return None
 
-            X_val = val_data[self.feature_columns].copy()
-            y_val = val_data["target"]
-            val_users = val_data["user_id"]
+            booster.save_model(MODEL_PATH)
+            log_message(f"💾 Модель сохранена после чанка {chunk_idx+1}")
 
-            log_message(f"Размер val: {len(X_val)}")
-            log_message(f"Количество пользователей в val: {val_users.nunique()}")
+        self.model = booster
 
-        # Определение категориальных признаков
-        log_message(f"Определение категориальных признаков")
-        categorical_features = [
-            col
-            for col in self.feature_columns
-            if col in ["user_id", "item_id"] or col.startswith(("user_", "item_"))
-        ]
+        if val_data is not None:
+            val_score = self.evaluate(val_data, k=100)
+            log_message(f"🎯 Финальный NDCG@100 на валидации: {val_score:.6f}")
 
-        # Приведение категориальных фич к строкам
-        log_message(f"Приведение категориальных фич к строкам")
-        for col in categorical_features:
-            X_train[col] = X_train[col].astype(str)
-            if X_val is not None:
-                X_val[col] = X_val[col].astype(str)
+        return self.model
 
-        # Создание пулов
-        log_message(f"Создание пулов")
-        log_message(f"train_pool")
-        train_pool = Pool(X_train, label=y_train, cat_features=categorical_features)
-        if X_val is not None:
-            log_message(f"val_pool")
-            val_pool = Pool(X_val, label=y_val, cat_features=categorical_features)
-        log_message(f"Создание пулов завершено")
-
-        # Кастомная метрика NDCG@100
-        class NDCG100:
-            def get_final_error(self, error, weight):
-                return error
-
-            def is_max_optimal(self):
-                return True
-
-            def evaluate(self, approxes, target, weight):
-                preds = approxes[0]
-                preds = list(preds)
-                target = list(target)
-                df = (
-                    val_data
-                    if (y_val is not None and len(preds) == len(y_val))
-                    else train_data
-                )
-                users = (
-                    val_users
-                    if (y_val is not None and len(preds) == len(y_val))
-                    else train_users
-                )
-                ndcg = self_outer._calculate_ndcg(df, preds, users)
-                return ndcg, 1
-
-        # сохраняем ссылку на self для метрики
-        self_outer = self
-
+    def _process_chunk(self, chunk_data, params, booster, model_path, val_data=None):
+        """Обработка и обучение на одном чанке"""
         try:
-            self.model = CatBoostClassifier(**params)
-            self.model.fit(
-                train_pool,
-                eval_set=val_pool if val_pool else None,
-                verbose=VERBOSE_N,
+            required_columns = self.feature_columns + ["target", "user_id"]
+            chunk_data = chunk_data[required_columns].copy()
+
+            for col in chunk_data.columns:
+                if chunk_data[col].dtype == "float64":
+                    chunk_data[col] = chunk_data[col].astype("float32")
+                elif chunk_data[col].dtype == "int64":
+                    chunk_data[col] = chunk_data[col].astype("int32")
+
+            X_chunk = chunk_data[self.feature_columns].values
+            y_chunk = chunk_data["target"].values
+            dtrain = xgb.DMatrix(
+                X_chunk, label=y_chunk, feature_names=self.feature_columns
             )
 
-            os.makedirs("/home/root6/python/e_cup/rec_system/src/models", exist_ok=True)
-            self.model.save_model(
-                "/home/root6/python/e_cup/rec_system/src/models/catboost_model.cbm"
-            )
-
+            # валидация
+            evals = []
             if val_data is not None:
-                preds = self.model.predict_proba(X_val)[:, 1]
-                final_val_ndcg = self._calculate_ndcg(val_data, preds, val_users)
-                log_message(
-                    f"🎯 Финальный кастомный NDCG@100 на валидации: {final_val_ndcg:.6f}"
+                required_val = self.feature_columns + ["target", "user_id"]
+                val_data = val_data[required_val].copy()
+                dval = xgb.DMatrix(
+                    val_data[self.feature_columns].values,
+                    label=val_data["target"].values,
+                    feature_names=self.feature_columns,
                 )
+                evals.append((dval, "val"))
 
-            return self.model
+            booster = xgb.train(
+                params,
+                dtrain,
+                num_boost_round=200,
+                evals=evals if evals else None,
+                early_stopping_rounds=20 if evals else None,
+                xgb_model=booster if booster is not None else None,
+                verbose_eval=50 if evals else False,
+            )
 
-        except CatboostError as e:
-            log_message(f"❌ ОШИБКА при обучении CatBoost: {e}")
+            del X_chunk, y_chunk, chunk_data, dtrain
+            if val_data is not None:
+                del dval
+            gc.collect()
+            return True, booster
+
+        except Exception as e:
+            log_message(f"❌ Ошибка при обработке чанка: {e}")
             import traceback
 
             log_message(f"Трассировка: {traceback.format_exc()}")
-            return None
+            return False, booster
 
-    def _calculate_ndcg(self, data, predictions, user_ids):
-        """Оптимизированный расчет NDCG@100"""
+    def _calculate_ndcg_fast(self, data, user_ids, k=100):
         if len(data) == 0:
             return 0.0
-
-        # Используем более эффективный метод группировки
-        temp_df = pd.DataFrame(
-            {
-                "user_id": data["user_id"].values,
-                "target": data["target"].values,
-                "score": predictions,
-            }
-        )
-
-        # Сортируем внутри групп без создания копий
-        def calculate_group_ndcg(group):
+        ndcg_scores = []
+        grouped = data.groupby("user_id")
+        for user_id, group in grouped:
             if len(group) <= 1:
-                return 0.0
-            # Берем топ-100 элементов
-            top_k = min(100, len(group))
-            sorted_group = group.nlargest(top_k, "score")
-            return ndcg_score(
-                [sorted_group["target"].values],
-                [sorted_group["target"].values],
-                k=top_k,
-            )
-
-        # Параллельный расчет для больших датасетов
-        if len(temp_df) > 100000:
-            from concurrent.futures import ThreadPoolExecutor
-
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                results = list(
-                    executor.map(
-                        calculate_group_ndcg,
-                        [group for _, group in temp_df.groupby("user_id")],
-                    )
-                )
-            return np.mean(results)
-        else:
-            return temp_df.groupby("user_id").apply(calculate_group_ndcg).mean()
+                continue
+            top_items = group.nlargest(k, "score")
+            relevance = top_items["target"].values
+            dcg = relevance[0]
+            for i in range(1, len(relevance)):
+                dcg += relevance[i] / np.log2(i + 2)
+            ideal_relevance = np.sort(relevance)[::-1]
+            idcg = ideal_relevance[0]
+            for i in range(1, len(ideal_relevance)):
+                idcg += ideal_relevance[i] / np.log2(i + 2)
+            if idcg > 0:
+                ndcg_scores.append(dcg / idcg)
+        return np.mean(ndcg_scores) if ndcg_scores else 0.0
 
     def evaluate(self, data, k=100):
-        """Оценка модели через NDCG@k"""
         if self.model is None or len(data) == 0:
             return 0.0
-        data = data.copy()
-        categorical_features = [
-            col
-            for col in self.feature_columns
-            if col in ["user_id", "item_id"] or col.startswith(("user_", "item_"))
-        ]
-
-        for col in categorical_features:
-            data[col] = data[col].astype(str)
-        data["score"] = self.model.predict(data[self.feature_columns])
-        groups = data.groupby("user_id").size().values
-        return ndcg_at_k_grouped(
-            data["score"].values, data["target"].values, groups, k=k
+        required_cols = self.feature_columns + ["target", "user_id"]
+        data = data[required_cols].copy()
+        dtest = xgb.DMatrix(
+            data[self.feature_columns].values, feature_names=self.feature_columns
         )
+        data["score"] = self.model.predict(dtest)
+        return self._calculate_ndcg_fast(data, data["user_id"], k=k)
 
     def recommend(self, user_items_data, top_k=100):
-        """Генерация рекомендаций для пользователей, топ-K"""
         data = user_items_data.copy()
-        categorical_features = [
-            col
-            for col in self.feature_columns
-            if col in ["user_id", "item_id"] or col.startswith(("user_", "item_"))
-        ]
-
-        for col in categorical_features:
-            data[col] = data[col].astype(str)
-        data["score"] = self.model.predict(data[self.feature_columns])
-
+        dtest = xgb.DMatrix(
+            data[self.feature_columns].values, feature_names=self.feature_columns
+        )
+        data["score"] = self.model.predict(dtest)
         recommendations = {
             user_id: group.nlargest(top_k, "score")["item_id"].tolist()
             for user_id, group in data.groupby("user_id")
