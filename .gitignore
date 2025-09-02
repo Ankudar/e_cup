@@ -70,3 +70,4 @@ catboost_info/learn/events.out.tfevents
 catboost_info/test/events.out.tfevents
 rec_system/src/models/catboost_model.cbm
 rec_system/src/models/model.pkl
+catboost_info/tmp/cat_feature_index.53694b53-18c6d1d5-95752262-ed6427b7.tmp

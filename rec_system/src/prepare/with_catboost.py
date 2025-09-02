@@ -2,6 +2,7 @@ import gc
 import glob
 import glob as glob_module
 import json
+import math
 import os
 import pickle
 import random
@@ -33,6 +34,7 @@ import torch.sparse
 from catboost import CatBoostClassifier, CatboostError, Pool
 from dask.diagnostics import ProgressBar
 from implicit.als import AlternatingLeastSquares
+from polars import LazyFrame, concat
 from scipy.sparse import coo_matrix, csr_matrix, vstack
 from sklearn.decomposition import PCA
 from sklearn.metrics import ndcg_score
@@ -49,10 +51,10 @@ warnings.filterwarnings(
 tqdm.pandas()
 
 MAX_FILES = 0  # сколько файлов берем в работу. 0 - все
-MAX_ROWS = 100_000  # сколько строк для каждой группы берем в работу. 0 - все
-ITER_N = 5  # число эпох для обучения
-EARLY_STOP = 10  # ранняя остановка обучения
-EMD_LENGHT = 10
+MAX_ROWS = 0  # сколько строк для каждой группы берем в работу. 0 - все
+ITER_N = 10_000  # число эпох для обучения
+EARLY_STOP = 50  # ранняя остановка обучения
+EMB_LENGHT = 10
 
 
 def find_parquet_files(folder):
@@ -1214,7 +1216,7 @@ class ModelRecommender:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             all_item_ids = list(self.external_embeddings_dict.keys())
             embedding_dim = len(next(iter(self.external_embeddings_dict.values())))
-            n_fclip_dims = min(EMD_LENGHT, embedding_dim)
+            n_fclip_dims = min(EMB_LENGHT, embedding_dim)
             embeddings_tensor = torch.tensor(
                 [self.external_embeddings_dict[i] for i in all_item_ids],
                 dtype=torch.float32,
@@ -1318,6 +1320,7 @@ class ModelRecommender:
         embeddings_dict=None,
         sample_fraction=0.1,
         negatives_per_positive=0,
+        val_split_ratio=0.2,
     ):
         log_message("Подготовка данных для модели (streaming, polars lazy, батчи)...")
 
@@ -1328,28 +1331,108 @@ class ModelRecommender:
         for p in [train_out_dir, val_out_dir, tmp_dir]:
             p.mkdir(parents=True, exist_ok=True)
 
-        # --- 1. Подготовка взаимодействий ---
-        train_inter_lazy = pl.concat(
+        # --- helper для валидации ---
+        def validate_item_ids(df: pl.LazyFrame, df_name: str):
+            schema = df.collect_schema()
+            if "item_id" not in schema:
+                raise ValueError(f"[{df_name}] Нет колонки 'item_id'")
+            if schema["item_id"] != pl.Utf8:
+                raise TypeError(
+                    f"[{df_name}] item_id должен быть Utf8, а сейчас {schema['item_id']}"
+                )
+
+        # --- helper для подготовки эмбеддингов ---
+        def prepare_embeddings(embeddings_dict: dict) -> tuple[pl.LazyFrame, list[str]]:
+            if not embeddings_dict:
+                return None, []
+
+            # Все item_id -> str
+            item_ids = [str(k) for k in embeddings_dict.keys()]
+
+            # Матрица (N, D)
+            emb_matrix = np.stack(
+                [np.array(v, dtype=np.float32) for v in embeddings_dict.values()],
+                axis=0,
+            )
+            emb_dim = emb_matrix.shape[1]
+
+            data = {"item_id": item_ids}
+            for i in range(emb_dim):
+                data[f"emb_{i}"] = emb_matrix[:, i]
+
+            schema = {"item_id": pl.Utf8}
+            schema.update({f"emb_{i}": pl.Float32 for i in range(emb_dim)})
+
+            emb_feats_lazy = pl.DataFrame(data, schema=schema).lazy()
+            emb_feat_cols = [f"emb_{i}" for i in range(emb_dim)]
+
+            validate_item_ids(emb_feats_lazy, "embeddings")
+
+            return emb_feats_lazy, emb_feat_cols
+
+        # --- 1. Подготовка train заказов ---
+        train_orders_pl = (
+            pl.from_pandas(train_orders_df)
+            .lazy()
+            .with_columns(
+                [
+                    pl.col("item_id").cast(pl.Utf8),
+                    pl.col("user_id").cast(pl.Utf8),
+                    pl.col("created_timestamp").cast(pl.Datetime("us")),
+                ]
+            )
+        )
+
+        # --- 2. Подготовка test заказов (если есть) ---
+        if test_orders_df is not None and len(test_orders_df) > 0:
+            test_orders_pl = (
+                pl.from_pandas(test_orders_df)
+                .lazy()
+                .with_columns(
+                    [
+                        pl.col("item_id").cast(pl.Utf8),
+                        pl.col("user_id").cast(pl.Utf8),
+                        pl.col("created_timestamp").cast(pl.Datetime("us")),
+                    ]
+                )
+            )
+            all_orders_pl = pl.concat([train_orders_pl, test_orders_pl])
+        else:
+            all_orders_pl = train_orders_pl
+            log_message("Тестовые заказы отсутствуют, используем только тренировочные")
+
+        validate_item_ids(all_orders_pl, "all_orders")
+
+        # --- 3. Подготовка ВСЕХ взаимодействий ---
+        all_inter_files = train_interactions_files + (
+            test_interactions_files if test_interactions_files else []
+        )
+        all_inter_lazy = pl.concat(
             [
                 pl.scan_parquet(str(f)).select(
                     ["user_id", "item_id", "timestamp", "weight"]
                 )
-                for f in train_interactions_files
+                for f in all_inter_files
+            ]
+        ).with_columns(
+            [
+                pl.col("item_id").cast(pl.Utf8),
+                pl.col("user_id").cast(pl.Utf8),
+                pl.col("timestamp").cast(pl.Datetime("us")),
             ]
         )
 
-        train_orders_pl = pl.from_pandas(train_orders_df).lazy()
-        train_merged = train_orders_pl.join(
-            train_inter_lazy, on=["user_id", "item_id"], how="left"
+        validate_item_ids(all_inter_lazy, "all_inter")
+
+        # --- 4. Объединяем заказы и взаимодействия ---
+        all_merged = all_orders_pl.join(
+            all_inter_lazy, on=["user_id", "item_id"], how="left"
         ).with_columns(
             [
                 pl.col("timestamp")
                 .cast(pl.Datetime("us"))
-                .fill_null(
-                    pl.col("created_timestamp").cast(pl.Datetime("us"))
-                    - pl.duration(days=1)
-                ),
-                pl.col("weight").cast(pl.Float64).fill_null(0.0),
+                .fill_null(pl.col("created_timestamp") - pl.duration(days=1)),
+                pl.col("weight").cast(pl.Float32).fill_null(0.0),
                 pl.when(pl.col("last_status") == "delivered_orders")
                 .then(1)
                 .otherwise(0)
@@ -1357,45 +1440,69 @@ class ModelRecommender:
             ]
         )
 
-        # --- 2. User/Item признаки ---
-        user_feats_lazy = None
-        user_feat_cols = []
-        if user_features_dict is not None:
+        # --- 5. Разделяем на train/val по timestamp ---
+        # Находим граничную дату для разделения
+        timestamp_stats = all_merged.select(
+            [
+                pl.col("timestamp").max().alias("max_ts"),
+                pl.col("timestamp").min().alias("min_ts"),
+            ]
+        ).collect()
+
+        max_ts = timestamp_stats["max_ts"][0]
+        min_ts = timestamp_stats["min_ts"][0]
+        split_ts = min_ts + (max_ts - min_ts) * (1 - val_split_ratio)
+
+        log_message(
+            f"Разделение данных по времени: {min_ts} -> {split_ts} (train) | {split_ts} -> {max_ts} (val)"
+        )
+
+        # Разделяем данные
+        train_merged = all_merged.filter(pl.col("timestamp") <= split_ts)
+        val_merged = all_merged.filter(pl.col("timestamp") > split_ts)
+
+        # --- 6. User признаки ---
+        user_feats_lazy, user_feat_cols = None, []
+        if user_features_dict:
             user_feats_lazy = pl.LazyFrame(
-                [{"user_id": k, **v} for k, v in user_features_dict.items()]
+                [
+                    {"user_id": str(k), **(v if isinstance(v, dict) else {})}
+                    for k, v in user_features_dict.items()
+                ]
             )
             user_feat_cols = [
                 c for c in user_feats_lazy.collect_schema().names() if c != "user_id"
             ]
 
-        item_feats_lazy = None
-        item_feat_cols = []
-        if item_features_dict is not None:
+        # --- 7. Item признаки ---
+        item_feats_lazy, item_feat_cols = None, []
+        if item_features_dict:
             items_data = []
             for item_id, feats in item_features_dict.items():
-                feats_copy = feats.copy() if isinstance(feats, dict) else {}
-                feats_copy["item_id"] = item_id
-                items_data.append(feats_copy)
-            item_feats_lazy = pl.LazyFrame(items_data)
+                if isinstance(feats, np.ndarray):
+                    feat_dict = {
+                        f"item_feat_{i}": float(feats[i]) for i in range(len(feats))
+                    }
+                elif isinstance(feats, dict):
+                    feat_dict = feats.copy()
+                else:
+                    feat_dict = {}
+
+                feat_dict["item_id"] = str(item_id)
+                items_data.append(feat_dict)
+
+            item_feats_lazy = pl.LazyFrame(items_data).with_columns(
+                pl.col("item_id").cast(pl.Utf8)
+            )
+            validate_item_ids(item_feats_lazy, "item_feats")
             item_feat_cols = [
                 c for c in item_feats_lazy.collect_schema().names() if c != "item_id"
             ]
 
-        # --- 3. Эмбеддинги ---
-        emb_feats_lazy = None
-        emb_feat_cols = []
-        if embeddings_dict is not None:
-            emb_data = []
-            for item_id, emb in embeddings_dict.items():
-                emb_dict = {f"emb_{i}": float(emb[i]) for i in range(len(emb))}
-                emb_dict["item_id"] = item_id
-                emb_data.append(emb_dict)
-            emb_feats_lazy = pl.LazyFrame(emb_data)
-            emb_feat_cols = [
-                c for c in emb_feats_lazy.collect_schema().names() if c != "item_id"
-            ]
+        # --- 8. Эмбеддинги ---
+        emb_feats_lazy, emb_feat_cols = prepare_embeddings(embeddings_dict)
 
-        # --- 4. Мержим признаки ---
+        # --- 9. Мержим признаки для train ---
         train_with_features = train_merged
         if user_feats_lazy is not None:
             train_with_features = train_with_features.join(
@@ -1410,80 +1517,46 @@ class ModelRecommender:
                 emb_feats_lazy, on="item_id", how="left"
             )
 
-        # --- 5. Заполняем NaN только для числовых колонок ---
+        # --- 10. Мержим признаки для val ---
+        val_with_features = val_merged
+        if user_feats_lazy is not None:
+            val_with_features = val_with_features.join(
+                user_feats_lazy, on="user_id", how="left"
+            )
+        if item_feats_lazy is not None:
+            val_with_features = val_with_features.join(
+                item_feats_lazy, on="item_id", how="left"
+            )
+        if emb_feats_lazy is not None:
+            val_with_features = val_with_features.join(
+                emb_feats_lazy, on="item_id", how="left"
+            )
+
+        # --- 11. Заполняем NaN ---
+        # Для train
+        schema = train_with_features.collect_schema()
         numeric_cols = [
             c
-            for c, dtype in train_with_features.schema.items()
-            if dtype in [pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.Float32, pl.Float64]
-            and c != "target"
+            for c, dtype in schema.items()
+            if dtype.is_numeric() and c != "target" and c not in ["user_id", "item_id"]
         ]
         train_with_features = train_with_features.with_columns(
-            [pl.col(c).cast(pl.Float64).fill_null(0.0) for c in numeric_cols]
+            [pl.col(c).fill_null(0.0) for c in numeric_cols]
         )
 
-        # --- 6. Тестовые/валидационные данные ---
-        if test_interactions_files and test_orders_df is not None:
-            test_inter_lazy = pl.concat(
-                [
-                    pl.scan_parquet(str(f)).select(
-                        ["user_id", "item_id", "timestamp", "weight"]
-                    )
-                    for f in test_interactions_files
-                ]
-            )
-            test_orders_pl = pl.from_pandas(test_orders_df).lazy()
-            test_merged = test_orders_pl.join(
-                test_inter_lazy, on=["user_id", "item_id"], how="left"
-            ).with_columns(
-                [
-                    pl.col("timestamp")
-                    .cast(pl.Datetime("us"))
-                    .fill_null(
-                        pl.col("created_timestamp").cast(pl.Datetime("us"))
-                        - pl.duration(days=1)
-                    ),
-                    pl.col("weight").cast(pl.Float64).fill_null(0.0),
-                    pl.when(pl.col("last_status") == "delivered_orders")
-                    .then(1)
-                    .otherwise(0)
-                    .alias("target"),
-                ]
-            )
+        # Для val
+        val_schema = val_with_features.collect_schema()
+        val_numeric_cols = [
+            c
+            for c, dtype in val_schema.items()
+            if dtype.is_numeric() and c != "target" and c not in ["user_id", "item_id"]
+        ]
+        val_final = val_with_features.with_columns(
+            [pl.col(c).fill_null(0.0) for c in val_numeric_cols]
+        )
 
-            val_with_features = test_merged
-            if user_feats_lazy is not None:
-                val_with_features = val_with_features.join(
-                    user_feats_lazy, on="user_id", how="left"
-                )
-            if item_feats_lazy is not None:
-                val_with_features = val_with_features.join(
-                    item_feats_lazy, on="item_id", how="left"
-                )
-            if emb_feats_lazy is not None:
-                val_with_features = val_with_features.join(
-                    emb_feats_lazy, on="item_id", how="left"
-                )
-
-            numeric_cols_val = [
-                c
-                for c, dtype in val_with_features.schema.items()
-                if dtype
-                in [pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.Float32, pl.Float64]
-                and c != "target"
-            ]
-            val_with_features = val_with_features.with_columns(
-                [pl.col(c).cast(pl.Float64).fill_null(0.0) for c in numeric_cols_val]
-            )
-
-            train_final, val_final = train_with_features, val_with_features
-        else:
-            train_final = train_with_features.filter(
-                pl.col("user_id").hash() % 100 < 80
-            )
-            val_final = train_with_features.filter(pl.col("user_id").hash() % 100 >= 80)
-
-        # --- 7. Сохраняем ---
-        train_final.sink_parquet(
+        # --- 12. Сохраняем ---
+        train_with_features.sink_parquet(
             str(train_out_dir / "train.parquet"), row_group_size=100_000
         )
         val_final.sink_parquet(str(val_out_dir / "val.parquet"), row_group_size=100_000)
@@ -1491,7 +1564,13 @@ class ModelRecommender:
         # feature_columns
         self.feature_columns = user_feat_cols + item_feat_cols + emb_feat_cols
 
-        log_message("✅ Данные подготовлены с эмбеддингами")
+        # Собираем статистику
+        train_count = train_with_features.select(pl.count()).collect().item()
+        val_count = val_final.select(pl.count()).collect().item()
+
+        log_message(
+            f"✅ Данные подготовлены. Train: {train_count} строк, Val: {val_count} строк"
+        )
         return train_out_dir, val_out_dir
 
     def _get_copurchase_strength(self, item_id):
@@ -2529,10 +2608,10 @@ if __name__ == "__main__":
             raw_embeddings_dict, "/home/root6/python/e_cup/rec_system/pca_variance.png"
         )
 
-        # Используем оптимальное число компонент или EMD_LENGHT, если оно меньше
-        final_components = min(optimal_components, EMD_LENGHT)
+        # Используем оптимальное число компонент или EMB_LENGHT, если оно меньше
+        final_components = min(optimal_components, EMB_LENGHT)
         log_message(
-            f"Используем {final_components} компонент PCA (оптимально: {optimal_components}, лимит: {EMD_LENGHT})"
+            f"Используем {final_components} компонент PCA (оптимально: {optimal_components}, лимит: {EMB_LENGHT})"
         )
 
         # Применяем PCA с выбранным числом компонент (оптимизированная версия)
@@ -2744,9 +2823,9 @@ if __name__ == "__main__":
         item_time = time.time() - item_start
         log_message(f"Item features построены за {timedelta(seconds=item_time)}")
 
-        # === ПОДГОТОВКА ДАННЫХ ДЛЯ LightGBM ===
+        # === ПОДГОТОВКА ДАННЫХ ДЛЯ модели ===
         stage_start = time.time()
-        log_message("=== ПОДГОТОВКА ДАННЫХ ДЛЯ LightGBM ===")
+        log_message("=== ПОДГОТОВКА ДАННЫХ ДЛЯ МОДЕЛИ ===")
         recommender = ModelRecommender()
         recommender.set_als_embeddings(model)
         recommender.set_additional_data(
@@ -2787,8 +2866,15 @@ if __name__ == "__main__":
 
         # --- Функция для подсчёта строк в parquet ---
         def parquet_len(parquet_pattern: str) -> int:
-            """Считает количество строк в parquet файлах по шаблону без загрузки всего в память"""
-            return pl.scan_parquet(parquet_pattern).select(pl.count()).collect()[0, 0]
+            """Безопасно возвращает количество строк в parquet (0 если файлов нет)."""
+            files = list(Path().glob(parquet_pattern))
+            if not files:
+                return 0
+            return (
+                pl.scan_parquet([str(f) for f in files])
+                .select(pl.len())
+                .collect()[0, 0]
+            )
 
         # --- Логирование размеров train/val ---
         train_parquet_pattern = "rec_system/data/processed/train_streaming/*.parquet"
@@ -2802,7 +2888,7 @@ if __name__ == "__main__":
 
         stage_time = time.time() - stage_start
         log_message(
-            f"Подготовка данных для LightGBM завершена за {timedelta(seconds=stage_time)}"
+            f"Подготовка данных для модели завершена за {timedelta(seconds=stage_time)}"
         )
 
         # === ДЕТАЛЬНАЯ ПРОВЕРКА ПРИЗНАКОВ ===
@@ -2836,7 +2922,7 @@ if __name__ == "__main__":
         if item_features_dict:
             sample_item = next(iter(item_features_dict))
             raw_item_feats = item_features_dict[sample_item]
-            item_feats = normalize_item_feats(raw_item_feats, max_emb_dim=EMD_LENGHT)
+            item_feats = normalize_item_feats(raw_item_feats, max_emb_dim=EMB_LENGHT)
 
             log_message(f"Пример item features для товара {sample_item}:")
             for feat, value in item_feats.items():
@@ -2845,7 +2931,7 @@ if __name__ == "__main__":
             items_with_features = len(item_features_dict)
             items_with_real_features = 0
             for feats in item_features_dict.values():
-                norm_feats = normalize_item_feats(feats, max_emb_dim=EMD_LENGHT)
+                norm_feats = normalize_item_feats(feats, max_emb_dim=EMB_LENGHT)
                 if any(v != 0 for v in norm_feats.values()):
                     items_with_real_features += 1
 
@@ -2921,7 +3007,7 @@ if __name__ == "__main__":
         # model = recommender.train(train_df, val_df)
 
         stage_time = time.time() - stage_start
-        log_message(f"Обучение LightGBM завершено за {timedelta(seconds=stage_time)}")
+        log_message(f"Обучение модели завершено за {timedelta(seconds=stage_time)}")
 
         # === ОЦЕНКА МОДЕЛИ ===
         stage_start = time.time()
