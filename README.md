@@ -1,11 +1,7 @@
 Итак... это было больно :)
 Тем не менее, что-то получилось сделать, жаль, без нормальным результатов на ЛБ.
 Но отсутствие опыта и первый раз в этой теме все решило за меня, поэтому получилось так, как получилось.
-
-Как запускать:
-0) 
-1) Запускаем обучение как есть
-2) Запускаем предикт как есть
+Код я конечно же пытался почистить от старых пробных/неудачных моментов, но могло, что-то, и остаться.
 
 Основные этапы выполнения:
 
@@ -66,3 +62,52 @@
 - GPU ускорение вычислений
 - Детальное логирование всех этапов выполнения
 - Автоматический подбор параметров PCA для эмбеддингов
+
+Старт:
+python3.12 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+
+Маршруты для файлов такие
+"orders": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train_final_apparel_orders_data/",
+"tracker": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train_final_apparel_tracker_data/",
+"items": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train_final_apparel_items_data/",
+"categories": "/home/root6/python/e_cup/rec_system/data/raw/ml_ozon_recsys_train_final_categories_tree/",
+"test_users": "/home/root6/python/e_cup/rec_system/data/raw/test_users/",
+
+with_xgbboost.py
+
+основные настройки
+MAX_FILES = 0  # сколько файлов берем в работу. 0 - все
+MAX_ROWS = 0  # сколько строк для каждой группы берем в работу. 0 - все
+EMB_LENGHT = 150  # сколько частей от исходного эмбединга брать, стоит, сколько я у себя смог обработать
+
+ITER_N = 2_000  # число эпох для обучения
+EARLY_STOP = 50  # ранняя остановка обучения
+VERBOSE_N = 10  # как часто выводить сведения об обучении
+CHUNK_SIZE = 200_000  # размер чанка для инкрементального обучения
+
+других значимых настроек на данном этапе не выносил также
+
+predict_xgbboost.py
+
+MODEL_PATH = "/home/root6/python/e_cup/rec_system/src/models/model.json"
+ARTIFACTS_PATH = "/home/root6/python/e_cup/rec_system/src/models/model.pkl"
+TEST_USERS_PATH = "/home/root6/python/e_cup/rec_system/data/raw/test_users/*.parquet"
+OUTPUT_PATH = "/home/root6/python/e_cup/rec_system/result/submission.csv"
+TOP_K = 100 # сколько генерим рекомендаций для юзера
+BATCH_USERS = 2000 # сколько за раз берем юзеров
+
+ACTION_WEIGHTS = {"page_view": 1, "favorite": 5, "to_cart": 10}
+
+1) Запускаем обучение как есть - python with_xgbboost.py
+2) Запускаем предикт как есть - python predict_xgbboost.py
+
+предварительно логи, как шло обучение у меня, можно посмотреть в training_log.txt
+
+при текущих настройках, время:
+обучения - ~10-15 минут
+инференса - ~25-35 минут
+
+врятли, но вдруг, что-то полезное получится вытащить из всего того, что я сделал :)

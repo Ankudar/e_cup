@@ -50,8 +50,8 @@ warnings.filterwarnings(
 tqdm.pandas()
 
 MAX_FILES = 0  # сколько файлов берем в работу. 0 - все
-MAX_ROWS = 1_000_000  # сколько строк для каждой группы берем в работу. 0 - все
-EMB_LENGHT = 10  # 150  # сколько частей от исходного эмбединга брать
+MAX_ROWS = 0  # сколько строк для каждой группы берем в работу. 0 - все
+EMB_LENGHT = 150  # сколько частей от исходного эмбединга брать
 
 # обучение
 ITER_N = 2_000  # число эпох для обучения
@@ -1758,18 +1758,18 @@ class ModelRecommender:
         # Итеративное чтение чанков через scan_parquet + slice
         try:
             num_chunks = (total_samples + chunk_size - 1) // chunk_size
-            
+
             for chunk_idx in range(num_chunks):
                 start_idx = chunk_idx * chunk_size
                 end_idx = min((chunk_idx + 1) * chunk_size, total_samples)
-                
+
                 # Читаем чанк через slice
                 chunk = (
                     pl.scan_parquet(train_data_str)
                     .slice(start_idx, chunk_size)
                     .collect()
                 )
-                
+
                 log_message(f"Чанк {chunk_idx + 1}/{num_chunks} ({len(chunk)} строк)")
 
                 success, booster = self._process_chunk(
@@ -1785,6 +1785,7 @@ class ModelRecommender:
         except Exception as e:
             log_message(f"ОШИБКА при чтении чанков: {e}")
             import traceback
+
             log_message(f"Трассировка: {traceback.format_exc()}")
             return None
 
