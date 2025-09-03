@@ -51,13 +51,13 @@ tqdm.pandas()
 
 MAX_FILES = 0  # сколько файлов берем в работу. 0 - все
 MAX_ROWS = 0  # сколько строк для каждой группы берем в работу. 0 - все
-EMB_LENGHT = 200  # сколько частей от исходного эмбединга брать
+EMB_LENGHT = 250  # сколько частей от исходного эмбединга брать
 
 # обучение
 ITER_N = 2_000  # число эпох для обучения
-EARLY_STOP = 10  # ранняя остановка обучения
+EARLY_STOP = 20  # ранняя остановка обучения
 VERBOSE_N = 10  # как часть выводить сведения об обучении
-CHUNK_SIZE = 100_000  # Размер чанка для инкрементального обучения
+CHUNK_SIZE = 50_000  # Размер чанка для инкрементального обучения
 
 
 def find_parquet_files(folder):
@@ -610,6 +610,14 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
         log_message(f"Ошибка удаления директории: {e}")
 
     log_message("Обучение завершено!")
+
+    # Сохраняем обученную модель
+    model_dir = "/home/root6/python/e_cup/rec_system/src/models/"
+    os.makedirs(model_dir, exist_ok=True)
+    model_path = os.path.join(model_dir, "als_model.pt")
+
+    torch.save(als_model.state_dict(), model_path)
+    log_message(f"als_model сохранен: {model_path}")
     return als_model, user_map, item_map
 
 
@@ -1628,7 +1636,7 @@ class ModelRecommender:
             start_idx = chunk_idx * chunk_size
             end_idx = min((chunk_idx + 1) * chunk_size, total_samples)
             chunk_data = train_data.iloc[start_idx:end_idx].copy()
-            log_message(f"📦 Чанк {chunk_idx+1}/{num_chunks} ({len(chunk_data)} строк)")
+            log_message(f"Чанк {chunk_idx+1}/{num_chunks} ({len(chunk_data)} строк)")
 
             success, booster = self._process_chunk(
                 chunk_data, params, booster, MODEL_PATH, val_data
@@ -2921,7 +2929,7 @@ if __name__ == "__main__":
 
         # Проверяем наличие данных и признаков перед обучением
         if not train_df.empty and getattr(recommender, "feature_columns", None):
-            model = recommender.train(train_df, val_df)
+            model = recommender.train(train_df, val_df, chunk_size=CHUNK_SIZE)
         else:
             log_message("❌ Нельзя обучать: нет данных или признаков")
 
@@ -2968,7 +2976,7 @@ if __name__ == "__main__":
         save_data = {
             "model": recommender.model,
             "feature_columns": recommender.feature_columns,
-            "als_model": model,
+            "als_model": als_model,
             "user_map": user_map,
             "item_map": item_map,
             "inv_item_map": inv_item_map,
