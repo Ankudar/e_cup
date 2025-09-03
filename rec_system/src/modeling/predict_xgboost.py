@@ -155,7 +155,7 @@ def build_candidates_for_user_fast(
             item_weights[item_action] = item_weights.get(item_action, 0) + 1
 
     cands = set()
-    recent_items = list(excluded_items)[:100]
+    recent_items = list(excluded_items)[:30]
 
     # 1. Сопутствующие товары
     for item_id in recent_items:
@@ -170,7 +170,7 @@ def build_candidates_for_user_fast(
                         return list(cands)
 
     # 2. Товары из категорий
-    for item_id in recent_items[:100]:
+    for item_id in recent_items[:30]:
         cat = item_to_cat.get(item_id)
         if cat and cat in cat_to_items:
             weight = item_weights.get(item_id, 1)
@@ -341,7 +341,6 @@ def main():
                 header_written = True
                 recommendations.clear()
                 gc.collect()
-                log_message(f"Обработано {processed} пользователей")
 
     if recommendations:
         save_recommendations_to_csv(

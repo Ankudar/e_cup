@@ -21,7 +21,6 @@ from pathlib import Path
 import dask
 import dask.dataframe as dd
 import joblib
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -52,13 +51,13 @@ tqdm.pandas()
 
 MAX_FILES = 0  # сколько файлов берем в работу. 0 - все
 MAX_ROWS = 0  # сколько строк для каждой группы берем в работу. 0 - все
-EMB_LENGHT = 100  # сколько частей от исходного эмбединга брать
+EMB_LENGHT = 200  # сколько частей от исходного эмбединга брать
 
 # обучение
 ITER_N = 2_000  # число эпох для обучения
-EARLY_STOP = 20  # ранняя остановка обучения
-VERBOSE_N = 50  # как часть выводить сведения об обучении
-CHUNK_SIZE = 100_000_000  # Размер чанка для инкрементального обучения
+EARLY_STOP = 10  # ранняя остановка обучения
+VERBOSE_N = 10  # как часть выводить сведения об обучении
+CHUNK_SIZE = 100_000  # Размер чанка для инкрементального обучения
 
 
 def find_parquet_files(folder):
@@ -2684,9 +2683,9 @@ if __name__ == "__main__":
             f"Построение дополнительных данных завершено за {timedelta(seconds=stage_time)}"
         )
 
-        # === ПРЕДВАРИТЕЛЬНЫЙ РАСЧЕТ ПРИЗНАКОВ ДЛЯ LGBM ===
+        # === ПРЕДВАРИТЕЛЬНЫЙ РАСЧЕТ ПРИЗНАКОВ ===
         stage_start = time.time()
-        log_message("=== ПРЕДВАРИТЕЛЬНЫЙ РАСЧЕТ ПРИЗНАКОВ ДЛЯ LGBM ===")
+        log_message("=== ПРЕДВАРИТЕЛЬНЫЙ РАСЧЕТ ПРИЗНАКОВ ===")
 
         # User features - используем ТОЛЬКО тренировочные данные!
         user_start = time.time()
@@ -2932,13 +2931,13 @@ if __name__ == "__main__":
         log_message(f"Обучение модели завершено за {timedelta(seconds=stage_time)}")
 
         # === ОЦЕНКА МОДЕЛИ ===
-        stage_start = time.time()
-        log_message("=== ОЦЕНКА МОДЕЛИ ===")
-        train_ndcg = recommender.evaluate(train_df)
-        val_ndcg = recommender.evaluate(val_df)
+        # stage_start = time.time()
+        # log_message("=== ОЦЕНКА МОДЕЛИ ===")
+        # train_ndcg = recommender.evaluate(train_df)
+        # val_ndcg = recommender.evaluate(val_df)
 
-        log_message(f"NDCG@100 train: {train_ndcg:.4f}")
-        log_message(f"NDCG@100 val: {val_ndcg:.4f}")
+        # log_message(f"NDCG@100 train: {train_ndcg:.4f}")
+        # log_message(f"NDCG@100 val: {val_ndcg:.4f}")
         # stage_time = time.time() - stage_start
         # log_message(f"Оценка модели завершена за {timedelta(seconds=stage_time)}")
 
@@ -2967,7 +2966,7 @@ if __name__ == "__main__":
         stage_start = time.time()
         log_message("=== СОХРАНЕНИЕ МОДЕЛИ И ПРИЗНАКОВ ===")
         save_data = {
-            "lgbm_model": recommender.model,
+            "model": recommender.model,
             "feature_columns": recommender.feature_columns,
             "als_model": model,
             "user_map": user_map,
