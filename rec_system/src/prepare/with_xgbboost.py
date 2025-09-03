@@ -50,14 +50,14 @@ warnings.filterwarnings(
 tqdm.pandas()
 
 MAX_FILES = 0  # сколько файлов берем в работу. 0 - все
-MAX_ROWS = 0  # сколько строк для каждой группы берем в работу. 0 - все
-EMB_LENGHT = 250  # сколько частей от исходного эмбединга брать
+MAX_ROWS = 1_000_000  # сколько строк для каждой группы берем в работу. 0 - все
+EMB_LENGHT = 10  # 150  # сколько частей от исходного эмбединга брать
 
 # обучение
 ITER_N = 2_000  # число эпох для обучения
-EARLY_STOP = 20  # ранняя остановка обучения
-VERBOSE_N = 10  # как часть выводить сведения об обучении
-CHUNK_SIZE = 50_000  # Размер чанка для инкрементального обучения
+EARLY_STOP = 50  # ранняя остановка обучения
+VERBOSE_N = 10  # как часто выводить сведения об обучении
+CHUNK_SIZE = 200_000  # размер чанка для инкрементального обучения
 
 
 def find_parquet_files(folder):
@@ -304,7 +304,7 @@ def prepare_interactions(
     log_message("Формируем матрицу взаимодействий по батчам...")
 
     if action_weights is None:
-        action_weights = {"page_view": 2, "favorite": 5, "to_cart": 10}
+        action_weights = {"page_view": 1, "favorite": 5, "to_cart": 10}
 
     os.makedirs(output_dir, exist_ok=True)
     batch_files = []
@@ -335,7 +335,7 @@ def prepare_interactions(
         end_idx = min(start + batch_size, n_rows)
         batch = train_orders_df.iloc[start:end_idx].copy()
 
-        # Эффективное вычисление временных факторов
+        # вычисление временных факторов
         days_ago = (ref_time - batch["created_timestamp"]).dt.days.clip(lower=1)
         time_factor = np.log1p(days_ago / scale_days)
 
@@ -376,12 +376,11 @@ def prepare_interactions(
         tracker_files.append(batch_path)
 
         if os.path.exists(batch_path) and not force_recreate:
-            log_message(f"✅ Tracker файл {file_idx} уже обработан, пропускаем")
+            log_message(f"Tracker файл {file_idx} уже обработан, пропускаем")
             batch_files.append(batch_path)
             continue
 
         try:
-            # Читаем только необходимые колонки
             part = pd.read_parquet(
                 file_path, columns=["user_id", "item_id", "timestamp", "action_type"]
             )
@@ -434,7 +433,7 @@ def prepare_interactions(
             gc.collect()
 
         except Exception as e:
-            log_message(f"❌ Ошибка обработки tracker файла {file_path}: {e}")
+            log_message(f"Ошибка обработки tracker файла {file_path}: {e}")
             continue
 
     # Проверяем целостность
@@ -442,9 +441,9 @@ def prepare_interactions(
     missing_files = [f for f in expected_files if not os.path.exists(f)]
 
     if missing_files:
-        log_message(f"⚠️  Отсутствуют {len(missing_files)} файлов")
+        log_message(f"Отсутствуют {len(missing_files)} файлов")
     else:
-        log_message("✅ Все файлы успешно созданы")
+        log_message("Все файлы успешно созданы")
 
     log_message(f"Всего файлов взаимодействий: {len(batch_files)}")
     return batch_files
@@ -453,7 +452,7 @@ def prepare_interactions(
 # -------------------- Глобальная популярность --------------------
 def compute_global_popularity(orders_df, cutoff_ts_info):
     """
-    Считает популярность товаров на основе ТОЛЬКО тренировочных заказов.
+    Считает популярность товаров на основе тренировочных заказов.
 
     Args:
         orders_df: Все заказы (до split)
@@ -522,7 +521,7 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
         f"Маппинги построены. Уников: users={len(user_map)}, items={len(item_map)}"
     )
 
-    # 💾 Сохраняем item_map.pkl
+    # Сохраняем item_map.pkl
     map_dir = "/home/root6/python/e_cup/rec_system/data/processed/"
     os.makedirs(map_dir, exist_ok=True)
     item_map_path = os.path.join(map_dir, "item_map.pkl")
@@ -622,7 +621,7 @@ def train_als(interactions_files, n_factors=64, reg=1e-3, device="cuda"):
 
 
 def build_copurchase_map(
-    train_orders_df, min_co_items=2, top_n=20, device="cuda", max_items=1000
+    train_orders_df, min_co_items=2, top_n=30, device="cuda", max_items=2000
 ):
     """
     строим словарь совместных покупок для топ-N товаров
@@ -883,7 +882,7 @@ def save_model(
     with open(path, "wb") as f:
         pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    log_message(f"✅ Модель сохранена: {path}")
+    log_message(f"Модель сохранена: {path}")
 
 
 # -------------------- Метрики --------------------
@@ -1296,9 +1295,9 @@ class ModelRecommender:
         if hasattr(self, "feature_columns"):
             missing = [f for f in self.feature_columns if f not in data.columns]
             if missing:
-                log_message(f"❌ Отсутствуют признаки: {missing}")
+                log_message(f"Отсутствуют признаки: {missing}")
             else:
-                log_message(f"✅ Все признаки присутствуют")
+                log_message(f"Все признаки присутствуют")
 
         # Статистика по целевой переменной
         if "target" in data.columns:
@@ -1330,7 +1329,6 @@ class ModelRecommender:
         item_features_dict=None,
         embeddings_dict=None,
         sample_fraction=0.1,
-        negatives_per_positive=0,
         val_split_ratio=0.2,
     ):
         log_message("Подготовка данных для модели (streaming, polars lazy, батчи)...")
@@ -1381,7 +1379,7 @@ class ModelRecommender:
 
             return emb_feats_lazy, emb_feat_cols
 
-        # --- 1. Подготовка train заказов ---
+        # --- 1. Подготовка ТОЛЬКО train заказов ---
         train_orders_pl = (
             pl.from_pandas(train_orders_df)
             .lazy()
@@ -1394,7 +1392,7 @@ class ModelRecommender:
             )
         )
 
-        # --- 2. Подготовка test заказов (если есть) ---
+        # --- 2. Подготовка test заказов (ОТДЕЛЬНО, не смешивать!) ---
         if test_orders_df is not None and len(test_orders_df) > 0:
             test_orders_pl = (
                 pl.from_pandas(test_orders_df)
@@ -1407,23 +1405,48 @@ class ModelRecommender:
                     ]
                 )
             )
-            all_orders_pl = pl.concat([train_orders_pl, test_orders_pl])
+            # Сохраняем тестовые заказы отдельно для будущего использования
+            test_max_ts = (
+                test_orders_pl.select(pl.max("created_timestamp")).collect().item()
+            )
+            log_message(f"Максимальная дата тестовых заказов: {test_max_ts}")
         else:
-            all_orders_pl = train_orders_pl
-            log_message("Тестовые заказы отсутствуют, используем только тренировочные")
+            test_orders_pl = None
+            log_message("Тестовые заказы отсутствуют")
 
-        validate_item_ids(all_orders_pl, "all_orders")
+        # --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: используем ТОЛЬКО train заказы для разделения ---
+        timestamp_stats = train_orders_pl.select(
+            [
+                pl.max("created_timestamp").alias("max_ts"),
+                pl.min("created_timestamp").alias("min_ts"),
+            ]
+        ).collect()
 
-        # --- 3. Подготовка ВСЕХ взаимодействий ---
-        all_inter_files = train_interactions_files + (
-            test_interactions_files if test_interactions_files else []
+        max_ts = timestamp_stats["max_ts"][0]
+        min_ts = timestamp_stats["min_ts"][0]
+        split_ts = min_ts + (max_ts - min_ts) * (1 - val_split_ratio)
+
+        log_message(
+            f"Разделение ТРЕНИРОВОЧНЫХ заказов по времени: {min_ts} -> {split_ts} (train) | {split_ts} -> {max_ts} (val)"
         )
-        all_inter_lazy = pl.concat(
+
+        orders_train = train_orders_pl.filter(pl.col("created_timestamp") <= split_ts)
+        orders_val = train_orders_pl.filter(pl.col("created_timestamp") > split_ts)
+
+        # --- 3. Подготовка ВЗАИМОДЕЙСТВИЙ: только из тренировочного периода ---
+        # Максимальная дата ТРЕНИРОВОЧНЫХ заказов
+        max_train_ts = (
+            train_orders_pl.select(pl.max("created_timestamp")).collect().item()
+        )
+        log_message(f"Максимальная дата тренировочных заказов: {max_train_ts}")
+
+        # Загружаем только тренировочные взаимодействия
+        train_inter_lazy = pl.concat(
             [
                 pl.scan_parquet(str(f)).select(
                     ["user_id", "item_id", "timestamp", "weight"]
                 )
-                for f in all_inter_files
+                for f in train_interactions_files
             ]
         ).with_columns(
             [
@@ -1433,61 +1456,128 @@ class ModelRecommender:
             ]
         )
 
-        validate_item_ids(all_inter_lazy, "all_inter")
+        # ФИЛЬТРУЕМ: только взаимодействия ДО максимальной даты тренировочных заказов
+        safe_interactions = train_inter_lazy.filter(pl.col("timestamp") <= max_train_ts)
 
-        # --- 4. Объединяем заказы и взаимодействия ---
-        all_merged = all_orders_pl.join(
-            all_inter_lazy, on=["user_id", "item_id"], how="left"
-        ).with_columns(
-            [
-                pl.col("timestamp")
-                .cast(pl.Datetime("us"))
-                .fill_null(pl.col("created_timestamp") - pl.duration(days=1)),
-                pl.col("weight").cast(pl.Float32).fill_null(0.0),
-                pl.when(pl.col("last_status") == "delivered_orders")
-                .then(1)
-                .otherwise(0)
-                .alias("target"),
-            ]
-        )
-
-        # --- 5. Разделяем на train/val по timestamp ---
-        # Находим граничную дату для разделения
-        timestamp_stats = all_merged.select(
-            [
-                pl.col("timestamp").max().alias("max_ts"),
-                pl.col("timestamp").min().alias("min_ts"),
-            ]
-        ).collect()
-
-        max_ts = timestamp_stats["max_ts"][0]
-        min_ts = timestamp_stats["min_ts"][0]
-        split_ts = min_ts + (max_ts - min_ts) * (1 - val_split_ratio)
-
-        log_message(
-            f"Разделение данных по времени: {min_ts} -> {split_ts} (train) | {split_ts} -> {max_ts} (val)"
-        )
-
-        # Разделяем данные
-        train_merged = all_merged.filter(pl.col("timestamp") <= split_ts)
-        val_merged = all_merged.filter(pl.col("timestamp") > split_ts)
-
-        # --- 6. User признаки ---
-        user_feats_lazy, user_feat_cols = None, []
-        if user_features_dict:
-            user_feats_lazy = pl.LazyFrame(
+        # --- 4. Валидация: проверяем, что нет взаимодействий из тестового периода ---
+        if test_interactions_files:
+            test_inter_lazy = pl.concat(
                 [
-                    {"user_id": str(k), **(v if isinstance(v, dict) else {})}
-                    for k, v in user_features_dict.items()
+                    pl.scan_parquet(str(f)).select(
+                        ["user_id", "item_id", "timestamp", "weight"]
+                    )
+                    for f in test_interactions_files
                 ]
             )
-            user_feat_cols = [
-                c for c in user_feats_lazy.collect_schema().names() if c != "user_id"
-            ]
 
-        # --- 7. Item признаки ---
+            # Проверяем, что тестовые взаимодействия не смешались
+            test_min_ts = test_inter_lazy.select(pl.min("timestamp")).collect().item()
+            if test_min_ts <= max_train_ts:
+                log_message(
+                    "ВНИМАНИЕ: Тестовые взаимодействия пересекаются с тренировочным периодом!"
+                )
+            else:
+                log_message("Тестовые взаимодействия отделены от тренировочных")
+
+        validate_item_ids(safe_interactions, "safe_interactions")
+
+        # --- 5. Добавляем признаки ТОЛЬКО из прошлого ---
+        def add_safe_features(orders_df, interactions_df):
+            """Добавляет только те взаимодействия, которые были ДО заказа"""
+            result = (
+                orders_df.join(
+                    interactions_df,
+                    on=["user_id", "item_id"],
+                    how="left",
+                )
+                .filter(
+                    # Фильтруем: либо взаимодействие было ДО заказа, либо его нет вообще
+                    (pl.col("timestamp") < pl.col("created_timestamp"))
+                    | (pl.col("timestamp").is_null())
+                )
+                .with_columns(
+                    [
+                        pl.col("timestamp")
+                        .cast(pl.Datetime("us"))
+                        .fill_null(pl.col("created_timestamp") - pl.duration(days=1)),
+                        pl.col("weight").cast(pl.Float32).fill_null(0.0),
+                        pl.when(pl.col("last_status") == "delivered_orders")
+                        .then(1)
+                        .otherwise(0)
+                        .alias("target"),
+                    ]
+                )
+            )
+            return result
+
+        # Создаем финальные датафреймы
+        train_merged = add_safe_features(orders_train, safe_interactions)
+        val_merged = add_safe_features(orders_val, safe_interactions)
+
+        # --- 6. Валидация на утечки ---
+        def check_leakage(df, dataset_name):
+            """Проверяет наличие утечек данных из будущего"""
+            leakage_count = (
+                df.filter(pl.col("timestamp") > pl.col("created_timestamp"))
+                .select(pl.len())
+                .collect()
+                .item()
+            )
+
+            log_message(f"Потенциальных утечек в {dataset_name}: {leakage_count}")
+
+            if leakage_count > 0:
+                log_message("Обнаружены взаимодействия ПОСЛЕ заказов!")
+                leakage_samples = (
+                    df.filter(pl.col("timestamp") > pl.col("created_timestamp"))
+                    .select(["user_id", "item_id", "timestamp", "created_timestamp"])
+                    .limit(3)
+                    .collect()
+                )
+                log_message(f"Примеры утечек:\n{leakage_samples}")
+            else:
+                log_message(f"{dataset_name}: Утечек не обнаружено")
+
+        # Проверяем оба набора
+        log_message(f"check_leakage train")
+        check_leakage(train_merged, "train")
+
+        log_message(f"check_leakage val")
+        check_leakage(val_merged, "val")
+
+        # --- 7. User признаки (только на основе тренировочных данных) ---
+        log_message("Формируем User признаки")
+        user_feats_lazy, user_feat_cols = None, []
+        if user_features_dict:
+            # СОЗДАЕМ LAZY FRAME С USER FEATURES И ДЕЛАEM JOIN
+            user_feats_data = []
+            for user_id, feats in user_features_dict.items():
+                user_feats_data.append(
+                    {
+                        "user_id": str(user_id),
+                        **(feats if isinstance(feats, dict) else {}),
+                    }
+                )
+
+            if user_feats_data:
+                user_feats_lazy = pl.LazyFrame(user_feats_data)
+                # Фильтруем только тех пользователей, которые есть в train через JOIN
+                user_feats_lazy = user_feats_lazy.join(
+                    train_merged.select("user_id").unique(),
+                    on="user_id",
+                    how="semi",  # ← ТОЛЬКО фильтрация, без дублирования данных
+                )
+                user_feat_cols = [
+                    c
+                    for c in user_feats_lazy.collect_schema().names()
+                    if c != "user_id"
+                ]
+
+        # --- 8. Item признаки (только на основе тренировочных данных) ---
+        log_message("Формируем Item признаки")
         item_feats_lazy, item_feat_cols = None, []
         if item_features_dict:
+            # СОЗДАЕМ LAZY FRAME И ФИЛЬТРУЕМ ЧЕРЕЗ JOIN
             items_data = []
             for item_id, feats in item_features_dict.items():
                 if isinstance(feats, np.ndarray):
@@ -1498,22 +1588,42 @@ class ModelRecommender:
                     feat_dict = feats.copy()
                 else:
                     feat_dict = {}
-
                 feat_dict["item_id"] = str(item_id)
                 items_data.append(feat_dict)
 
-            item_feats_lazy = pl.LazyFrame(items_data).with_columns(
-                pl.col("item_id").cast(pl.Utf8)
-            )
-            validate_item_ids(item_feats_lazy, "item_feats")
-            item_feat_cols = [
-                c for c in item_feats_lazy.collect_schema().names() if c != "item_id"
-            ]
+            if items_data:
+                item_feats_lazy = pl.LazyFrame(items_data).with_columns(
+                    pl.col("item_id").cast(pl.Utf8)
+                )
+                # Фильтруем только товары из train через JOIN
+                item_feats_lazy = item_feats_lazy.join(
+                    train_merged.select("item_id").unique(),
+                    on="item_id",
+                    how="semi",  # ← быстрая фильтрация
+                )
+                validate_item_ids(item_feats_lazy, "item_feats")
+                item_feat_cols = [
+                    c
+                    for c in item_feats_lazy.collect_schema().names()
+                    if c != "item_id"
+                ]
 
-        # --- 8. Эмбеддинги ---
-        emb_feats_lazy, emb_feat_cols = prepare_embeddings(embeddings_dict)
+        # --- 9. Эмбеддинги (только для тренировочных товаров) ---
+        log_message("Формируем Эмбеддинги")
+        emb_feats_lazy, emb_feat_cols = None, []
+        if embeddings_dict:
+            # СОЗДАЕМ ВСЕ эмбеддинги, фильтруем через JOIN позже
+            emb_feats_lazy, emb_feat_cols = prepare_embeddings(embeddings_dict)
+            if emb_feats_lazy is not None:
+                # Фильтруем только товары из train через JOIN
+                emb_feats_lazy = emb_feats_lazy.join(
+                    train_merged.select("item_id").unique(),
+                    on="item_id",
+                    how="semi",  # ← быстрая фильтрация
+                )
 
-        # --- 9. Мержим признаки для train ---
+        # --- 10. Мержим признаки ---
+        log_message(f"Объединение признаков в train")
         train_with_features = train_merged
         if user_feats_lazy is not None:
             train_with_features = train_with_features.join(
@@ -1528,7 +1638,7 @@ class ModelRecommender:
                 emb_feats_lazy, on="item_id", how="left"
             )
 
-        # --- 10. Мержим признаки для val ---
+        log_message(f"Объединение признаков в val")
         val_with_features = val_merged
         if user_feats_lazy is not None:
             val_with_features = val_with_features.join(
@@ -1544,44 +1654,44 @@ class ModelRecommender:
             )
 
         # --- 11. Заполняем NaN ---
-        # Для train
+        log_message(f"Заполняем NaN")
         schema = train_with_features.collect_schema()
         numeric_cols = [
             c
             for c, dtype in schema.items()
             if dtype.is_numeric() and c != "target" and c not in ["user_id", "item_id"]
         ]
+
         train_with_features = train_with_features.with_columns(
             [pl.col(c).fill_null(0.0) for c in numeric_cols]
         )
-
-        # Для val
-        val_schema = val_with_features.collect_schema()
-        val_numeric_cols = [
-            c
-            for c, dtype in val_schema.items()
-            if dtype.is_numeric() and c != "target" and c not in ["user_id", "item_id"]
-        ]
-        val_final = val_with_features.with_columns(
-            [pl.col(c).fill_null(0.0) for c in val_numeric_cols]
+        val_with_features = val_with_features.with_columns(
+            [pl.col(c).fill_null(0.0) for c in numeric_cols]
         )
 
         # --- 12. Сохраняем ---
+        log_message(f"Сохранение паркета для train")
         train_with_features.sink_parquet(
             str(train_out_dir / "train.parquet"), row_group_size=100_000
         )
-        val_final.sink_parquet(str(val_out_dir / "val.parquet"), row_group_size=100_000)
+
+        log_message(f"Сохранение паркета для val")
+        val_with_features.sink_parquet(
+            str(val_out_dir / "val.parquet"), row_group_size=100_000
+        )
 
         # feature_columns
         self.feature_columns = user_feat_cols + item_feat_cols + emb_feat_cols
 
         # Собираем статистику
-        train_count = train_with_features.select(pl.count()).collect().item()
-        val_count = val_final.select(pl.count()).collect().item()
+        train_count = train_with_features.select(pl.len()).collect().item()
+        val_count = val_with_features.select(pl.len()).collect().item()
 
         log_message(
-            f"✅ Данные подготовлены. Train: {train_count} строк, Val: {val_count} строк"
+            f"Данные подготовлены БЕЗ УТЕЧЕК. Train: {train_count} строк, Val: {val_count} строк"
         )
+        log_message(f"Признаки: {self.feature_columns}")
+
         return train_out_dir, val_out_dir
 
     def _get_copurchase_strength(self, item_id):
@@ -1602,9 +1712,11 @@ class ModelRecommender:
         # Временная реализация - возвращаем общую силу
         return self._get_copurchase_strength(item_id)
 
-    def train(self, train_data, val_data=None, params=None, chunk_size=1_000_000):
+    def train(
+        self, train_data_path, val_data_path=None, params=None, chunk_size=1_000_000
+    ):
         """
-        Инкрементальное обучение с обработкой данных чанками
+        Инкрементальное обучение с чтением данных напрямую из parquet
         """
         MODEL_PATH = "/home/root6/python/e_cup/rec_system/src/models/model.json"
 
@@ -1617,71 +1729,117 @@ class ModelRecommender:
                 "lambda": 3,
                 "subsample": 0.8,
                 "colsample_bytree": 0.8,
-                "tree_method": "hist",  # быстрее и меньше памяти
+                "tree_method": "hist",
                 "random_state": 42,
                 "nthread": 8,
             }
 
         if not hasattr(self, "feature_columns") or not self.feature_columns:
-            log_message("❌ ОШИБКА: Нет признаков для обучения!")
+            log_message("ОШИБКА: Нет признаков для обучения!")
             return None
 
-        total_samples = len(train_data)
-        log_message(f"📊 Всего данных для обработки: {total_samples} строк")
+        train_data_str = "/home/root6/python/e_cup/rec_system/data/processed/train_streaming/train.parquet"
+        val_data_str = "/home/root6/python/e_cup/rec_system/data/processed/val_streaming/val.parquet"
 
-        num_chunks = (total_samples + chunk_size - 1) // chunk_size
+        # Читаем общее количество строк без загрузки в память
+        try:
+            total_samples = (
+                pl.scan_parquet(train_data_str).select(pl.len()).collect().item()
+            )
+            log_message(f"Всего данных для обработки: {total_samples} строк")
+        except Exception as e:
+            log_message(f"ОШИБКА при чтении parquet файла: {e}")
+            log_message(f"Путь: {train_data_str}")
+            return None
 
         booster = None
-        for chunk_idx in range(num_chunks):
-            start_idx = chunk_idx * chunk_size
-            end_idx = min((chunk_idx + 1) * chunk_size, total_samples)
-            chunk_data = train_data.iloc[start_idx:end_idx].copy()
-            log_message(f"Чанк {chunk_idx+1}/{num_chunks} ({len(chunk_data)} строк)")
+        chunk_idx = 0
 
-            success, booster = self._process_chunk(
-                chunk_data, params, booster, MODEL_PATH, val_data
-            )
-            if not success:
-                log_message("❌ Ошибка при обработке чанка, прерываем обучение")
-                return None
+        # Итеративное чтение чанков через scan_parquet + slice
+        try:
+            num_chunks = (total_samples + chunk_size - 1) // chunk_size
+            
+            for chunk_idx in range(num_chunks):
+                start_idx = chunk_idx * chunk_size
+                end_idx = min((chunk_idx + 1) * chunk_size, total_samples)
+                
+                # Читаем чанк через slice
+                chunk = (
+                    pl.scan_parquet(train_data_str)
+                    .slice(start_idx, chunk_size)
+                    .collect()
+                )
+                
+                log_message(f"Чанк {chunk_idx + 1}/{num_chunks} ({len(chunk)} строк)")
 
-            booster.save_model(MODEL_PATH)
-            log_message(f"💾 Модель сохранена после чанка {chunk_idx+1}")
+                success, booster = self._process_chunk(
+                    chunk, params, booster, MODEL_PATH, val_data_str
+                )
+                if not success:
+                    log_message("Ошибка при обработке чанка, прерываем обучение")
+                    return None
+
+                booster.save_model(MODEL_PATH)
+                log_message(f"Модель сохранена после чанка {chunk_idx + 1}")
+
+        except Exception as e:
+            log_message(f"ОШИБКА при чтении чанков: {e}")
+            import traceback
+            log_message(f"Трассировка: {traceback.format_exc()}")
+            return None
 
         self.model = booster
 
-        if val_data is not None:
-            val_score = self.evaluate(val_data, k=100)
-            log_message(f"🎯 Финальный NDCG@100 на валидации: {val_score:.6f}")
+        if val_data_str is not None:
+            try:
+                val_score = self.evaluate(val_data_str, k=100)
+                log_message(f"Финальный NDCG@100 на валидации: {val_score:.6f}")
+            except Exception as e:
+                log_message(f"ОШИБКА при оценке модели: {e}")
 
         return self.model
 
-    def _process_chunk(self, chunk_data, params, booster, model_path, val_data=None):
+    def _process_chunk(
+        self, chunk_data, params, booster, model_path, val_data_path=None
+    ):
         """Обработка и обучение на одном чанке"""
         try:
-            required_columns = self.feature_columns + ["target", "user_id"]
-            chunk_data = chunk_data[required_columns].copy()
+            # Конвертируем Polars DataFrame в pandas для совместимости с XGBoost
+            chunk_pd = chunk_data.to_pandas()
+            required_columns = self.feature_columns + ["target"]
 
-            for col in chunk_data.columns:
-                if chunk_data[col].dtype == "float64":
-                    chunk_data[col] = chunk_data[col].astype("float32")
-                elif chunk_data[col].dtype == "int64":
-                    chunk_data[col] = chunk_data[col].astype("int32")
+            # Проверяем наличие всех необходимых колонок
+            missing_cols = set(required_columns) - set(chunk_pd.columns)
+            if missing_cols:
+                log_message(f"Отсутствующие колонки в чанке: {missing_cols}")
+                return False, booster
 
-            X_chunk = chunk_data[self.feature_columns].values
-            y_chunk = chunk_data["target"].values
+            chunk_pd = chunk_pd[required_columns].copy()
+
+            # Оптимизация типов данных
+            for col in chunk_pd.columns:
+                if chunk_pd[col].dtype == "float64":
+                    chunk_pd[col] = chunk_pd[col].astype("float32")
+                elif chunk_pd[col].dtype == "int64":
+                    chunk_pd[col] = chunk_pd[col].astype("int32")
+
+            X_chunk = chunk_pd[self.feature_columns].values
+            y_chunk = chunk_pd["target"].values
+
             dtrain = xgb.DMatrix(
                 X_chunk, label=y_chunk, feature_names=self.feature_columns
             )
 
-            # валидация
+            # Подготовка валидационных данных
             evals = []
-            if val_data is not None:
-                required_val = self.feature_columns + ["target", "user_id"]
-                val_data = val_data[required_val].copy()
+            if val_data_path is not None:  # ← проверяем не None
+                # Читаем валидационные данные
+                val_chunk = pl.read_parquet(val_data_path).to_pandas()
+                val_chunk = val_chunk[self.feature_columns + ["target"]].copy()
+
                 dval = xgb.DMatrix(
-                    val_data[self.feature_columns].values,
-                    label=val_data["target"].values,
+                    val_chunk[self.feature_columns].values,
+                    label=val_chunk["target"].values,
                     feature_names=self.feature_columns,
                 )
                 evals.append((dval, "val"))
@@ -1689,21 +1847,23 @@ class ModelRecommender:
             booster = xgb.train(
                 params,
                 dtrain,
-                num_boost_round=200,
+                num_boost_round=50,
                 evals=evals if evals else None,
-                early_stopping_rounds=20 if evals else None,
+                early_stopping_rounds=10 if evals else None,
                 xgb_model=booster if booster is not None else None,
-                verbose_eval=50 if evals else False,
+                verbose_eval=20,
             )
 
-            del X_chunk, y_chunk, chunk_data, dtrain
-            if val_data is not None:
+            # Очистка памяти
+            del X_chunk, y_chunk, chunk_pd, dtrain
+            if val_data_path is not None:
                 del dval
             gc.collect()
+
             return True, booster
 
         except Exception as e:
-            log_message(f"❌ Ошибка при обработке чанка: {e}")
+            log_message(f"Ошибка при обработке чанка: {e}")
             import traceback
 
             log_message(f"Трассировка: {traceback.format_exc()}")
@@ -1730,28 +1890,36 @@ class ModelRecommender:
                 ndcg_scores.append(dcg / idcg)
         return np.mean(ndcg_scores) if ndcg_scores else 0.0
 
-    def evaluate(self, data, k=100):
-        if self.model is None or len(data) == 0:
+    def evaluate(self, data_path, k=100):
+        """Оценка модели на данных из parquet файла"""
+        if self.model is None:
             return 0.0
-        required_cols = self.feature_columns + ["target", "user_id"]
-        data = data[required_cols].copy()
-        dtest = xgb.DMatrix(
-            data[self.feature_columns].values, feature_names=self.feature_columns
-        )
-        data["score"] = self.model.predict(dtest)
-        return self._calculate_ndcg_fast(data, data["user_id"], k=k)
 
-    def recommend(self, user_items_data, top_k=100):
-        data = user_items_data.copy()
-        dtest = xgb.DMatrix(
-            data[self.feature_columns].values, feature_names=self.feature_columns
-        )
-        data["score"] = self.model.predict(dtest)
-        recommendations = {
-            user_id: group.nlargest(top_k, "score")["item_id"].tolist()
-            for user_id, group in data.groupby("user_id")
-        }
-        return recommendations
+        # Используем прямой путь к файлу
+        eval_data_path = "/home/root6/python/e_cup/rec_system/data/processed/val_streaming/val.parquet"
+
+        try:
+            # Читаем данные
+            data = pl.read_parquet(eval_data_path).to_pandas()
+            required_cols = self.feature_columns + ["target", "user_id"]
+
+            # Проверяем наличие колонок
+            missing_cols = set(required_cols) - set(data.columns)
+            if missing_cols:
+                log_message(f"Отсутствующие колонки в данных: {missing_cols}")
+                return 0.0
+
+            data = data[required_cols].copy()
+
+            dtest = xgb.DMatrix(
+                data[self.feature_columns].values, feature_names=self.feature_columns
+            )
+            data["score"] = self.model.predict(dtest)
+            return self._calculate_ndcg_fast(data, data["user_id"], k=k)
+
+        except Exception as e:
+            log_message(f"ОШИБКА при оценке: {e}")
+            return 0.0
 
 
 def build_user_features_dict(interactions_files, orders_df, device="cuda"):
@@ -2165,52 +2333,6 @@ def save_pca_models(pca_model, scaler, base_path):
     log_message(f"Модель Scaler сохранена: {scaler_path}")
 
 
-def load_pca_models(base_path):
-    """
-    Загружает модели PCA и StandardScaler
-
-    Args:
-        base_path: базовый путь для загрузки
-
-    Returns:
-        tuple: (pca_model, scaler)
-    """
-    pca_path = f"{base_path}_pca.pkl"
-    scaler_path = f"{base_path}_scaler.pkl"
-
-    pca_model = joblib.load(pca_path)
-    scaler = joblib.load(scaler_path)
-
-    log_message(f"Модель PCA загружена: {pca_path}")
-    log_message(f"Модель Scaler загружена: {scaler_path}")
-
-    return pca_model, scaler
-
-
-def transform_new_embeddings(new_embeddings, pca_model, scaler):
-    """
-    Трансформирует новые эмбеддинги с помощью обученных PCA и StandardScaler
-
-    Args:
-        new_embeddings: новые эмбеддинги (массив или список)
-        pca_model: обученная модель PCA
-        scaler: обученный StandardScaler
-
-    Returns:
-        array: трансформированные эмбеддинги
-    """
-    if isinstance(new_embeddings, list):
-        new_embeddings = np.array(new_embeddings)
-
-    # Стандартизация
-    new_scaled = scaler.transform(new_embeddings.reshape(1, -1))
-
-    # PCA трансформация
-    transformed = pca_model.transform(new_scaled)
-
-    return transformed[0]
-
-
 def analyze_embedding_variance(embeddings_dict, max_components=None):
     """
     Анализирует дисперсию эмбеддингов для выбора оптимального числа компонент PCA
@@ -2417,47 +2539,6 @@ def apply_pca_to_embeddings_streaming(
                     continue
 
     return embeddings_dict, pca, scaler
-
-
-def save_negatives_to_parquet(
-    interactions_df, all_items, out_dir, num_negatives=10, batch_size=50_000
-):
-    os.makedirs(out_dir, exist_ok=True)
-    rows, counter, part = [], 0, 0
-
-    for row in tqdm(interactions_df.iter_rows(named=True), desc="Saving negatives"):
-        u = row["user_id"]
-        pos_item = row["item_id"]
-        negatives = []
-        while len(negatives) < num_negatives:
-            candidate = all_items.sample(1).item()
-            if candidate != pos_item:
-                negatives.append(candidate)
-
-        for neg in negatives:
-            rows.append({"user_id": u, "item_id": neg, "label": 0})
-            counter += 1
-
-        if counter >= batch_size:
-            pl.DataFrame(rows).write_parquet(f"{out_dir}/negs_{part}.parquet")
-            rows.clear()
-            counter = 0
-            part += 1
-
-    if rows:
-        pl.DataFrame(rows).write_parquet(f"{out_dir}/negs_{part}.parquet")
-
-
-def make_timer_callback(log_every_sec=30):
-    last_log = {"time": time.time()}
-
-    def timer_callback(env):
-        now = time.time()
-        if now - last_log["time"] >= log_every_sec:
-            log_message(f"[Timer] Iter={env.iteration}")
-            last_log["time"] = now
-
-    return timer_callback
 
 
 # -------------------- Основной запуск --------------------
@@ -2790,7 +2871,6 @@ if __name__ == "__main__":
             item_features_dict=item_features_dict,  # обязательно передаем
             embeddings_dict=embeddings_dict,  # вот сюда эмбеддинги
             sample_fraction=config["sample_fraction"],
-            negatives_per_positive=0,
         )
 
         # --- Функция для подсчёта строк в parquet ---
@@ -2806,7 +2886,9 @@ if __name__ == "__main__":
             )
 
         # --- Логирование размеров train/val ---
+        log_message(f"Собираем паркет для трейна")
         train_parquet_pattern = "rec_system/data/processed/train_streaming/*.parquet"
+        log_message(f"Собираем паркет для вала")
         val_parquet_pattern = "rec_system/data/processed/val_streaming/*.parquet"
 
         train_len = parquet_len(train_parquet_pattern)
@@ -2844,7 +2926,7 @@ if __name__ == "__main__":
                 f"Пользователей с НЕнулевыми features: {users_with_real_features}"
             )
         else:
-            log_message("⚠️ user_features_dict ПУСТОЙ!")
+            log_message("user_features_dict ПУСТОЙ!")
 
         # --- Проверки item features ---
         log_message("--- ПРОВЕРКА ITEM FEATURES ---")
@@ -2867,7 +2949,7 @@ if __name__ == "__main__":
             log_message(f"Товаров с features: {items_with_features}")
             log_message(f"Товаров с НЕнулевыми features: {items_with_real_features}")
         else:
-            log_message("⚠️ item_features_dict ПУСТОЙ!")
+            log_message("item_features_dict ПУСТОЙ!")
 
         # --- Проверка эмбеддингов ---
         log_message("--- ПРОВЕРКА ЭМБЕДДИНГОВ ---")
@@ -2880,7 +2962,7 @@ if __name__ == "__main__":
             log_message(f"Эмбеддингов загружено: {len(embeddings_dict)}")
             log_message(f"Пример значений: {embedding[:5]}")
         else:
-            log_message("⚠️ embeddings_dict ПУСТОЙ!")
+            log_message("embeddings_dict ПУСТОЙ!")
 
         # --- Проверка co-purchase map ---
         log_message("--- ПРОВЕРКА CO-PURCHASE MAP ---")
@@ -2892,7 +2974,7 @@ if __name__ == "__main__":
             )
             log_message(f"Co-purchase записей: {len(copurchase_map)}")
         else:
-            log_message("⚠️ copurchase_map ПУСТОЙ!")
+            log_message("copurchase_map ПУСТОЙ!")
 
         # --- Проверка категорийных маппингов ---
         log_message("--- ПРОВЕРКА КАТЕГОРИЙНЫХ МАППИНГОВ ---")
@@ -2905,7 +2987,7 @@ if __name__ == "__main__":
             log_message(f"Товаров в маппинге: {len(item_to_cat)}")
             log_message(f"Категорий в маппинге: {len(cat_to_items)}")
         else:
-            log_message("⚠️ Категорийные маппинги ПУСТЫЕ!")
+            log_message("Категорийные маппинги ПУСТЫЕ!")
 
         stage_time = time.time() - stage_start
         log_message(f"Проверка признаков завершена за {timedelta(seconds=stage_time)}")
@@ -2925,13 +3007,13 @@ if __name__ == "__main__":
         if hasattr(recommender, "feature_columns"):
             log_message(f"Feature columns: {recommender.feature_columns}")
         else:
-            log_message("❌ Feature columns не определены!")
+            log_message("Feature columns не определены!")
 
         # Проверяем наличие данных и признаков перед обучением
         if not train_df.empty and getattr(recommender, "feature_columns", None):
             model = recommender.train(train_df, val_df, chunk_size=CHUNK_SIZE)
         else:
-            log_message("❌ Нельзя обучать: нет данных или признаков")
+            log_message("Нельзя обучать: нет данных или признаков")
 
         # model = recommender.train(train_df, val_df)
 
@@ -2976,7 +3058,6 @@ if __name__ == "__main__":
         save_data = {
             "model": recommender.model,
             "feature_columns": recommender.feature_columns,
-            "als_model": als_model,
             "user_map": user_map,
             "item_map": item_map,
             "inv_item_map": inv_item_map,

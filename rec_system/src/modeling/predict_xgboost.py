@@ -21,10 +21,10 @@ ARTIFACTS_PATH = "/home/root6/python/e_cup/rec_system/src/models/model.pkl"
 TEST_USERS_PATH = "/home/root6/python/e_cup/rec_system/data/raw/test_users/*.parquet"
 OUTPUT_PATH = "/home/root6/python/e_cup/rec_system/result/submission.csv"
 TOP_K = 100
-BATCH_USERS = 1000
+BATCH_USERS = 2000
 
 # Веса действий
-ACTION_WEIGHTS = {"page_view": 2, "favorite": 5, "to_cart": 10}
+ACTION_WEIGHTS = {"page_view": 1, "favorite": 5, "to_cart": 10}
 
 # ===== ЛОГИ =====
 logging.basicConfig(
@@ -78,9 +78,12 @@ def make_candidate_frame_batch(
         if not candidates:
             continue
 
-        # Фичи пользователя
+        # Фичи пользователя - проверяем наличие
         u = user_features_dict.get(user_id, {})
-        if isinstance(u, np.ndarray):
+        if u is None or (isinstance(u, dict) and len(u) == 0):
+            # Если нет фичей, создаем нулевые
+            u = {name: 0.0 for name in user_names}
+        elif isinstance(u, np.ndarray):
             u = {
                 name: float(u[idx]) if idx < len(u) else 0.0
                 for idx, name in enumerate(user_names)
@@ -93,7 +96,10 @@ def make_candidate_frame_batch(
         # Для всех кандидатов пользователя
         for iid in candidates:
             it = item_features_dict.get(iid, {})
-            if isinstance(it, np.ndarray):
+            if it is None or (isinstance(it, dict) and len(it) == 0):
+                # Если нет фичей товара, пропускаем или используем нулевые
+                continue
+            elif isinstance(it, np.ndarray):
                 it = {
                     name: float(it[idx]) if idx < len(it) else 0.0
                     for idx, name in enumerate(item_names)
@@ -138,59 +144,119 @@ def build_candidates_for_user_fast(
     user_history = recent_items_get(user_id, [])
 
     if not user_history:
-        return popular_items_array[:max_candidates].tolist()
+        # Для пользователей без истории - разнообразные популярные
+        start_idx = (user_id % 50) * (max_candidates // 2)
+        end_idx = start_idx + max_candidates
+        if end_idx > len(popular_items_array):
+            part1 = popular_items_array[start_idx:]
+            part2 = popular_items_array[: max_candidates - len(part1)]
+            return list(part1) + list(part2)
+        return popular_items_array[start_idx:end_idx].tolist()
 
-    excluded_items = set()
+    # Правильное разделение с весами
+    cart_items = []
+    favorite_items = []
+    viewed_items = []
     item_weights = {}
 
-    for item_action in user_history[:100]:
+    for item_action in user_history:
         if isinstance(item_action, tuple) and len(item_action) >= 2:
             item_id, action_type = item_action[0], item_action[1]
-            excluded_items.add(item_id)
-            item_weights[item_id] = item_weights.get(item_id, 0) + ACTION_WEIGHTS.get(
-                action_type, 1
-            )
+            weight = ACTION_WEIGHTS.get(action_type, 1)
+
+            if action_type == "to_cart":
+                cart_items.append((item_id, weight))
+            elif action_type == "favorite":
+                favorite_items.append((item_id, weight))
+            elif action_type == "page_view":
+                viewed_items.append((item_id, weight))
+
+            item_weights[item_id] = item_weights.get(item_id, 0) + weight
         else:
-            excluded_items.add(item_action)
+            viewed_items.append((item_action, 1))
             item_weights[item_action] = item_weights.get(item_action, 0) + 1
 
-    cands = set()
-    recent_items = list(excluded_items)[:30]
+    # Сортируем по весу (важные действия first)
+    cart_items.sort(key=lambda x: x[1], reverse=True)
+    favorite_items.sort(key=lambda x: x[1], reverse=True)
+    viewed_items.sort(key=lambda x: x[1], reverse=True)
 
-    # 1. Сопутствующие товары
-    for item_id in recent_items:
+    cands = []
+    excluded = set()
+
+    # 1. Товары из корзины (максимальный приоритет)
+    for item_id, weight in cart_items:
+        if item_id in item_map:
+            cands.append(item_id)
+            excluded.add(item_id)
+            if len(cands) >= max_candidates:
+                return cands
+
+    # 2. Избранные товары
+    for item_id, weight in favorite_items:
+        if item_id not in excluded and item_id in item_map:
+            cands.append(item_id)
+            excluded.add(item_id)
+            if len(cands) >= max_candidates:
+                return cands
+
+    # 3. Просмотренные товары (только с высоким весом)
+    for item_id, weight in viewed_items:
+        if weight >= 2 and item_id not in excluded and item_id in item_map:
+            cands.append(item_id)
+            excluded.add(item_id)
+            if len(cands) >= max_candidates:
+                return cands
+
+    # 4. Умные сопутствующие на основе весов
+    all_weighted_items = [
+        (item_id, weight)
+        for item_id, weight in cart_items + favorite_items
+        if weight > 1
+    ]
+
+    for item_id, weight in all_weighted_items[:20]:
         if item_id in copurchase_map:
-            weight = item_weights.get(item_id, 1)
-            n_to_take = min(15, int(10 * (weight / 5)))
-
+            n_to_take = min(15, 8 + int(weight))
             for candidate in copurchase_map[item_id][:n_to_take]:
-                if candidate not in excluded_items and candidate in item_map:
-                    cands.add(candidate)
+                if candidate not in excluded and candidate in item_map:
+                    cands.append(candidate)
+                    excluded.add(candidate)
                     if len(cands) >= max_candidates:
-                        return list(cands)
+                        return cands
 
-    # 2. Товары из категорий
-    for item_id in recent_items[:30]:
+    # 5. Товары из релевантных категорий
+    relevant_categories = {}
+    for item_id, weight in all_weighted_items[:15]:
         cat = item_to_cat.get(item_id)
-        if cat and cat in cat_to_items:
-            weight = item_weights.get(item_id, 1)
-            n_to_take = min(12, int(8 * (weight / 5)))
+        if cat:
+            relevant_categories[cat] = relevant_categories.get(cat, 0) + weight
 
+    sorted_categories = sorted(
+        relevant_categories.items(), key=lambda x: x[1], reverse=True
+    )
+
+    for cat, cat_weight in sorted_categories[:8]:
+        if cat in cat_to_items:
+            n_to_take = min(12, 5 + int(cat_weight / 2))
             for candidate in cat_to_items[cat][:n_to_take]:
-                if candidate not in excluded_items and candidate in item_map:
-                    cands.add(candidate)
+                if candidate not in excluded and candidate in item_map:
+                    cands.append(candidate)
+                    excluded.add(candidate)
                     if len(cands) >= max_candidates:
-                        return list(cands)
+                        return cands
 
-    # 3. Популярные товары
+    # 6. Качественные популярные товары
     if len(cands) < max_candidates:
-        for candidate in popular_items_array:
-            if candidate not in excluded_items and candidate in item_map:
-                cands.add(candidate)
+        needed = max_candidates - len(cands)
+        # Берем не все подряд, а только топовые популярные
+        for candidate in popular_items_array[: needed * 2]:
+            if candidate not in excluded and candidate in item_map:
+                cands.append(candidate)
                 if len(cands) >= max_candidates:
                     break
 
-    return list(cands)[:max_candidates]
+    return cands[:max_candidates]
 
 
 # ===== ОСНОВНОЙ ИНФЕРЕНС =====
@@ -200,13 +266,10 @@ def main():
 
     # --- Загрузка пользователей
     log_message("Загрузка пользователей...")
-
-    # Используем glob для получения списка файлов
     parquet_files = glob.glob(TEST_USERS_PATH)
     if not parquet_files:
         raise FileNotFoundError(f"No parquet files found matching: {TEST_USERS_PATH}")
 
-    # Читаем все файлы последовательно
     test_dfs = []
     for file_path in parquet_files:
         test_dfs.append(pd.read_parquet(file_path))
@@ -229,10 +292,27 @@ def main():
     feature_columns = artifacts.get("feature_columns", [])
     cat_features = artifacts.get("cat_features", [])
 
+    # Проверка совпадения фичей модели и артефактов
+    if hasattr(model, "feature_names") and model.feature_names:
+        if model.feature_names != feature_columns:
+            log_message("⚠️  Выравнивание фичей модели и артефактов")
+            feature_columns = model.feature_names
+
     item_map_set = set(artifacts["item_map"].keys())
     popular_items_array = np.array(artifacts["popular_items"], dtype=np.int64)
 
     log_message(f"Загружено {len(feature_columns)} признаков")
+
+    # Диагностика артефактов
+    log_message(f"User features count: {len(artifacts['user_features_dict'])}")
+    log_message(f"Item features count: {len(artifacts['item_features_dict'])}")
+
+    # Проверка тестовых пользователей
+    test_user_sample = test_users[:100]
+    users_with_features = sum(
+        1 for uid in test_user_sample if uid in artifacts["user_features_dict"]
+    )
+    log_message(f"Тестовых пользователей с фичами: {users_with_features}/100")
 
     # --- Генерация рекомендаций батчами
     recommendations = {}
@@ -258,11 +338,12 @@ def main():
                         item_to_cat=artifacts["item_to_cat"],
                         cat_to_items=artifacts.get("cat_to_items", {}),
                         item_map=item_map_set,
-                        max_candidates=200,
+                        max_candidates=500,  # Уменьшили для скорости
                     )
                     batch_candidates.append(cands)
                     batch_user_ids.append(uid)
                 except Exception as e:
+                    log_message(f"Ошибка генерации кандидатов для user {uid}: {e}")
                     batch_candidates.append(popular_items_array[:TOP_K].tolist())
                     batch_user_ids.append(uid)
 
@@ -279,11 +360,19 @@ def main():
                     )
 
                     if not X_batch.empty:
-                        X_pred = X_batch[feature_columns]
+                        # Проверка и очистка данных
+                        X_pred = X_batch[feature_columns].fillna(0)
+                        X_pred = X_pred.replace([np.inf, -np.inf], 0)
+
                         dmatrix = xgb.DMatrix(X_pred)
                         probs = model.predict(dmatrix)
 
-                        # ОПТИМИЗИРОВАННАЯ ЧАСТЬ - без фрагментации DataFrame
+                        # Диагностика предсказаний
+                        if i == 0:  # Только для первого батча
+                            log_message(
+                                f"Predictions - min: {probs.min():.4f}, max: {probs.max():.4f}, mean: {probs.mean():.4f}"
+                            )
+
                         result_df = pd.DataFrame(
                             {
                                 "user_id": X_batch["user_id"].values,
@@ -294,42 +383,48 @@ def main():
 
                         top_items_per_user = {}
                         for user_id, group in result_df.groupby("user_id"):
-                            # Берем TOP_K items с наибольшими score
+                            # Берем TOP_K с наибольшими score
                             top_items = group.nlargest(TOP_K, "score")[
                                 "item_id"
                             ].tolist()
 
-                            # Добираем популярными если нужно
+                            # Дополняем только если действительно нужно
                             if len(top_items) < TOP_K:
                                 user_history = artifacts["recent_items_map"].get(
                                     user_id, []
                                 )
                                 excluded = set()
                                 for item_action in user_history:
-                                    if isinstance(item_action, tuple):
-                                        excluded.add(item_action[0])
-                                    else:
-                                        excluded.add(item_action)
+                                    item_id = (
+                                        item_action[0]
+                                        if isinstance(item_action, tuple)
+                                        else item_action
+                                    )
+                                    excluded.add(item_id)
 
-                                for popular_item in popular_items_array:
+                                # Добираем разнообразными популярными
+                                added_count = 0
+                                for candidate in popular_items_array:
                                     if (
-                                        popular_item not in top_items
-                                        and popular_item not in excluded
+                                        candidate not in excluded
+                                        and candidate not in top_items
                                     ):
-                                        top_items.append(popular_item)
-                                    if len(top_items) >= TOP_K:
-                                        break
+                                        top_items.append(candidate)
+                                        added_count += 1
+                                        if len(top_items) >= TOP_K or added_count >= 20:
+                                            break
 
                             top_items_per_user[user_id] = top_items[:TOP_K]
 
-                        # Добавляем в recommendations
+                        # Добавляем рекомендации
                         for user_id, top_items in top_items_per_user.items():
                             recommendations[user_id] = top_items
 
                 except Exception as e:
+                    log_message(f"Ошибка обработки батча {i}: {e}")
+                    # Fallback на популярные
                     for uid in batch_user_ids:
                         recommendations[uid] = popular_items_array[:TOP_K].tolist()
-                    log_message(f"Ошибка в батче {i}: {e}")
 
             processed += len(batch_users)
             pbar.update(len(batch_users))
